@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+.env
+.venv/
+venv/
+
+data/
+tmp/
+
+outputs/**/*.safetensors
+outputs/**/visuals/
+outputs/**/train_log.csv
+
+*.log
