@@ -294,6 +294,7 @@ def load_lora(unet: nn.Module, lora_dir: str | Path, device: torch.device, dtype
         target=metadata["target"],
         scope=metadata["lora_scope"],
     )
+    unet.to(device=device, dtype=dtype)
     tensors = load_file(str(lora_dir / "pytorch_lora_weights.safetensors"))
     modules = dict(iter_lora_modules(unet))
     for key, value in tensors.items():
@@ -378,6 +379,18 @@ def get_prompt_embeds(pipe, batch_size: int, device: torch.device, dtype: torch.
     return pipe.text_encoder(tokens)[0].to(dtype=dtype)
 
 
+def make_grad_scaler(device: torch.device, enabled: bool):
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler(device.type, enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def autocast_context(device: torch.device, enabled: bool):
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast(device_type=device.type, enabled=enabled)
+    return torch.cuda.amp.autocast(enabled=enabled)
+
+
 def train(args: argparse.Namespace) -> None:
     require_torch()
     set_seed(args.seed)
@@ -390,6 +403,7 @@ def train(args: argparse.Namespace) -> None:
     pipe.unet.train()
 
     info = inject_lora(pipe.unet, args.rank, args.alpha, args.target, args.lora_scope)
+    pipe.unet.to(device=device, dtype=dtype)
     params = [p for p in pipe.unet.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=args.lr)
 
@@ -397,7 +411,8 @@ def train(args: argparse.Namespace) -> None:
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     data_iter = iter(loader)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and args.fp16))
+    use_amp = device.type == "cuda" and args.fp16
+    scaler = make_grad_scaler(device, enabled=use_amp)
     logs = []
     start = time.time()
     max_mem = 0
@@ -448,7 +463,7 @@ def train(args: argparse.Namespace) -> None:
                 else:
                     target = noise
 
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda" and args.fp16)):
+            with autocast_context(device, enabled=use_amp):
                 pred = pipe.unet(model_input, timesteps, prompt_embeds, class_labels=noise_level).sample
                 loss = F.mse_loss(pred.float(), target.float()) / args.grad_accum
 
