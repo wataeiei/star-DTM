@@ -97,7 +97,7 @@ def list_images(root: str | Path) -> list[Path]:
 
 def pil_to_tensor(image: Image.Image, size: int) -> torch.Tensor:
     image = image.convert("RGB").resize((size, size), Image.BICUBIC)
-    arr = torch.ByteTensor(torch.ByteStorage.from_buffer(image.tobytes()))
+    arr = torch.frombuffer(bytearray(image.tobytes()), dtype=torch.uint8)
     arr = arr.view(size, size, 3).permute(2, 0, 1).float() / 255.0
     return arr * 2.0 - 1.0
 
@@ -429,11 +429,17 @@ def train(args: argparse.Namespace) -> None:
                 )
                 noisy_latents = pipe.scheduler.add_noise(latents, noise, timesteps)
                 noise_level = torch.full((bsz,), args.noise_level, device=device, dtype=torch.long)
-                low_noise = torch.randn_like(lr_up)
+                lr_cond_clean = F.interpolate(
+                    lr_up.float(),
+                    size=noisy_latents.shape[-2:],
+                    mode="bicubic",
+                    align_corners=False,
+                ).to(dtype=dtype)
+                low_noise = torch.randn_like(lr_cond_clean)
                 if hasattr(pipe, "low_res_scheduler"):
-                    lr_cond = pipe.low_res_scheduler.add_noise(lr_up, low_noise, noise_level)
+                    lr_cond = pipe.low_res_scheduler.add_noise(lr_cond_clean, low_noise, noise_level)
                 else:
-                    lr_cond = lr_up
+                    lr_cond = lr_cond_clean
                 model_input = torch.cat([noisy_latents, lr_cond], dim=1)
                 prompt_embeds = get_prompt_embeds(pipe, bsz, device, dtype)
                 prediction_type = getattr(pipe.scheduler.config, "prediction_type", "epsilon")
