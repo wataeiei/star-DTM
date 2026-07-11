@@ -163,7 +163,9 @@ class LoRALinear(nn.Module):
             p.requires_grad_(False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.base(x) + self.lora_up(self.lora_down(x)) * self.scale
+        base_out = self.base(x)
+        lora_out = self.lora_up(self.lora_down(x.float())) * self.scale
+        return base_out + lora_out.to(dtype=base_out.dtype)
 
 
 def target_suffixes(target: str) -> tuple[str, ...]:
@@ -245,6 +247,12 @@ def iter_lora_modules(root: nn.Module) -> Iterable[tuple[str, LoRALinear]]:
             yield name, module
 
 
+def move_lora_to_device(root: nn.Module, device: torch.device) -> None:
+    for _name, module in iter_lora_modules(root):
+        module.lora_down.to(device=device, dtype=torch.float32)
+        module.lora_up.to(device=device, dtype=torch.float32)
+
+
 def lora_structure_rows(unet: nn.Module) -> list[dict]:
     rows = []
     for name, module in iter_lora_modules(unet):
@@ -294,14 +302,14 @@ def load_lora(unet: nn.Module, lora_dir: str | Path, device: torch.device, dtype
         target=metadata["target"],
         scope=metadata["lora_scope"],
     )
-    unet.to(device=device, dtype=dtype)
+    move_lora_to_device(unet, device)
     tensors = load_file(str(lora_dir / "pytorch_lora_weights.safetensors"))
     modules = dict(iter_lora_modules(unet))
     for key, value in tensors.items():
         module_name, weight_name, _ = key.rsplit(".", 2)
         module = modules[module_name]
         layer = module.lora_down if weight_name == "lora_down" else module.lora_up
-        layer.weight.data.copy_(value.to(device=device, dtype=dtype))
+        layer.weight.data.copy_(value.to(device=device, dtype=torch.float32))
     return metadata
 
 
@@ -403,7 +411,7 @@ def train(args: argparse.Namespace) -> None:
     pipe.unet.train()
 
     info = inject_lora(pipe.unet, args.rank, args.alpha, args.target, args.lora_scope)
-    pipe.unet.to(device=device, dtype=dtype)
+    move_lora_to_device(pipe.unet, device)
     params = [p for p in pipe.unet.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=args.lr)
 
