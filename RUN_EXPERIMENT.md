@@ -123,3 +123,22 @@ Change only `--lora_scope` and `--output_dir`:
 
 For formal results, prefer increasing `--eval_max_images` or setting it to `0`
 to evaluate the full validation split.
+
+## 7. Summarize Base vs Sandwich-LoRA
+
+After Base evaluation, Sandwich-LoRA training, and Sandwich-LoRA evaluation are
+finished, generate a compact comparison table and report:
+
+```bash
+python3 summarize_base_sandwich.py \
+  --base_eval_summary outputs/eval_base/eval_summary.csv \
+  --sandwich_eval_summary outputs/eval_sandwich_r8/eval_summary.csv \
+  --sandwich_train_summary outputs/lora_sandwich_r8/summary.csv \
+  --output_csv outputs/base_vs_sandwich_summary.csv \
+  --output_md outputs/base_vs_sandwich_report.md
+```
+
+Outputs:
+
+- `outputs/base_vs_sandwich_summary.csv`
+- `outputs/base_vs_sandwich_report.md`
