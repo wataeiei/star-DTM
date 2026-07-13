@@ -147,3 +147,52 @@ Training memory metrics are written automatically:
 
 - `summary.csv`: start/end/peak CUDA allocated and reserved memory
 - `train_log.csv`: per-step current and peak CUDA memory
+- If training loss becomes `nan`, rerun a small check with `--no_fp16`; non-finite steps are logged in `train_log.csv`.
+
+Example stable debug run:
+
+```bash
+python3 onboard_sandwich_lora_sr.py \
+  --mode train \
+  --train_dir data/ucmerced/train_hr \
+  --output_dir outputs/lora_sandwich_debug_fp32 \
+  --hr_size 256 \
+  --lr_size 64 \
+  --rank 8 \
+  --alpha 16 \
+  --target qv \
+  --lora_scope shallow_deep \
+  --train_steps 20 \
+  --batch_size 1 \
+  --grad_accum 4 \
+  --lr 1e-5 \
+  --grad_clip 1.0 \
+  --no_fp16
+```
+
+## 8. Inspect a LoRA Adapter
+
+If LoRA evaluation is identical to Base, first check whether the saved adapter is
+nonzero:
+
+```bash
+python3 onboard_sandwich_lora_sr.py \
+  --mode inspect_lora \
+  --lora_dir outputs/lora_sandwich_r8_gpu \
+  --output_dir outputs/inspect_lora_sandwich_r8_gpu
+```
+
+For a deeper check that loads the model and verifies module-name matching:
+
+```bash
+python3 onboard_sandwich_lora_sr.py \
+  --mode inspect_lora \
+  --lora_dir outputs/lora_sandwich_r8_gpu \
+  --output_dir outputs/inspect_lora_sandwich_r8_gpu \
+  --inspect_load_model
+```
+
+Outputs:
+
+- `lora_inspect_summary.csv`
+- `lora_inspect_tensors.csv`

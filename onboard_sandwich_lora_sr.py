@@ -7,6 +7,7 @@ Modes:
   train             Fine-tune selected UNet attention projections with LoRA.
   eval              Evaluate base or LoRA-adapted SD x4 upscaler.
   parse_tegrastats  Parse Jetson tegrastats logs into resource metrics.
+  inspect_lora      Inspect whether a saved LoRA adapter is nonzero and loadable.
 
 The LoRA implementation is intentionally local to this script so the experiment
 does not depend on PEFT/diffusers adapter API changes.
@@ -313,6 +314,103 @@ def load_lora(unet: nn.Module, lora_dir: str | Path, device: torch.device, dtype
     return metadata
 
 
+def inspect_lora(args: argparse.Namespace) -> None:
+    require_packages("safetensors")
+    from safetensors.torch import load_file
+
+    lora_dir = Path(args.lora_dir)
+    if not lora_dir:
+        raise SystemExit("--lora_dir is required for --mode inspect_lora")
+    metadata_path = lora_dir / "lora_metadata.json"
+    weight_path = lora_dir / "pytorch_lora_weights.safetensors"
+    if not metadata_path.exists():
+        raise SystemExit(f"Missing metadata: {metadata_path}")
+    if not weight_path.exists():
+        raise SystemExit(f"Missing weights: {weight_path}")
+
+    with metadata_path.open("r", encoding="utf-8") as f:
+        metadata = json.load(f)
+    tensors = load_file(str(weight_path))
+    rows = []
+    total_params = 0
+    total_l1 = 0.0
+    global_max_abs = 0.0
+    zero_tensors = 0
+    for name, tensor in sorted(tensors.items()):
+        t = tensor.float()
+        numel = t.numel()
+        l1 = float(t.abs().sum().item())
+        max_abs = float(t.abs().max().item()) if numel else 0.0
+        mean_abs = l1 / numel if numel else 0.0
+        is_all_zero = max_abs == 0.0
+        rows.append(
+            {
+                "tensor": name,
+                "shape": "x".join(str(v) for v in tensor.shape),
+                "num_params": numel,
+                "mean_abs": mean_abs,
+                "max_abs": max_abs,
+                "l1_sum": l1,
+                "all_zero": is_all_zero,
+            }
+        )
+        total_params += numel
+        total_l1 += l1
+        global_max_abs = max(global_max_abs, max_abs)
+        zero_tensors += int(is_all_zero)
+
+    expected_modules = metadata.get("lora_module_names", [])
+    summary = {
+        "lora_dir": str(lora_dir),
+        "rank": metadata.get("rank", ""),
+        "alpha": metadata.get("alpha", ""),
+        "target": metadata.get("target", ""),
+        "lora_scope": metadata.get("lora_scope", ""),
+        "metadata_module_count": len(expected_modules),
+        "tensor_count": len(tensors),
+        "total_lora_params": total_params,
+        "zero_tensor_count": zero_tensors,
+        "nonzero_tensor_count": len(tensors) - zero_tensors,
+        "global_max_abs": global_max_abs,
+        "global_mean_abs": total_l1 / total_params if total_params else 0.0,
+        "adapter_size_mb": weight_path.stat().st_size / (1024 * 1024),
+        "looks_nonzero": global_max_abs > args.inspect_zero_tol,
+        "deep_model_check": bool(args.inspect_load_model),
+    }
+
+    if args.inspect_load_model:
+        require_torch()
+        device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+        dtype = torch.float16 if device.type == "cuda" and args.fp16 else torch.float32
+        pipe = load_pipeline(dtype=dtype).to(device)
+        info = inject_lora(
+            pipe.unet,
+            rank=int(metadata["rank"]),
+            alpha=int(metadata["alpha"]),
+            target=metadata["target"],
+            scope=metadata["lora_scope"],
+        )
+        actual_modules = set(info.names)
+        expected_set = set(expected_modules)
+        modules_from_tensors = {key.rsplit(".", 2)[0] for key in tensors}
+        summary.update(
+            {
+                "actual_injected_module_count": len(actual_modules),
+                "metadata_modules_missing_in_model": len(expected_set - actual_modules),
+                "tensor_modules_missing_in_model": len(modules_from_tensors - actual_modules),
+                "model_modules_missing_in_tensors": len(actual_modules - modules_from_tensors),
+                "module_names_match": not (expected_set - actual_modules)
+                and not (modules_from_tensors - actual_modules)
+                and not (actual_modules - modules_from_tensors),
+            }
+        )
+
+    output_dir = ensure_dir(args.output_dir)
+    save_csv(output_dir / "lora_inspect_tensors.csv", rows)
+    save_csv(output_dir / "lora_inspect_summary.csv", [summary])
+    print(json.dumps(summary, indent=2))
+
+
 def prepare_ucmerced(args: argparse.Namespace) -> None:
     require_packages("datasets")
     from datasets import load_dataset
@@ -443,9 +541,12 @@ def train(args: argparse.Namespace) -> None:
         torch.cuda.reset_peak_memory_stats(device)
     start_mem = cuda_memory_stats_mb(device)
     optimizer.zero_grad(set_to_none=True)
+    skipped_nonfinite_steps = 0
 
     for step in range(1, args.train_steps + 1):
         accum_loss = 0.0
+        step_nonfinite = False
+        nonfinite_reason = ""
         for _ in range(args.grad_accum):
             try:
                 batch = next(data_iter)
@@ -493,16 +594,42 @@ def train(args: argparse.Namespace) -> None:
                 pred = pipe.unet(model_input, timesteps, prompt_embeds, class_labels=noise_level).sample
                 loss = F.mse_loss(pred.float(), target.float()) / args.grad_accum
 
+            if not torch.isfinite(loss):
+                step_nonfinite = True
+                pred_finite = bool(torch.isfinite(pred).all().item())
+                target_finite = bool(torch.isfinite(target).all().item())
+                nonfinite_reason = f"loss_nonfinite,pred_finite={pred_finite},target_finite={target_finite}"
+                break
+
             scaler.scale(loss).backward()
             accum_loss += float(loss.detach().cpu()) * args.grad_accum
 
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
+        if step_nonfinite:
+            skipped_nonfinite_steps += 1
+            optimizer.zero_grad(set_to_none=True)
+            if use_amp:
+                scaler.update()
+        else:
+            if args.grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
         elapsed = time.time() - start
         mem_stats = cuda_memory_stats_mb(device)
-        logs.append({"step": step, "loss": accum_loss, "elapsed_s": elapsed, **mem_stats})
+        logs.append(
+            {
+                "step": step,
+                "loss": accum_loss if not step_nonfinite else "nan",
+                "elapsed_s": elapsed,
+                "step_nonfinite": step_nonfinite,
+                "nonfinite_reason": nonfinite_reason,
+                "skipped_nonfinite_steps": skipped_nonfinite_steps,
+                **mem_stats,
+            }
+        )
         if step % args.log_every == 0 or step == 1 or step == args.train_steps:
             mem_msg = ""
             if device.type == "cuda":
@@ -511,7 +638,13 @@ def train(args: argparse.Namespace) -> None:
                     f" cuda_peak={mem_stats['cuda_max_mem_allocated_mb']:.1f}MB"
                     f" cuda_reserved={mem_stats['cuda_mem_reserved_mb']:.1f}MB"
                 )
-            print(f"step {step:05d}/{args.train_steps} loss={accum_loss:.6f} elapsed={elapsed:.1f}s{mem_msg}")
+            if step_nonfinite:
+                print(
+                    f"step {step:05d}/{args.train_steps} loss=nan skipped_nonfinite={skipped_nonfinite_steps} "
+                    f"reason={nonfinite_reason} elapsed={elapsed:.1f}s{mem_msg}"
+                )
+            else:
+                print(f"step {step:05d}/{args.train_steps} loss={accum_loss:.6f} elapsed={elapsed:.1f}s{mem_msg}")
 
     output_dir = ensure_dir(args.output_dir)
     metadata = {
@@ -547,6 +680,9 @@ def train(args: argparse.Namespace) -> None:
                 "samples_per_second": safe_div(effective_samples, elapsed),
                 "images_per_hour": safe_div(effective_samples * 3600.0, elapsed),
                 "estimated_energy_wh": energy_wh,
+                "fp16": args.fp16,
+                "grad_clip": args.grad_clip,
+                "skipped_nonfinite_steps": skipped_nonfinite_steps,
                 "cuda_start_mem_allocated_mb": start_mem["cuda_mem_allocated_mb"],
                 "cuda_start_mem_reserved_mb": start_mem["cuda_mem_reserved_mb"],
                 "cuda_end_mem_allocated_mb": end_mem["cuda_mem_allocated_mb"],
@@ -729,10 +865,15 @@ def parse_tegrastats(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", required=True, choices=["prepare_ucmerced", "comm", "train", "eval", "parse_tegrastats"])
+    parser.add_argument(
+        "--mode",
+        required=True,
+        choices=["prepare_ucmerced", "comm", "train", "eval", "parse_tegrastats", "inspect_lora"],
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu", action="store_true")
-    parser.add_argument("--fp16", action="store_true", default=True)
+    parser.add_argument("--fp16", dest="fp16", action="store_true", default=True)
+    parser.add_argument("--no_fp16", dest="fp16", action="store_false")
 
     parser.add_argument("--data_root", default="data/ucmerced")
     parser.add_argument("--dataset_name", default="blanchon/UC_Merced")
@@ -758,6 +899,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train_steps", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accum", type=int, default=4)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--power_w", type=float, default=30)
     parser.add_argument("--full_model_size_mb", type=float, default=1200)
@@ -774,6 +916,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--tegrastats_log", default="outputs/tegrastats_sandwich_train.log")
     parser.add_argument("--tegrastats_interval_s", type=float, default=1.0)
+    parser.add_argument("--inspect_load_model", action="store_true")
+    parser.add_argument("--inspect_zero_tol", type=float, default=0.0)
     return parser
 
 
@@ -789,6 +933,8 @@ def main() -> None:
         eval_model(args)
     elif args.mode == "parse_tegrastats":
         parse_tegrastats(args)
+    elif args.mode == "inspect_lora":
+        inspect_lora(args)
     else:
         raise SystemExit(f"Unsupported mode: {args.mode}")
 
