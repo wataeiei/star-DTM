@@ -142,3 +142,8 @@ Outputs:
 
 - `outputs/base_vs_sandwich_summary.csv`
 - `outputs/base_vs_sandwich_report.md`
+
+Training memory metrics are written automatically:
+
+- `summary.csv`: start/end/peak CUDA allocated and reserved memory
+- `train_log.csv`: per-step current and peak CUDA memory

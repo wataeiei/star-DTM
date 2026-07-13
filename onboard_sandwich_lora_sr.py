@@ -399,6 +399,22 @@ def autocast_context(device: torch.device, enabled: bool):
     return torch.cuda.amp.autocast(enabled=enabled)
 
 
+def cuda_memory_stats_mb(device: torch.device) -> dict:
+    if device.type != "cuda":
+        return {
+            "cuda_mem_allocated_mb": 0.0,
+            "cuda_mem_reserved_mb": 0.0,
+            "cuda_max_mem_allocated_mb": 0.0,
+            "cuda_max_mem_reserved_mb": 0.0,
+        }
+    return {
+        "cuda_mem_allocated_mb": torch.cuda.memory_allocated(device) / (1024 * 1024),
+        "cuda_mem_reserved_mb": torch.cuda.memory_reserved(device) / (1024 * 1024),
+        "cuda_max_mem_allocated_mb": torch.cuda.max_memory_allocated(device) / (1024 * 1024),
+        "cuda_max_mem_reserved_mb": torch.cuda.max_memory_reserved(device) / (1024 * 1024),
+    }
+
+
 def train(args: argparse.Namespace) -> None:
     require_torch()
     set_seed(args.seed)
@@ -423,7 +439,9 @@ def train(args: argparse.Namespace) -> None:
     scaler = make_grad_scaler(device, enabled=use_amp)
     logs = []
     start = time.time()
-    max_mem = 0
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    start_mem = cuda_memory_stats_mb(device)
     optimizer.zero_grad(set_to_none=True)
 
     for step in range(1, args.train_steps + 1):
@@ -482,12 +500,18 @@ def train(args: argparse.Namespace) -> None:
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
 
-        if device.type == "cuda":
-            max_mem = max(max_mem, torch.cuda.max_memory_allocated(device))
         elapsed = time.time() - start
-        logs.append({"step": step, "loss": accum_loss, "elapsed_s": elapsed})
+        mem_stats = cuda_memory_stats_mb(device)
+        logs.append({"step": step, "loss": accum_loss, "elapsed_s": elapsed, **mem_stats})
         if step % args.log_every == 0 or step == 1 or step == args.train_steps:
-            print(f"step {step:05d}/{args.train_steps} loss={accum_loss:.6f} elapsed={elapsed:.1f}s")
+            mem_msg = ""
+            if device.type == "cuda":
+                mem_msg = (
+                    f" cuda_alloc={mem_stats['cuda_mem_allocated_mb']:.1f}MB"
+                    f" cuda_peak={mem_stats['cuda_max_mem_allocated_mb']:.1f}MB"
+                    f" cuda_reserved={mem_stats['cuda_mem_reserved_mb']:.1f}MB"
+                )
+            print(f"step {step:05d}/{args.train_steps} loss={accum_loss:.6f} elapsed={elapsed:.1f}s{mem_msg}")
 
     output_dir = ensure_dir(args.output_dir)
     metadata = {
@@ -510,6 +534,7 @@ def train(args: argparse.Namespace) -> None:
     full_model_size_mb = args.full_model_size_mb
     compression_ratio = safe_div(full_model_size_mb, adapter_mb)
     trainable_param_pct = safe_div(info.trainable_params * 100.0, info.total_params)
+    end_mem = cuda_memory_stats_mb(device)
     save_csv(output_dir / "train_log.csv", logs)
     save_csv(output_dir / "lora_structure.csv", lora_structure_rows(pipe.unet))
     save_csv(
@@ -522,7 +547,12 @@ def train(args: argparse.Namespace) -> None:
                 "samples_per_second": safe_div(effective_samples, elapsed),
                 "images_per_hour": safe_div(effective_samples * 3600.0, elapsed),
                 "estimated_energy_wh": energy_wh,
-                "peak_cuda_mem_mb": max_mem / (1024 * 1024),
+                "cuda_start_mem_allocated_mb": start_mem["cuda_mem_allocated_mb"],
+                "cuda_start_mem_reserved_mb": start_mem["cuda_mem_reserved_mb"],
+                "cuda_end_mem_allocated_mb": end_mem["cuda_mem_allocated_mb"],
+                "cuda_end_mem_reserved_mb": end_mem["cuda_mem_reserved_mb"],
+                "peak_cuda_mem_mb": end_mem["cuda_max_mem_allocated_mb"],
+                "peak_cuda_reserved_mb": end_mem["cuda_max_mem_reserved_mb"],
                 "adapter_size_mb": adapter_mb,
                 "full_model_size_mb": full_model_size_mb,
                 "compression_ratio_full_to_adapter": compression_ratio,
