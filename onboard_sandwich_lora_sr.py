@@ -547,6 +547,7 @@ def train(args: argparse.Namespace) -> None:
         accum_loss = 0.0
         step_nonfinite = False
         nonfinite_reason = ""
+        did_backward = False
         for _ in range(args.grad_accum):
             try:
                 batch = next(data_iter)
@@ -602,12 +603,13 @@ def train(args: argparse.Namespace) -> None:
                 break
 
             scaler.scale(loss).backward()
+            did_backward = True
             accum_loss += float(loss.detach().cpu()) * args.grad_accum
 
         if step_nonfinite:
             skipped_nonfinite_steps += 1
             optimizer.zero_grad(set_to_none=True)
-            if use_amp:
+            if use_amp and did_backward:
                 scaler.update()
         else:
             if args.grad_clip > 0:
@@ -626,6 +628,7 @@ def train(args: argparse.Namespace) -> None:
                 "elapsed_s": elapsed,
                 "step_nonfinite": step_nonfinite,
                 "nonfinite_reason": nonfinite_reason,
+                "did_backward": did_backward,
                 "skipped_nonfinite_steps": skipped_nonfinite_steps,
                 **mem_stats,
             }
