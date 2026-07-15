@@ -117,7 +117,9 @@ per MB/Wh when the corresponding training or base summaries are provided.
 
 Change only `--lora_scope` and `--output_dir`:
 
-- `--lora_scope shallow` for Shallow-LoRA
+- `--lora_scope shallow` for Shallow-LoRA. The script automatically selects the
+  first down block that actually contains target attention layers in the current
+  diffusers UNet.
 - `--lora_scope last2_up` for Last2-Up-LoRA
 - `--lora_scope all` for All-LoRA
 

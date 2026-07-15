@@ -181,16 +181,24 @@ def target_suffixes(target: str) -> tuple[str, ...]:
     return mapping[target]
 
 
-def module_in_scope(name: str, scope: str, last_up_indices: set[int] | None = None) -> bool:
+def module_in_scope(
+    name: str,
+    scope: str,
+    shallow_down_indices: set[int] | None = None,
+    last_up_indices: set[int] | None = None,
+) -> bool:
     if scope == "all":
         return True
     if scope == "shallow":
-        return "down_blocks.0." in name
+        shallow_down_indices = shallow_down_indices or set()
+        return any(f"down_blocks.{idx}." in name for idx in shallow_down_indices)
     if scope == "last2_up":
         last_up_indices = last_up_indices or set()
         return any(f"up_blocks.{idx}." in name for idx in last_up_indices)
     if scope == "shallow_deep":
-        return module_in_scope(name, "shallow") or module_in_scope(name, "last2_up", last_up_indices)
+        return module_in_scope(name, "shallow", shallow_down_indices, last_up_indices) or module_in_scope(
+            name, "last2_up", shallow_down_indices, last_up_indices
+        )
     raise SystemExit(f"Unknown lora_scope={scope}")
 
 
@@ -212,17 +220,27 @@ class LoraInfo:
 def inject_lora(unet: nn.Module, rank: int, alpha: int, target: str, scope: str) -> LoraInfo:
     suffixes = target_suffixes(target)
     replacements: list[tuple[str, nn.Linear]] = []
+    down_indices_with_targets = set()
     up_indices = set()
-    for name, _module in unet.named_modules():
+    for name, module in unet.named_modules():
         parts = name.split(".")
+        if (
+            isinstance(module, nn.Linear)
+            and len(parts) >= 2
+            and parts[0] == "down_blocks"
+            and parts[1].isdigit()
+            and any(name.endswith(suffix) for suffix in suffixes)
+        ):
+            down_indices_with_targets.add(int(parts[1]))
         if len(parts) >= 2 and parts[0] == "up_blocks" and parts[1].isdigit():
             up_indices.add(int(parts[1]))
+    shallow_down_indices = set(sorted(down_indices_with_targets)[:1])
     last_up_indices = set(sorted(up_indices)[-2:])
 
     for name, module in unet.named_modules():
         if not isinstance(module, nn.Linear):
             continue
-        if not module_in_scope(name, scope, last_up_indices):
+        if not module_in_scope(name, scope, shallow_down_indices, last_up_indices):
             continue
         if any(name.endswith(suffix) for suffix in suffixes):
             replacements.append((name, module))
