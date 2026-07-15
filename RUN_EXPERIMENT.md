@@ -268,3 +268,63 @@ python3 summarize_base_sandwich.py \
   --output_csv outputs/base_vs_sandwich_vs_full_summary.csv \
   --output_md outputs/base_vs_sandwich_vs_full_report.md
 ```
+
+## 10. FP32 Training + FP16 LoRA Saving
+
+To keep stable FP32 training but save a smaller FP16 adapter, add:
+
+```bash
+--no_fp16 \
+--save_lora_dtype fp16
+```
+
+Example:
+
+```bash
+python3 onboard_sandwich_lora_sr.py \
+  --mode train \
+  --train_method lora \
+  --train_dir data/ucmerced/train_hr \
+  --output_dir outputs/lora_sandwich_r8_lr1e5_1000_fp32_savefp16_gpu \
+  --hr_size 256 \
+  --lr_size 64 \
+  --rank 8 \
+  --alpha 16 \
+  --target qv \
+  --lora_scope shallow_deep \
+  --train_steps 1000 \
+  --batch_size 1 \
+  --grad_accum 4 \
+  --lr 1e-5 \
+  --grad_clip 1.0 \
+  --power_w 30 \
+  --full_model_size_mb 1200 \
+  --no_fp16 \
+  --save_lora_dtype fp16
+```
+
+To convert an existing FP32 adapter without retraining:
+
+```bash
+python3 onboard_sandwich_lora_sr.py \
+  --mode quantize_lora \
+  --lora_dir outputs/lora_sandwich_r8_lr1e5_1000_fp32_gpu \
+  --output_dir outputs/lora_sandwich_r8_lr1e5_1000_fp32_gpu_savefp16 \
+  --save_lora_dtype fp16
+```
+
+Evaluate the converted adapter in the same way:
+
+```bash
+python3 onboard_sandwich_lora_sr.py \
+  --mode eval \
+  --val_dir data/ucmerced/val_hr \
+  --lora_dir outputs/lora_sandwich_r8_lr1e5_1000_fp32_gpu_savefp16 \
+  --output_dir outputs/eval_sandwich_r8_lr1e5_1000_fp32_gpu_savefp16_full \
+  --hr_size 256 \
+  --lr_size 64 \
+  --eval_max_images 0 \
+  --num_inference_steps 25 \
+  --base_summary_csv outputs/eval_base_gpu_full/eval_summary.csv \
+  --train_summary_csv outputs/lora_sandwich_r8_lr1e5_1000_fp32_gpu_savefp16/quantize_lora_summary.csv
+```

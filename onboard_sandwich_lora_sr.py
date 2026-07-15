@@ -271,19 +271,29 @@ def lora_structure_rows(unet: nn.Module) -> list[dict]:
     return rows
 
 
-def save_lora(unet: nn.Module, output_dir: str | Path, metadata: dict) -> Path:
+def lora_save_dtype(dtype_name: str):
+    if dtype_name == "fp32":
+        return torch.float32
+    if dtype_name == "fp16":
+        return torch.float16
+    raise SystemExit(f"Unknown save_lora_dtype={dtype_name}; choose fp32 or fp16")
+
+
+def save_lora(unet: nn.Module, output_dir: str | Path, metadata: dict, save_dtype: str = "fp32") -> Path:
     require_packages("safetensors")
     from safetensors.torch import save_file
 
     output_dir = ensure_dir(output_dir)
+    tensor_dtype = lora_save_dtype(save_dtype)
     tensors = {}
     for name, module in iter_lora_modules(unet):
-        tensors[f"{name}.lora_down.weight"] = module.lora_down.weight.detach().cpu()
-        tensors[f"{name}.lora_up.weight"] = module.lora_up.weight.detach().cpu()
+        tensors[f"{name}.lora_down.weight"] = module.lora_down.weight.detach().cpu().to(dtype=tensor_dtype)
+        tensors[f"{name}.lora_up.weight"] = module.lora_up.weight.detach().cpu().to(dtype=tensor_dtype)
     if not tensors:
         raise SystemExit("No LoRA modules to save")
     weight_path = output_dir / "pytorch_lora_weights.safetensors"
     save_file(tensors, str(weight_path))
+    metadata["save_lora_dtype"] = save_dtype
     with (output_dir / "lora_metadata.json").open("w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
     return weight_path
@@ -408,6 +418,50 @@ def inspect_lora(args: argparse.Namespace) -> None:
     output_dir = ensure_dir(args.output_dir)
     save_csv(output_dir / "lora_inspect_tensors.csv", rows)
     save_csv(output_dir / "lora_inspect_summary.csv", [summary])
+    print(json.dumps(summary, indent=2))
+
+
+def quantize_lora(args: argparse.Namespace) -> None:
+    require_packages("safetensors")
+    from safetensors.torch import load_file, save_file
+
+    src_dir = Path(args.lora_dir)
+    if not src_dir:
+        raise SystemExit("--lora_dir is required for --mode quantize_lora")
+    src_meta = src_dir / "lora_metadata.json"
+    src_weights = src_dir / "pytorch_lora_weights.safetensors"
+    if not src_meta.exists():
+        raise SystemExit(f"Missing metadata: {src_meta}")
+    if not src_weights.exists():
+        raise SystemExit(f"Missing weights: {src_weights}")
+
+    out_dir = ensure_dir(args.output_dir)
+    with src_meta.open("r", encoding="utf-8") as f:
+        metadata = json.load(f)
+    target_dtype = lora_save_dtype(args.save_lora_dtype)
+    tensors = load_file(str(src_weights))
+    quantized = {name: tensor.detach().cpu().to(dtype=target_dtype) for name, tensor in tensors.items()}
+    out_weights = out_dir / "pytorch_lora_weights.safetensors"
+    save_file(quantized, str(out_weights))
+    metadata["source_lora_dir"] = str(src_dir)
+    metadata["save_lora_dtype"] = args.save_lora_dtype
+    metadata["quantized_from"] = str(src_weights)
+    with (out_dir / "lora_metadata.json").open("w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+    src_mb = src_weights.stat().st_size / (1024 * 1024)
+    out_mb = out_weights.stat().st_size / (1024 * 1024)
+    summary = {
+        "source_lora_dir": str(src_dir),
+        "output_dir": str(out_dir),
+        "save_lora_dtype": args.save_lora_dtype,
+        "source_size_mb": src_mb,
+        "quantized_size_mb": out_mb,
+        "adapter_size_mb": out_mb,
+        "size_ratio": safe_div(src_mb, out_mb),
+        "upload_time_1mbps_s": upload_seconds(out_mb, 1.0, args.eta),
+    }
+    save_csv(out_dir / "quantize_lora_summary.csv", [summary])
     print(json.dumps(summary, indent=2))
 
 
@@ -673,7 +727,7 @@ def train(args: argparse.Namespace) -> None:
         "lora_module_names": info.names,
     }
     if args.train_method == "lora":
-        weight_path = save_lora(pipe.unet, output_dir, metadata)
+        weight_path = save_lora(pipe.unet, output_dir, metadata, save_dtype=args.save_lora_dtype)
         update_size_mb = weight_path.stat().st_size / (1024 * 1024)
         saved_update_path = str(weight_path)
     else:
@@ -708,6 +762,7 @@ def train(args: argparse.Namespace) -> None:
                 "images_per_hour": safe_div(effective_samples * 3600.0, elapsed),
                 "estimated_energy_wh": energy_wh,
                 "fp16": args.fp16,
+                "save_lora_dtype": args.save_lora_dtype if args.train_method == "lora" else "",
                 "grad_clip": args.grad_clip,
                 "skipped_nonfinite_steps": skipped_nonfinite_steps,
                 "cuda_start_mem_allocated_mb": start_mem["cuda_mem_allocated_mb"],
@@ -901,7 +956,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         required=True,
-        choices=["prepare_ucmerced", "comm", "train", "eval", "parse_tegrastats", "inspect_lora"],
+        choices=["prepare_ucmerced", "comm", "train", "eval", "parse_tegrastats", "inspect_lora", "quantize_lora"],
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu", action="store_true")
@@ -930,6 +985,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--alpha", type=int, default=16)
     parser.add_argument("--target", default="qv", choices=["q", "v", "qv", "qkvo"])
     parser.add_argument("--lora_scope", default="shallow_deep", choices=["shallow", "last2_up", "shallow_deep", "all"])
+    parser.add_argument("--save_lora_dtype", default="fp32", choices=["fp32", "fp16"])
     parser.add_argument("--train_method", default="lora", choices=["lora", "full_unet"])
     parser.add_argument("--train_steps", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=1)
@@ -970,6 +1026,8 @@ def main() -> None:
         parse_tegrastats(args)
     elif args.mode == "inspect_lora":
         inspect_lora(args)
+    elif args.mode == "quantize_lora":
+        quantize_lora(args)
     else:
         raise SystemExit(f"Unsupported mode: {args.mode}")
 
