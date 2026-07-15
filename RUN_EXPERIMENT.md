@@ -256,15 +256,15 @@ python3 onboard_sandwich_lora_sr.py \
   --train_summary_csv outputs/full_unet_lr1e5_1000_fp32_gpu/summary.csv
 ```
 
-Generate a three-way summary:
+Generate a three-way summary. The summarizer accepts repeatable
+`--extra_method name,eval_summary_csv,train_summary_csv` entries, so new
+methods can be added without editing the script:
 
 ```bash
 python3 summarize_base_sandwich.py \
   --base_eval_summary outputs/eval_base_gpu_full/eval_summary.csv \
-  --sandwich_eval_summary outputs/eval_sandwich_r8_lr1e5_1000_fp32_gpu_full/eval_summary.csv \
-  --sandwich_train_summary outputs/lora_sandwich_r8_lr1e5_1000_fp32_gpu/summary.csv \
-  --full_eval_summary outputs/eval_full_unet_lr1e5_1000_fp32_gpu_full/eval_summary.csv \
-  --full_train_summary outputs/full_unet_lr1e5_1000_fp32_gpu/summary.csv \
+  --extra_method Sandwich-LoRA,outputs/eval_sandwich_r8_lr1e5_1000_fp32_gpu_full/eval_summary.csv,outputs/lora_sandwich_r8_lr1e5_1000_fp32_gpu/summary.csv \
+  --extra_method Full-UNet,outputs/eval_full_unet_lr1e5_1000_fp32_gpu_full/eval_summary.csv,outputs/full_unet_lr1e5_1000_fp32_gpu/summary.csv \
   --output_csv outputs/base_vs_sandwich_vs_full_summary.csv \
   --output_md outputs/base_vs_sandwich_vs_full_report.md
 ```
@@ -327,4 +327,29 @@ python3 onboard_sandwich_lora_sr.py \
   --num_inference_steps 25 \
   --base_summary_csv outputs/eval_base_gpu_full/eval_summary.csv \
   --train_summary_csv outputs/lora_sandwich_r8_lr1e5_1000_fp32_gpu_savefp16/quantize_lora_summary.csv
+```
+
+Then include it in the comparison table:
+
+```bash
+python3 summarize_base_sandwich.py \
+  --base_eval_summary outputs/eval_base_gpu_full/eval_summary.csv \
+  --extra_method Sandwich-LoRA-FP32,outputs/eval_sandwich_r8_lr1e5_1000_fp32_gpu_full/eval_summary.csv,outputs/lora_sandwich_r8_lr1e5_1000_fp32_gpu/summary.csv \
+  --extra_method Sandwich-LoRA-FP16-Adapter,outputs/eval_sandwich_r8_lr1e5_1000_fp32_gpu_savefp16_full/eval_summary.csv,outputs/lora_sandwich_r8_lr1e5_1000_fp32_gpu_savefp16/quantize_lora_summary.csv \
+  --extra_method Full-UNet,outputs/eval_full_unet_lr1e5_1000_fp32_gpu_full/eval_summary.csv,outputs/full_unet_lr1e5_1000_fp32_gpu/summary.csv \
+  --output_csv outputs/base_vs_sandwich_fp32_fp16_vs_full_summary.csv \
+  --output_md outputs/base_vs_sandwich_fp32_fp16_vs_full_report.md
+```
+
+After the All-LoRA experiment finishes, add it as one more method:
+
+```bash
+python3 summarize_base_sandwich.py \
+  --base_eval_summary outputs/eval_base_gpu_full/eval_summary.csv \
+  --extra_method Sandwich-LoRA-FP32,outputs/eval_sandwich_r8_lr1e5_1000_fp32_gpu_full/eval_summary.csv,outputs/lora_sandwich_r8_lr1e5_1000_fp32_gpu/summary.csv \
+  --extra_method Sandwich-LoRA-FP16-Adapter,outputs/eval_sandwich_r8_lr1e5_1000_fp32_gpu_savefp16_full/eval_summary.csv,outputs/lora_sandwich_r8_lr1e5_1000_fp32_gpu_savefp16/quantize_lora_summary.csv \
+  --extra_method All-LoRA,outputs/eval_all_r8_lr1e5_1000_fp32_gpu_full/eval_summary.csv,outputs/lora_all_r8_lr1e5_1000_fp32_gpu/summary.csv \
+  --extra_method Full-UNet,outputs/eval_full_unet_lr1e5_1000_fp32_gpu_full/eval_summary.csv,outputs/full_unet_lr1e5_1000_fp32_gpu/summary.csv \
+  --output_csv outputs/base_vs_sandwich_vs_all_vs_full_summary.csv \
+  --output_md outputs/base_vs_sandwich_vs_all_vs_full_report.md
 ```
