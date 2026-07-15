@@ -196,3 +196,75 @@ Outputs:
 
 - `lora_inspect_summary.csv`
 - `lora_inspect_tensors.csv`
+
+## 9. Full UNet Fine-tuning Baseline
+
+Use this to compare full fine-tuning with Sandwich-LoRA. First run a short
+debug job to check memory:
+
+```bash
+python3 onboard_sandwich_lora_sr.py \
+  --mode train \
+  --train_method full_unet \
+  --train_dir data/ucmerced/train_hr \
+  --output_dir outputs/full_unet_lr1e5_20_fp32_gpu \
+  --hr_size 256 \
+  --lr_size 64 \
+  --train_steps 20 \
+  --batch_size 1 \
+  --grad_accum 4 \
+  --lr 1e-5 \
+  --grad_clip 1.0 \
+  --power_w 30 \
+  --full_model_size_mb 1200 \
+  --no_fp16
+```
+
+If it fits, run the full baseline:
+
+```bash
+python3 onboard_sandwich_lora_sr.py \
+  --mode train \
+  --train_method full_unet \
+  --train_dir data/ucmerced/train_hr \
+  --output_dir outputs/full_unet_lr1e5_1000_fp32_gpu \
+  --hr_size 256 \
+  --lr_size 64 \
+  --train_steps 1000 \
+  --batch_size 1 \
+  --grad_accum 4 \
+  --lr 1e-5 \
+  --grad_clip 1.0 \
+  --power_w 30 \
+  --full_model_size_mb 1200 \
+  --no_fp16
+```
+
+Evaluate the full fine-tuned UNet:
+
+```bash
+python3 onboard_sandwich_lora_sr.py \
+  --mode eval \
+  --val_dir data/ucmerced/val_hr \
+  --unet_dir outputs/full_unet_lr1e5_1000_fp32_gpu/unet \
+  --output_dir outputs/eval_full_unet_lr1e5_1000_fp32_gpu_full \
+  --hr_size 256 \
+  --lr_size 64 \
+  --eval_max_images 0 \
+  --num_inference_steps 25 \
+  --base_summary_csv outputs/eval_base_gpu_full/eval_summary.csv \
+  --train_summary_csv outputs/full_unet_lr1e5_1000_fp32_gpu/summary.csv
+```
+
+Generate a three-way summary:
+
+```bash
+python3 summarize_base_sandwich.py \
+  --base_eval_summary outputs/eval_base_gpu_full/eval_summary.csv \
+  --sandwich_eval_summary outputs/eval_sandwich_r8_lr1e5_1000_fp32_gpu_full/eval_summary.csv \
+  --sandwich_train_summary outputs/lora_sandwich_r8_lr1e5_1000_fp32_gpu/summary.csv \
+  --full_eval_summary outputs/eval_full_unet_lr1e5_1000_fp32_gpu_full/eval_summary.csv \
+  --full_train_summary outputs/full_unet_lr1e5_1000_fp32_gpu/summary.csv \
+  --output_csv outputs/base_vs_sandwich_vs_full_summary.csv \
+  --output_md outputs/base_vs_sandwich_vs_full_report.md
+```

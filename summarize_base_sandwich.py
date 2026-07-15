@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize Base vs Sandwich-LoRA experiment results.
+"""Summarize Base vs Sandwich-LoRA and optional full fine-tuning results.
 
 Reads the CSV files produced by onboard_sandwich_lora_sr.py and writes:
   outputs/base_vs_sandwich_summary.csv
@@ -103,6 +103,32 @@ def build_summary(args: argparse.Namespace) -> tuple[list[dict], str]:
         },
     ]
 
+    if args.full_eval_summary and args.full_train_summary:
+        full_eval = read_one_csv(args.full_eval_summary)
+        full_train = read_one_csv(args.full_train_summary)
+        full_psnr = as_float(full_eval, "mean_psnr")
+        full_ssim = as_float(full_eval, "mean_ssim")
+        full_delta_psnr = full_psnr - base_psnr
+        full_delta_ssim = full_ssim - base_ssim
+        full_update_mb = as_float(full_train, "update_size_mb", as_float(full_train, "adapter_size_mb"))
+        full_energy_wh = as_float(full_train, "estimated_energy_wh")
+        rows.append(
+            {
+                "method": "Full UNet Fine-tune",
+                "mean_psnr": fmt(full_psnr, 4),
+                "mean_ssim": fmt(full_ssim, 5),
+                "delta_psnr_vs_base": fmt(full_delta_psnr, 4),
+                "delta_ssim_vs_base": fmt(full_delta_ssim, 5),
+                "train_time_s": fmt(as_float(full_train, "train_time_s"), 1),
+                "estimated_energy_wh": fmt(full_energy_wh, 4),
+                "peak_cuda_mem_mb": fmt(as_float(full_train, "peak_cuda_mem_mb"), 1),
+                "adapter_size_mb": fmt(full_update_mb, 4),
+                "upload_time_1mbps_s": fmt(as_float(full_train, "upload_time_1mbps_s"), 1),
+                "psnr_gain_per_mb": fmt(full_delta_psnr / full_update_mb, 6) if full_update_mb else "",
+                "psnr_gain_per_wh": fmt(full_delta_psnr / full_energy_wh, 6) if full_energy_wh else "",
+            }
+        )
+
     verdict_bits = []
     if delta_psnr > 0:
         verdict_bits.append(f"Sandwich-LoRA improves PSNR by {delta_psnr:.4f} dB over Base.")
@@ -149,15 +175,16 @@ def main() -> None:
     parser.add_argument("--base_eval_summary", default="outputs/eval_base/eval_summary.csv")
     parser.add_argument("--sandwich_eval_summary", default="outputs/eval_sandwich_r8/eval_summary.csv")
     parser.add_argument("--sandwich_train_summary", default="outputs/lora_sandwich_r8/summary.csv")
+    parser.add_argument("--full_eval_summary", default="")
+    parser.add_argument("--full_train_summary", default="")
     parser.add_argument("--output_csv", default="outputs/base_vs_sandwich_summary.csv")
     parser.add_argument("--output_md", default="outputs/base_vs_sandwich_report.md")
     args = parser.parse_args()
 
-    missing = [
-        str(path)
-        for path in [args.base_eval_summary, args.sandwich_eval_summary, args.sandwich_train_summary]
-        if not Path(path).exists()
-    ]
+    required = [args.base_eval_summary, args.sandwich_eval_summary, args.sandwich_train_summary]
+    if args.full_eval_summary or args.full_train_summary:
+        required.extend([args.full_eval_summary, args.full_train_summary])
+    missing = [str(path) for path in required if not path or not Path(path).exists()]
     if missing:
         print("Missing required result files:")
         for path in missing:

@@ -521,11 +521,20 @@ def train(args: argparse.Namespace) -> None:
     pipe = load_pipeline(dtype=dtype).to(device)
     pipe.vae.requires_grad_(False)
     pipe.text_encoder.requires_grad_(False)
-    pipe.unet.requires_grad_(False)
     pipe.unet.train()
 
-    info = inject_lora(pipe.unet, args.rank, args.alpha, args.target, args.lora_scope)
-    move_lora_to_device(pipe.unet, device)
+    if args.train_method == "lora":
+        pipe.unet.requires_grad_(False)
+        info = inject_lora(pipe.unet, args.rank, args.alpha, args.target, args.lora_scope)
+        move_lora_to_device(pipe.unet, device)
+        trainable_label = "lora"
+    elif args.train_method == "full_unet":
+        pipe.unet.requires_grad_(True)
+        info = LoraInfo(names=[], trainable_params=sum(p.numel() for p in pipe.unet.parameters()), total_params=sum(p.numel() for p in pipe.unet.parameters()))
+        trainable_label = "full_unet"
+    else:
+        raise SystemExit(f"Unknown train_method={args.train_method}")
+
     params = [p for p in pipe.unet.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=args.lr)
 
@@ -652,6 +661,7 @@ def train(args: argparse.Namespace) -> None:
     output_dir = ensure_dir(args.output_dir)
     metadata = {
         "model_id": MODEL_ID,
+        "train_method": args.train_method,
         "rank": args.rank,
         "alpha": args.alpha,
         "target": args.target,
@@ -662,21 +672,35 @@ def train(args: argparse.Namespace) -> None:
         "seed": args.seed,
         "lora_module_names": info.names,
     }
-    weight_path = save_lora(pipe.unet, output_dir, metadata)
-    adapter_mb = weight_path.stat().st_size / (1024 * 1024)
+    if args.train_method == "lora":
+        weight_path = save_lora(pipe.unet, output_dir, metadata)
+        update_size_mb = weight_path.stat().st_size / (1024 * 1024)
+        saved_update_path = str(weight_path)
+    else:
+        unet_dir = ensure_dir(output_dir / "unet")
+        pipe.unet.save_pretrained(unet_dir, safe_serialization=True)
+        metadata_path = output_dir / "full_unet_metadata.json"
+        with metadata_path.open("w", encoding="utf-8") as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        update_size_mb = sum(p.stat().st_size for p in unet_dir.rglob("*") if p.is_file()) / (1024 * 1024)
+        saved_update_path = str(unet_dir)
+
     elapsed = time.time() - start
     energy_wh = args.power_w * elapsed / 3600.0
     effective_samples = args.train_steps * args.batch_size * args.grad_accum
     full_model_size_mb = args.full_model_size_mb
-    compression_ratio = safe_div(full_model_size_mb, adapter_mb)
+    compression_ratio = safe_div(full_model_size_mb, update_size_mb)
     trainable_param_pct = safe_div(info.trainable_params * 100.0, info.total_params)
     end_mem = cuda_memory_stats_mb(device)
     save_csv(output_dir / "train_log.csv", logs)
-    save_csv(output_dir / "lora_structure.csv", lora_structure_rows(pipe.unet))
+    if args.train_method == "lora":
+        save_csv(output_dir / "lora_structure.csv", lora_structure_rows(pipe.unet))
     save_csv(
         output_dir / "summary.csv",
         [
             {
+                "train_method": trainable_label,
+                "saved_update_path": saved_update_path,
                 "train_time_s": elapsed,
                 "sec_per_step": safe_div(elapsed, args.train_steps),
                 "effective_samples": effective_samples,
@@ -692,12 +716,13 @@ def train(args: argparse.Namespace) -> None:
                 "cuda_end_mem_reserved_mb": end_mem["cuda_mem_reserved_mb"],
                 "peak_cuda_mem_mb": end_mem["cuda_max_mem_allocated_mb"],
                 "peak_cuda_reserved_mb": end_mem["cuda_max_mem_reserved_mb"],
-                "adapter_size_mb": adapter_mb,
+                "adapter_size_mb": update_size_mb,
+                "update_size_mb": update_size_mb,
                 "full_model_size_mb": full_model_size_mb,
                 "compression_ratio_full_to_adapter": compression_ratio,
-                "upload_time_0_5mbps_s": upload_seconds(adapter_mb, 0.5, args.eta),
-                "upload_time_1mbps_s": upload_seconds(adapter_mb, 1.0, args.eta),
-                "upload_time_5mbps_s": upload_seconds(adapter_mb, 5.0, args.eta),
+                "upload_time_0_5mbps_s": upload_seconds(update_size_mb, 0.5, args.eta),
+                "upload_time_1mbps_s": upload_seconds(update_size_mb, 1.0, args.eta),
+                "upload_time_5mbps_s": upload_seconds(update_size_mb, 5.0, args.eta),
                 "lora_module_count": len(info.names),
                 "trainable_params": info.trainable_params,
                 "total_unet_params": info.total_params,
@@ -705,7 +730,7 @@ def train(args: argparse.Namespace) -> None:
             }
         ],
     )
-    print(f"Saved LoRA adapter to {weight_path}")
+    print(f"Saved {args.train_method} update to {saved_update_path}")
 
 
 def psnr(pred, target) -> float:
@@ -728,6 +753,11 @@ def eval_model(args: argparse.Namespace) -> None:
     dtype = torch.float16 if device.type == "cuda" and args.fp16 else torch.float32
     pipe = load_pipeline(dtype=dtype).to(device)
     pipe.set_progress_bar_config(disable=args.disable_progress)
+    if args.unet_dir:
+        require_packages("diffusers")
+        from diffusers import UNet2DConditionModel
+
+        pipe.unet = UNet2DConditionModel.from_pretrained(args.unet_dir, torch_dtype=dtype).to(device)
     if args.lora_dir:
         load_lora(pipe.unet, args.lora_dir, device=device, dtype=dtype)
     pipe.unet.eval()
@@ -893,12 +923,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--val_dir", default="data/ucmerced/val_hr")
     parser.add_argument("--output_dir", default="outputs/lora_sandwich_r8")
     parser.add_argument("--lora_dir", default="")
+    parser.add_argument("--unet_dir", default="")
     parser.add_argument("--hr_size", type=int, default=256)
     parser.add_argument("--lr_size", type=int, default=64)
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--alpha", type=int, default=16)
     parser.add_argument("--target", default="qv", choices=["q", "v", "qv", "qkvo"])
     parser.add_argument("--lora_scope", default="shallow_deep", choices=["shallow", "last2_up", "shallow_deep", "all"])
+    parser.add_argument("--train_method", default="lora", choices=["lora", "full_unet"])
     parser.add_argument("--train_steps", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accum", type=int, default=4)
