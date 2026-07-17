@@ -181,14 +181,75 @@ def target_suffixes(target: str) -> tuple[str, ...]:
     return mapping[target]
 
 
+def natural_key(text: str) -> list[int | str]:
+    key: list[int | str] = []
+    for part in text.replace(".", " ").split():
+        key.append(int(part) if part.isdigit() else part)
+    return key
+
+
+def transformer_block_key(name: str) -> str:
+    parts = name.split(".")
+    if "transformer_blocks" not in parts:
+        return ""
+    idx = parts.index("transformer_blocks")
+    if idx + 1 >= len(parts):
+        return ""
+    return ".".join(parts[: idx + 2])
+
+
+def select_topk_blocks(block_keys: set[str], k: int, policy: str) -> list[str]:
+    if k <= 0:
+        raise SystemExit("--topk_blocks must be positive when --lora_scope topk")
+    keys = sorted(block_keys, key=natural_key)
+    if not keys:
+        return []
+    if k >= len(keys):
+        return keys
+    if policy == "early":
+        return keys[:k]
+    if policy == "late":
+        return keys[-k:]
+    if policy == "uniform":
+        if k == 1:
+            return [keys[len(keys) // 2]]
+        indices = sorted({round(i * (len(keys) - 1) / (k - 1)) for i in range(k)})
+        return [keys[i] for i in indices][:k]
+    if policy == "balanced":
+        down = [key for key in keys if key.startswith("down_blocks.")]
+        mid = [key for key in keys if key.startswith("mid_block.")]
+        up = [key for key in keys if key.startswith("up_blocks.")]
+        selected: list[str] = []
+        i = 0
+        while len(selected) < k and (i < len(down) or i < len(up)):
+            if i < len(down):
+                selected.append(down[i])
+            if len(selected) >= k:
+                break
+            if i < len(up):
+                selected.append(up[-1 - i])
+            i += 1
+        for key in mid + keys:
+            if len(selected) >= k:
+                break
+            if key not in selected:
+                selected.append(key)
+        return selected[:k]
+    raise SystemExit(f"Unknown topk_policy={policy}")
+
+
 def module_in_scope(
     name: str,
     scope: str,
     shallow_down_indices: set[int] | None = None,
     last_up_indices: set[int] | None = None,
+    topk_block_keys: set[str] | None = None,
 ) -> bool:
     if scope == "all":
         return True
+    if scope == "topk":
+        topk_block_keys = topk_block_keys or set()
+        return transformer_block_key(name) in topk_block_keys
     if scope == "shallow":
         shallow_down_indices = shallow_down_indices or set()
         return any(f"down_blocks.{idx}." in name for idx in shallow_down_indices)
@@ -196,8 +257,10 @@ def module_in_scope(
         last_up_indices = last_up_indices or set()
         return any(f"up_blocks.{idx}." in name for idx in last_up_indices)
     if scope == "shallow_deep":
-        return module_in_scope(name, "shallow", shallow_down_indices, last_up_indices) or module_in_scope(
-            name, "last2_up", shallow_down_indices, last_up_indices
+        return module_in_scope(
+            name, "shallow", shallow_down_indices, last_up_indices, topk_block_keys
+        ) or module_in_scope(
+            name, "last2_up", shallow_down_indices, last_up_indices, topk_block_keys
         )
     raise SystemExit(f"Unknown lora_scope={scope}")
 
@@ -215,15 +278,29 @@ class LoraInfo:
     names: list[str]
     trainable_params: int
     total_params: int
+    selected_blocks: list[str]
 
 
-def inject_lora(unet: nn.Module, rank: int, alpha: int, target: str, scope: str) -> LoraInfo:
+def inject_lora(
+    unet: nn.Module,
+    rank: int,
+    alpha: int,
+    target: str,
+    scope: str,
+    topk_blocks: int = 5,
+    topk_policy: str = "balanced",
+    topk_block_names: list[str] | None = None,
+) -> LoraInfo:
     suffixes = target_suffixes(target)
     replacements: list[tuple[str, nn.Linear]] = []
     down_indices_with_targets = set()
+    candidate_block_keys = set()
     up_indices = set()
     for name, module in unet.named_modules():
         parts = name.split(".")
+        block_key = transformer_block_key(name)
+        if isinstance(module, nn.Linear) and block_key and any(name.endswith(suffix) for suffix in suffixes):
+            candidate_block_keys.add(block_key)
         if (
             isinstance(module, nn.Linear)
             and len(parts) >= 2
@@ -236,11 +313,17 @@ def inject_lora(unet: nn.Module, rank: int, alpha: int, target: str, scope: str)
             up_indices.add(int(parts[1]))
     shallow_down_indices = set(sorted(down_indices_with_targets)[:1])
     last_up_indices = set(sorted(up_indices)[-2:])
+    if scope == "topk":
+        selected_blocks = topk_block_names or select_topk_blocks(candidate_block_keys, topk_blocks, topk_policy)
+        topk_block_keys = set(selected_blocks)
+    else:
+        selected_blocks = []
+        topk_block_keys = set()
 
     for name, module in unet.named_modules():
         if not isinstance(module, nn.Linear):
             continue
-        if not module_in_scope(name, scope, shallow_down_indices, last_up_indices):
+        if not module_in_scope(name, scope, shallow_down_indices, last_up_indices, topk_block_keys):
             continue
         if any(name.endswith(suffix) for suffix in suffixes):
             replacements.append((name, module))
@@ -257,7 +340,7 @@ def inject_lora(unet: nn.Module, rank: int, alpha: int, target: str, scope: str)
 
     trainable = sum(p.numel() for p in unet.parameters() if p.requires_grad)
     total = sum(p.numel() for p in unet.parameters())
-    return LoraInfo([name for name, _ in replacements], trainable, total)
+    return LoraInfo([name for name, _ in replacements], trainable, total, selected_blocks)
 
 
 def iter_lora_modules(root: nn.Module) -> Iterable[tuple[str, LoRALinear]]:
@@ -330,6 +413,9 @@ def load_lora(unet: nn.Module, lora_dir: str | Path, device: torch.device, dtype
         alpha=int(metadata["alpha"]),
         target=metadata["target"],
         scope=metadata["lora_scope"],
+        topk_blocks=int(metadata.get("topk_blocks", 5)),
+        topk_policy=metadata.get("topk_policy", "balanced"),
+        topk_block_names=metadata.get("topk_block_names") or None,
     )
     move_lora_to_device(unet, device)
     tensors = load_file(str(lora_dir / "pytorch_lora_weights.safetensors"))
@@ -417,6 +503,9 @@ def inspect_lora(args: argparse.Namespace) -> None:
             alpha=int(metadata["alpha"]),
             target=metadata["target"],
             scope=metadata["lora_scope"],
+            topk_blocks=int(metadata.get("topk_blocks", 5)),
+            topk_policy=metadata.get("topk_policy", "balanced"),
+            topk_block_names=metadata.get("topk_block_names") or None,
         )
         actual_modules = set(info.names)
         expected_set = set(expected_modules)
@@ -597,12 +686,25 @@ def train(args: argparse.Namespace) -> None:
 
     if args.train_method == "lora":
         pipe.unet.requires_grad_(False)
-        info = inject_lora(pipe.unet, args.rank, args.alpha, args.target, args.lora_scope)
+        info = inject_lora(
+            pipe.unet,
+            args.rank,
+            args.alpha,
+            args.target,
+            args.lora_scope,
+            topk_blocks=args.topk_blocks,
+            topk_policy=args.topk_policy,
+        )
         move_lora_to_device(pipe.unet, device)
         trainable_label = "lora"
     elif args.train_method == "full_unet":
         pipe.unet.requires_grad_(True)
-        info = LoraInfo(names=[], trainable_params=sum(p.numel() for p in pipe.unet.parameters()), total_params=sum(p.numel() for p in pipe.unet.parameters()))
+        info = LoraInfo(
+            names=[],
+            trainable_params=sum(p.numel() for p in pipe.unet.parameters()),
+            total_params=sum(p.numel() for p in pipe.unet.parameters()),
+            selected_blocks=[],
+        )
         trainable_label = "full_unet"
     else:
         raise SystemExit(f"Unknown train_method={args.train_method}")
@@ -743,6 +845,9 @@ def train(args: argparse.Namespace) -> None:
         "train_steps": args.train_steps,
         "seed": args.seed,
         "lora_module_names": info.names,
+        "topk_blocks": args.topk_blocks,
+        "topk_policy": args.topk_policy,
+        "topk_block_names": info.selected_blocks,
     }
     if args.train_method == "lora":
         weight_path = save_lora(pipe.unet, output_dir, metadata, save_dtype=args.save_lora_dtype)
@@ -1002,7 +1107,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--alpha", type=int, default=16)
     parser.add_argument("--target", default="qv", choices=["q", "v", "qv", "qkvo"])
-    parser.add_argument("--lora_scope", default="shallow_deep", choices=["shallow", "last2_up", "shallow_deep", "all"])
+    parser.add_argument(
+        "--lora_scope",
+        default="shallow_deep",
+        choices=["shallow", "last2_up", "shallow_deep", "topk", "all"],
+    )
+    parser.add_argument("--topk_blocks", type=int, default=5)
+    parser.add_argument("--topk_policy", default="balanced", choices=["balanced", "uniform", "early", "late"])
     parser.add_argument("--save_lora_dtype", default="fp32", choices=["fp32", "fp16"])
     parser.add_argument("--train_method", default="lora", choices=["lora", "full_unet"])
     parser.add_argument("--train_steps", type=int, default=200)

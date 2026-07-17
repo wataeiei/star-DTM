@@ -121,10 +121,55 @@ Change only `--lora_scope` and `--output_dir`:
   first down block that actually contains target attention layers in the current
   diffusers UNet.
 - `--lora_scope last2_up` for Last2-Up-LoRA
+- `--lora_scope topk --topk_blocks 8 --topk_policy balanced` for Top-K Block LoRA
 - `--lora_scope all` for All-LoRA
 
 For formal results, prefer increasing `--eval_max_images` or setting it to `0`
 to evaluate the full validation split.
+
+Top-K Block LoRA selects K Transformer blocks that contain the target attention
+projections, then applies LoRA only to those blocks. The selected block names are
+stored in `lora_metadata.json`, so evaluation reloads exactly the same placement.
+
+Example Top-8 run:
+
+```bash
+python3 onboard_sandwich_lora_sr.py \
+  --mode train \
+  --train_method lora \
+  --train_dir data/ucmerced/train_hr \
+  --output_dir outputs/lora_top8_balanced_r8_lr1e5_1000_fp32_gpu \
+  --hr_size 256 \
+  --lr_size 64 \
+  --rank 8 \
+  --alpha 16 \
+  --target qv \
+  --lora_scope topk \
+  --topk_blocks 8 \
+  --topk_policy balanced \
+  --train_steps 1000 \
+  --batch_size 1 \
+  --grad_accum 4 \
+  --lr 1e-5 \
+  --grad_clip 1.0 \
+  --power_w 30 \
+  --full_model_size_mb 1200 \
+  --no_fp16
+```
+
+```bash
+python3 onboard_sandwich_lora_sr.py \
+  --mode eval \
+  --val_dir data/ucmerced/val_hr \
+  --lora_dir outputs/lora_top8_balanced_r8_lr1e5_1000_fp32_gpu \
+  --output_dir outputs/eval_top8_balanced_r8_lr1e5_1000_fp32_gpu_full \
+  --hr_size 256 \
+  --lr_size 64 \
+  --eval_max_images 0 \
+  --num_inference_steps 25 \
+  --base_summary_csv outputs/eval_base_gpu_full/eval_summary.csv \
+  --train_summary_csv outputs/lora_top8_balanced_r8_lr1e5_1000_fp32_gpu/summary.csv
+```
 
 ## 7. Summarize Base vs Sandwich-LoRA
 
