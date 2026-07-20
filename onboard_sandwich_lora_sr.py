@@ -247,7 +247,7 @@ def module_in_scope(
 ) -> bool:
     if scope == "all":
         return True
-    if scope == "topk":
+    if scope in ("topk", "grad_topk"):
         topk_block_keys = topk_block_keys or set()
         return transformer_block_key(name) in topk_block_keys
     if scope == "shallow":
@@ -271,6 +271,12 @@ def split_parent_name(root: nn.Module, dotted_name: str) -> tuple[nn.Module, str
     for part in parts[:-1]:
         parent = parent[int(part)] if part.isdigit() else getattr(parent, part)
     return parent, parts[-1]
+
+
+def unwrap_lora(root: nn.Module) -> None:
+    for name, module in list(iter_lora_modules(root)):
+        parent, child_name = split_parent_name(root, name)
+        setattr(parent, child_name, module.base)
 
 
 @dataclass
@@ -313,7 +319,7 @@ def inject_lora(
             up_indices.add(int(parts[1]))
     shallow_down_indices = set(sorted(down_indices_with_targets)[:1])
     last_up_indices = set(sorted(up_indices)[-2:])
-    if scope == "topk":
+    if scope in ("topk", "grad_topk"):
         selected_blocks = topk_block_names or select_topk_blocks(candidate_block_keys, topk_blocks, topk_policy)
         topk_block_keys = set(selected_blocks)
     else:
@@ -353,6 +359,96 @@ def move_lora_to_device(root: nn.Module, device: torch.device) -> None:
     for _name, module in iter_lora_modules(root):
         module.lora_down.to(device=device, dtype=torch.float32)
         module.lora_up.to(device=device, dtype=torch.float32)
+
+
+def lora_block_key(name: str) -> str:
+    return transformer_block_key(name)
+
+
+def lora_param_vector(module: LoRALinear) -> torch.Tensor:
+    return torch.cat(
+        [
+            module.lora_down.weight.detach().float().flatten().cpu(),
+            module.lora_up.weight.detach().float().flatten().cpu(),
+        ]
+    )
+
+
+def lora_grad_norm(module: LoRALinear) -> float:
+    total = 0.0
+    for param in (module.lora_down.weight, module.lora_up.weight):
+        if param.grad is not None:
+            total += float(param.grad.detach().float().pow(2).sum().cpu())
+    return math.sqrt(total)
+
+
+def set_lora_trainable(module: LoRALinear, trainable: bool) -> None:
+    module.lora_down.weight.requires_grad_(trainable)
+    module.lora_up.weight.requires_grad_(trainable)
+
+
+def shallow_lora_blocks(root: nn.Module) -> set[str]:
+    blocks = {lora_block_key(name) for name, _module in iter_lora_modules(root) if name.startswith("down_blocks.")}
+    return {block for block in blocks if block}
+
+
+def init_freeze_state(root: nn.Module) -> dict:
+    snapshots: dict[str, torch.Tensor] = {}
+    for name, module in iter_lora_modules(root):
+        block = lora_block_key(name)
+        if block:
+            current = lora_param_vector(module)
+            snapshots[block] = current if block not in snapshots else torch.cat([snapshots[block], current])
+    return {"snapshots": snapshots, "patience": {}, "frozen": set(), "events": []}
+
+
+def dynamic_freeze_check(root: nn.Module, step: int, args: argparse.Namespace, state: dict) -> None:
+    shallow_blocks = shallow_lora_blocks(root)
+    if not shallow_blocks:
+        return
+    current_vectors: dict[str, torch.Tensor] = {}
+    grad_sq: dict[str, float] = {}
+    modules_by_block: dict[str, list[LoRALinear]] = {}
+    for name, module in iter_lora_modules(root):
+        block = lora_block_key(name)
+        if block not in shallow_blocks:
+            continue
+        vec = lora_param_vector(module)
+        current_vectors[block] = vec if block not in current_vectors else torch.cat([current_vectors[block], vec])
+        grad_sq[block] = grad_sq.get(block, 0.0) + lora_grad_norm(module) ** 2
+        modules_by_block.setdefault(block, []).append(module)
+
+    for block, current in current_vectors.items():
+        previous = state["snapshots"].get(block)
+        if previous is None:
+            state["snapshots"][block] = current
+            continue
+        update_ratio = float(torch.linalg.vector_norm(current - previous) / (torch.linalg.vector_norm(previous) + 1e-12))
+        grad_norm = math.sqrt(grad_sq.get(block, 0.0))
+        should_count = update_ratio < args.freeze_tau_update and grad_norm < args.freeze_tau_grad
+        state["patience"][block] = state["patience"].get(block, 0) + 1 if should_count else 0
+        frozen_now = False
+        if state["patience"][block] >= args.freeze_patience and block not in state["frozen"]:
+            for module in modules_by_block.get(block, []):
+                set_lora_trainable(module, False)
+            state["frozen"].add(block)
+            frozen_now = True
+            print(
+                f"Dynamic freeze: froze {block} at step {step} "
+                f"(update_ratio={update_ratio:.3e}, grad_norm={grad_norm:.3e})"
+            )
+        state["events"].append(
+            {
+                "step": step,
+                "block": block,
+                "update_ratio": update_ratio,
+                "grad_norm": grad_norm,
+                "patience_count": state["patience"][block],
+                "frozen": block in state["frozen"],
+                "frozen_now": frozen_now,
+            }
+        )
+        state["snapshots"][block] = current
 
 
 def lora_structure_rows(unet: nn.Module) -> list[dict]:
@@ -674,18 +770,206 @@ def cuda_memory_stats_mb(device: torch.device) -> dict:
     }
 
 
+def diffusion_train_loss(pipe, batch: dict, args: argparse.Namespace, device: torch.device, dtype: torch.dtype, use_amp: bool):
+    hr = batch["hr"].to(device=device, dtype=dtype)
+    lr_up = batch["lr_up"].to(device=device, dtype=dtype)
+    bsz = hr.shape[0]
+
+    with torch.no_grad():
+        latents = pipe.vae.encode(hr).latent_dist.sample()
+        latents = latents * pipe.vae.config.scaling_factor
+        noise = torch.randn_like(latents)
+        timesteps = torch.randint(
+            0,
+            pipe.scheduler.config.num_train_timesteps,
+            (bsz,),
+            device=device,
+            dtype=torch.long,
+        )
+        noisy_latents = pipe.scheduler.add_noise(latents, noise, timesteps)
+        noise_level = torch.full((bsz,), args.noise_level, device=device, dtype=torch.long)
+        lr_cond_clean = F.interpolate(
+            lr_up.float(),
+            size=noisy_latents.shape[-2:],
+            mode="bicubic",
+            align_corners=False,
+        ).to(dtype=dtype)
+        low_noise = torch.randn_like(lr_cond_clean)
+        if hasattr(pipe, "low_res_scheduler"):
+            lr_cond = pipe.low_res_scheduler.add_noise(lr_cond_clean, low_noise, noise_level)
+        else:
+            lr_cond = lr_cond_clean
+        model_input = torch.cat([noisy_latents, lr_cond], dim=1)
+        prompt_embeds = get_prompt_embeds(pipe, bsz, device, dtype)
+        prediction_type = getattr(pipe.scheduler.config, "prediction_type", "epsilon")
+        if prediction_type == "v_prediction":
+            target = pipe.scheduler.get_velocity(latents, noise, timesteps)
+        else:
+            target = noise
+
+    with autocast_context(device, enabled=use_amp):
+        pred = pipe.unet(model_input, timesteps, prompt_embeds, class_labels=noise_level).sample
+        loss = F.mse_loss(pred.float(), target.float())
+    return loss, pred, target
+
+
+def param_matches_target(name: str, suffixes: tuple[str, ...]) -> bool:
+    return any(f".{suffix}.weight" in name for suffix in suffixes)
+
+
+def block_order(keys: Iterable[str]) -> dict[str, int]:
+    ordered = sorted(keys, key=natural_key)
+    return {key: idx + 1 for idx, key in enumerate(ordered)}
+
+
+def select_gradient_blocks(rows: list[dict], args: argparse.Namespace) -> list[str]:
+    rows.sort(key=lambda row: row["selection_score"], reverse=True)
+    if args.grad_probe_budget_params > 0:
+        selected = []
+        used = 0
+        for row in rows:
+            params = int(row["lora_param_count"])
+            if used + params <= args.grad_probe_budget_params:
+                selected.append(row["block"])
+                used += params
+            if len(selected) >= args.topk_blocks:
+                break
+        if selected:
+            return selected
+    return [row["block"] for row in rows[: args.topk_blocks]]
+
+
+def probe_gradient_topk_blocks(
+    pipe,
+    loader: DataLoader,
+    args: argparse.Namespace,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> list[str]:
+    pipe.unet.requires_grad_(False)
+    probe_info = inject_lora(
+        pipe.unet,
+        args.rank,
+        args.alpha,
+        args.target,
+        "all",
+    )
+    move_lora_to_device(pipe.unet, device)
+    pipe.unet.zero_grad(set_to_none=True)
+
+    block_param_counts: dict[str, int] = {}
+    for name, module in iter_lora_modules(pipe.unet):
+        block_key = transformer_block_key(name)
+        if block_key:
+            block_param_counts[block_key] = block_param_counts.get(block_key, 0) + (
+                module.lora_down.weight.numel() + module.lora_up.weight.numel()
+            )
+
+    if not block_param_counts:
+        raise SystemExit(f"No gradient probe candidates found for target={args.target}")
+
+    data_iter = iter(loader)
+    rows = []
+    total_loss = 0.0
+    valid_batches = 0
+    use_amp = False
+    probe_batches = max(1, args.grad_probe_batches)
+    for probe_idx in range(1, probe_batches + 1):
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            data_iter = iter(loader)
+            batch = next(data_iter)
+
+        loss, pred, target = diffusion_train_loss(pipe, batch, args, device, dtype, use_amp)
+        if not torch.isfinite(loss):
+            print(
+                f"gradient probe batch {probe_idx}/{probe_batches} skipped: "
+                f"loss_nonfinite,pred_finite={bool(torch.isfinite(pred).all().item())},"
+                f"target_finite={bool(torch.isfinite(target).all().item())}"
+            )
+            pipe.unet.zero_grad(set_to_none=True)
+            continue
+        loss.backward()
+        total_loss += float(loss.detach().cpu())
+        valid_batches += 1
+        print(f"gradient probe batch {probe_idx:03d}/{probe_batches} loss={float(loss.detach().cpu()):.6f}")
+
+    if valid_batches == 0:
+        raise SystemExit("Gradient probe failed: all probe batches produced non-finite loss.")
+
+    block_grad_sq: dict[str, float] = {key: 0.0 for key in block_param_counts}
+    for name, module in iter_lora_modules(pipe.unet):
+        block_key = transformer_block_key(name)
+        if block_key not in block_grad_sq:
+            continue
+        for param in (module.lora_down.weight, module.lora_up.weight):
+            if param.grad is not None:
+                block_grad_sq[block_key] += float(param.grad.detach().float().pow(2).sum().cpu())
+
+    order = block_order(block_param_counts)
+    total_blocks = len(order)
+    for block, grad_sq in block_grad_sq.items():
+        grad_norm = math.sqrt(grad_sq)
+        param_count = block_param_counts[block]
+        normalized_grad = grad_norm / math.sqrt(max(param_count, 1)) if args.grad_probe_normalize else grad_norm
+        bp_cost = total_blocks - order[block] + 1
+        selection_score = normalized_grad
+        if args.grad_probe_compute_lambda > 0:
+            selection_score = normalized_grad / (param_count + args.grad_probe_compute_lambda * bp_cost)
+        rows.append(
+            {
+                "block": block,
+                "block_index": order[block],
+                "grad_norm": grad_norm,
+                "lora_param_count": param_count,
+                "normalized_grad_score": normalized_grad,
+                "bp_cost": bp_cost,
+                "compute_lambda": args.grad_probe_compute_lambda,
+                "selection_score": selection_score,
+                "probe_batches": valid_batches,
+                "mean_probe_loss": total_loss / valid_batches,
+                "selected": False,
+            }
+        )
+
+    selected = select_gradient_blocks(rows, args)
+    selected_set = set(selected)
+    for row in rows:
+        row["selected"] = row["block"] in selected_set
+
+    output_dir = ensure_dir(args.output_dir)
+    rows.sort(key=lambda row: row["selection_score"], reverse=True)
+    save_csv(output_dir / "grad_topk_scores.csv", rows)
+    unwrap_lora(pipe.unet)
+    pipe.unet.zero_grad(set_to_none=True)
+    pipe.unet.requires_grad_(False)
+    del probe_info
+    print(f"Gradient-TopK selected blocks: {selected}")
+    return selected
+
+
 def train(args: argparse.Namespace) -> None:
     require_torch()
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    dtype = torch.float16 if device.type == "cuda" and args.fp16 else torch.float32
+    force_fp32 = args.train_method == "lora" and args.lora_scope == "grad_topk"
+    if force_fp32 and args.fp16:
+        print("Gradient-TopK-LoRA uses FP32 for stable gradient probing; ignoring --fp16 during training.")
+    dtype = torch.float16 if device.type == "cuda" and args.fp16 and not force_fp32 else torch.float32
     pipe = load_pipeline(dtype=dtype).to(device)
     pipe.vae.requires_grad_(False)
     pipe.text_encoder.requires_grad_(False)
     pipe.unet.train()
 
+    dataset = HrImageDataset(args.train_dir, args.hr_size, args.lr_size)
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+
     if args.train_method == "lora":
         pipe.unet.requires_grad_(False)
+        topk_block_names = None
+        if args.lora_scope == "grad_topk":
+            topk_block_names = probe_gradient_topk_blocks(pipe, loader, args, device, dtype)
         info = inject_lora(
             pipe.unet,
             args.rank,
@@ -694,6 +978,7 @@ def train(args: argparse.Namespace) -> None:
             args.lora_scope,
             topk_blocks=args.topk_blocks,
             topk_policy=args.topk_policy,
+            topk_block_names=topk_block_names,
         )
         move_lora_to_device(pipe.unet, device)
         trainable_label = "lora"
@@ -712,11 +997,9 @@ def train(args: argparse.Namespace) -> None:
     params = [p for p in pipe.unet.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=args.lr)
 
-    dataset = HrImageDataset(args.train_dir, args.hr_size, args.lr_size)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     data_iter = iter(loader)
 
-    use_amp = device.type == "cuda" and args.fp16
+    use_amp = device.type == "cuda" and args.fp16 and not force_fp32
     scaler = make_grad_scaler(device, enabled=use_amp)
     logs = []
     start = time.time()
@@ -725,6 +1008,7 @@ def train(args: argparse.Namespace) -> None:
     start_mem = cuda_memory_stats_mb(device)
     optimizer.zero_grad(set_to_none=True)
     skipped_nonfinite_steps = 0
+    freeze_state = init_freeze_state(pipe.unet) if args.dynamic_shallow_freeze and args.train_method == "lora" else None
 
     for step in range(1, args.train_steps + 1):
         accum_loss = 0.0
@@ -800,6 +1084,13 @@ def train(args: argparse.Namespace) -> None:
                 torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
+            if (
+                freeze_state is not None
+                and step >= args.freeze_warmup_steps
+                and args.freeze_check_interval > 0
+                and step % args.freeze_check_interval == 0
+            ):
+                dynamic_freeze_check(pipe.unet, step, args, freeze_state)
             optimizer.zero_grad(set_to_none=True)
 
         elapsed = time.time() - start
@@ -813,6 +1104,7 @@ def train(args: argparse.Namespace) -> None:
                 "nonfinite_reason": nonfinite_reason,
                 "did_backward": did_backward,
                 "skipped_nonfinite_steps": skipped_nonfinite_steps,
+                "frozen_shallow_blocks": len(freeze_state["frozen"]) if freeze_state is not None else 0,
                 **mem_stats,
             }
         )
@@ -848,6 +1140,16 @@ def train(args: argparse.Namespace) -> None:
         "topk_blocks": args.topk_blocks,
         "topk_policy": args.topk_policy,
         "topk_block_names": info.selected_blocks,
+        "grad_probe_batches": args.grad_probe_batches,
+        "grad_probe_normalize": args.grad_probe_normalize,
+        "grad_probe_compute_lambda": args.grad_probe_compute_lambda,
+        "grad_probe_budget_params": args.grad_probe_budget_params,
+        "dynamic_shallow_freeze": args.dynamic_shallow_freeze,
+        "freeze_warmup_steps": args.freeze_warmup_steps,
+        "freeze_check_interval": args.freeze_check_interval,
+        "freeze_patience": args.freeze_patience,
+        "freeze_tau_update": args.freeze_tau_update,
+        "freeze_tau_grad": args.freeze_tau_grad,
     }
     if args.train_method == "lora":
         weight_path = save_lora(pipe.unet, output_dir, metadata, save_dtype=args.save_lora_dtype)
@@ -868,10 +1170,14 @@ def train(args: argparse.Namespace) -> None:
     full_model_size_mb = args.full_model_size_mb
     compression_ratio = safe_div(full_model_size_mb, update_size_mb)
     trainable_param_pct = safe_div(info.trainable_params * 100.0, info.total_params)
+    final_trainable_params = sum(p.numel() for p in pipe.unet.parameters() if p.requires_grad)
+    final_trainable_param_pct = safe_div(final_trainable_params * 100.0, info.total_params)
     end_mem = cuda_memory_stats_mb(device)
     save_csv(output_dir / "train_log.csv", logs)
     if args.train_method == "lora":
         save_csv(output_dir / "lora_structure.csv", lora_structure_rows(pipe.unet))
+    if freeze_state is not None:
+        save_csv(output_dir / "dynamic_freeze_log.csv", freeze_state["events"])
     save_csv(
         output_dir / "summary.csv",
         [
@@ -903,8 +1209,17 @@ def train(args: argparse.Namespace) -> None:
                 "upload_time_5mbps_s": upload_seconds(update_size_mb, 5.0, args.eta),
                 "lora_module_count": len(info.names),
                 "trainable_params": info.trainable_params,
+                "final_trainable_params": final_trainable_params,
                 "total_unet_params": info.total_params,
                 "trainable_param_pct": trainable_param_pct,
+                "final_trainable_param_pct": final_trainable_param_pct,
+                "dynamic_shallow_freeze": args.dynamic_shallow_freeze,
+                "frozen_shallow_blocks": len(freeze_state["frozen"]) if freeze_state is not None else 0,
+                "freeze_warmup_steps": args.freeze_warmup_steps if freeze_state is not None else 0,
+                "freeze_check_interval": args.freeze_check_interval if freeze_state is not None else 0,
+                "freeze_patience": args.freeze_patience if freeze_state is not None else 0,
+                "freeze_tau_update": args.freeze_tau_update if freeze_state is not None else 0,
+                "freeze_tau_grad": args.freeze_tau_grad if freeze_state is not None else 0,
             }
         ],
     )
@@ -1110,10 +1425,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lora_scope",
         default="shallow_deep",
-        choices=["shallow", "last2_up", "shallow_deep", "topk", "all"],
+        choices=["shallow", "last2_up", "shallow_deep", "topk", "grad_topk", "all"],
     )
     parser.add_argument("--topk_blocks", type=int, default=5)
     parser.add_argument("--topk_policy", default="balanced", choices=["balanced", "uniform", "early", "late"])
+    parser.add_argument("--grad_probe_batches", type=int, default=20)
+    parser.add_argument("--grad_probe_normalize", dest="grad_probe_normalize", action="store_true", default=True)
+    parser.add_argument("--no_grad_probe_normalize", dest="grad_probe_normalize", action="store_false")
+    parser.add_argument("--grad_probe_compute_lambda", type=float, default=0.0)
+    parser.add_argument("--grad_probe_budget_params", type=int, default=0)
+    parser.add_argument("--dynamic_shallow_freeze", action="store_true")
+    parser.add_argument("--freeze_warmup_steps", type=int, default=20)
+    parser.add_argument("--freeze_check_interval", type=int, default=10)
+    parser.add_argument("--freeze_patience", type=int, default=3)
+    parser.add_argument("--freeze_tau_update", type=float, default=1e-3)
+    parser.add_argument("--freeze_tau_grad", type=float, default=1e-5)
     parser.add_argument("--save_lora_dtype", default="fp32", choices=["fp32", "fp16"])
     parser.add_argument("--train_method", default="lora", choices=["lora", "full_unet"])
     parser.add_argument("--train_steps", type=int, default=200)

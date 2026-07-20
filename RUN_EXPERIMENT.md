@@ -122,6 +122,8 @@ Change only `--lora_scope` and `--output_dir`:
   diffusers UNet.
 - `--lora_scope last2_up` for Last2-Up-LoRA
 - `--lora_scope topk --topk_blocks 8 --topk_policy balanced` for Top-K Block LoRA
+- `--lora_scope grad_topk --topk_blocks 5 --grad_probe_batches 20` for
+  Gradient-TopK-LoRA
 - `--lora_scope all` for All-LoRA
 
 For formal results, prefer increasing `--eval_max_images` or setting it to `0`
@@ -169,6 +171,72 @@ python3 onboard_sandwich_lora_sr.py \
   --num_inference_steps 25 \
   --base_summary_csv outputs/eval_base_gpu_full/eval_summary.csv \
   --train_summary_csv outputs/lora_top8_balanced_r8_lr1e5_1000_fp32_gpu/summary.csv
+```
+
+Gradient-TopK-LoRA first inserts temporary probe LoRA modules, measures the
+gradient norm of probe LoRA parameters on a small number of calibration batches,
+writes layer scores to `grad_topk_scores.csv`, removes the probe LoRA, and then
+trains LoRA only on the selected blocks. Use Top-5 for a fair comparison with
+Sandwich-LoRA-Fixed:
+
+```bash
+python3 onboard_sandwich_lora_sr.py \
+  --mode train \
+  --train_method lora \
+  --train_dir data/ucmerced/train_hr \
+  --output_dir outputs/lora_gradtop5_r8_lr1e5_1000_fp32_gpu \
+  --hr_size 256 \
+  --lr_size 64 \
+  --rank 8 \
+  --alpha 16 \
+  --target qv \
+  --lora_scope grad_topk \
+  --topk_blocks 5 \
+  --grad_probe_batches 20 \
+  --train_steps 1000 \
+  --batch_size 1 \
+  --grad_accum 4 \
+  --lr 1e-5 \
+  --grad_clip 1.0 \
+  --power_w 30 \
+  --full_model_size_mb 1200 \
+  --no_fp16
+```
+
+For compute-aware selection, add a nonzero backward-path penalty. This favors
+layers with high normalized gradient score and lower estimated backward cost:
+
+```bash
+--grad_probe_compute_lambda 10000
+```
+
+For dynamic shallow-layer freezing, add:
+
+```bash
+--dynamic_shallow_freeze \
+--freeze_warmup_steps 20 \
+--freeze_check_interval 10 \
+--freeze_patience 3 \
+--freeze_tau_update 1e-3 \
+--freeze_tau_grad 1e-5
+```
+
+When enabled, shallow LoRA blocks that satisfy both the update and gradient
+thresholds for several check windows are frozen. The events are saved to
+`dynamic_freeze_log.csv`.
+
+```bash
+python3 onboard_sandwich_lora_sr.py \
+  --mode eval \
+  --val_dir data/ucmerced/val_hr \
+  --lora_dir outputs/lora_gradtop5_r8_lr1e5_1000_fp32_gpu \
+  --output_dir outputs/eval_gradtop5_r8_lr1e5_1000_fp32_gpu_full \
+  --hr_size 256 \
+  --lr_size 64 \
+  --eval_max_images 0 \
+  --num_inference_steps 25 \
+  --base_summary_csv outputs/eval_base_gpu_full/eval_summary.csv \
+  --train_summary_csv outputs/lora_gradtop5_r8_lr1e5_1000_fp32_gpu/summary.csv
 ```
 
 ## 7. Summarize Base vs Sandwich-LoRA
