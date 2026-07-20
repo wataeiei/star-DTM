@@ -198,6 +198,27 @@ def transformer_block_key(name: str) -> str:
     return ".".join(parts[: idx + 2])
 
 
+def block_group_index(block: str, group: str) -> int | None:
+    parts = block.split(".")
+    if len(parts) >= 2 and parts[0] == group and parts[1].isdigit():
+        return int(parts[1])
+    return None
+
+
+def sandwich_core_blocks(block_keys: Iterable[str]) -> list[str]:
+    keys = sorted(block_keys, key=natural_key)
+    down_indices = [idx for key in keys if (idx := block_group_index(key, "down_blocks")) is not None]
+    up_indices = [idx for key in keys if (idx := block_group_index(key, "up_blocks")) is not None]
+    core: list[str] = []
+    if down_indices:
+        first_down = min(down_indices)
+        core.extend([key for key in keys if block_group_index(key, "down_blocks") == first_down])
+    if up_indices:
+        last_up = max(up_indices)
+        core.extend([key for key in keys if block_group_index(key, "up_blocks") == last_up])
+    return list(dict.fromkeys(core))
+
+
 def select_topk_blocks(block_keys: set[str], k: int, policy: str) -> list[str]:
     if k <= 0:
         raise SystemExit("--topk_blocks must be positive when --lora_scope topk")
@@ -215,6 +236,15 @@ def select_topk_blocks(block_keys: set[str], k: int, policy: str) -> list[str]:
             return [keys[len(keys) // 2]]
         indices = sorted({round(i * (len(keys) - 1) / (k - 1)) for i in range(k)})
         return [keys[i] for i in indices][:k]
+    if policy in ("sandwich_plus", "grad_sandwich_plus"):
+        core = sandwich_core_blocks(keys)
+        selected = core[:k]
+        for key in [key for key in keys if key.startswith("mid_block.")] + keys:
+            if len(selected) >= k:
+                break
+            if key not in selected:
+                selected.append(key)
+        return selected[:k]
     if policy == "balanced":
         down = [key for key in keys if key.startswith("down_blocks.")]
         mid = [key for key in keys if key.startswith("mid_block.")]
@@ -823,6 +853,25 @@ def block_order(keys: Iterable[str]) -> dict[str, int]:
 
 
 def select_gradient_blocks(rows: list[dict], args: argparse.Namespace) -> list[str]:
+    row_by_block = {row["block"]: row for row in rows}
+    if args.topk_policy == "grad_sandwich_plus":
+        core = sandwich_core_blocks(row_by_block)
+        selected = core[: args.topk_blocks]
+        used = sum(int(row_by_block[block]["lora_param_count"]) for block in selected if block in row_by_block)
+        ranked = sorted(rows, key=lambda row: row["selection_score"], reverse=True)
+        for row in ranked:
+            block = row["block"]
+            if block in selected:
+                continue
+            params = int(row["lora_param_count"])
+            if args.grad_probe_budget_params > 0 and used + params > args.grad_probe_budget_params:
+                continue
+            selected.append(block)
+            used += params
+            if len(selected) >= args.topk_blocks:
+                break
+        return selected[: args.topk_blocks]
+
     rows.sort(key=lambda row: row["selection_score"], reverse=True)
     if args.grad_probe_budget_params > 0:
         selected = []
@@ -1431,7 +1480,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["shallow", "last2_up", "shallow_deep", "topk", "grad_topk", "all"],
     )
     parser.add_argument("--topk_blocks", type=int, default=5)
-    parser.add_argument("--topk_policy", default="balanced", choices=["balanced", "uniform", "early", "late"])
+    parser.add_argument(
+        "--topk_policy",
+        default="balanced",
+        choices=["balanced", "uniform", "early", "late", "sandwich_plus", "grad_sandwich_plus"],
+    )
     parser.add_argument("--grad_probe_batches", type=int, default=20)
     parser.add_argument("--grad_probe_normalize", dest="grad_probe_normalize", action="store_true", default=True)
     parser.add_argument("--no_grad_probe_normalize", dest="grad_probe_normalize", action="store_false")

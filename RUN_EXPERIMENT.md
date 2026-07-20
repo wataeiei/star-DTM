@@ -124,6 +124,8 @@ Change only `--lora_scope` and `--output_dir`:
 - `--lora_scope topk --topk_blocks 8 --topk_policy balanced` for Top-K Block LoRA
 - `--lora_scope grad_topk --topk_blocks 5 --grad_probe_batches 20` for
   Gradient-TopK-LoRA
+- `--lora_scope grad_topk --topk_blocks 8 --topk_policy grad_sandwich_plus` for
+  Gradient-SandwichPlus-LoRA
 - `--lora_scope all` for All-LoRA
 
 For formal results, prefer increasing `--eval_max_images` or setting it to `0`
@@ -224,6 +226,49 @@ For dynamic shallow-layer freezing, add:
 When enabled, shallow LoRA blocks that satisfy both the update and gradient
 thresholds for several check windows are frozen. The events are saved to
 `dynamic_freeze_log.csv`.
+
+Gradient-SandwichPlus-LoRA combines the strongest parts of the previous
+strategies: it keeps the Sandwich core verified by Grad-Top5, then uses probe
+LoRA gradient scores to add the best remaining blocks. For a Top-8 run:
+
+```bash
+python3 onboard_sandwich_lora_sr.py \
+  --mode train \
+  --train_method lora \
+  --train_dir data/ucmerced/train_hr \
+  --output_dir outputs/lora_grad_sandwichplus_top8_r8_lr1e5_1000_fp32_gpu \
+  --hr_size 256 \
+  --lr_size 64 \
+  --rank 8 \
+  --alpha 16 \
+  --target qv \
+  --lora_scope grad_topk \
+  --topk_blocks 8 \
+  --topk_policy grad_sandwich_plus \
+  --grad_probe_batches 20 \
+  --train_steps 1000 \
+  --batch_size 1 \
+  --grad_accum 4 \
+  --lr 1e-5 \
+  --grad_clip 1.0 \
+  --power_w 30 \
+  --full_model_size_mb 1200 \
+  --no_fp16
+```
+
+```bash
+python3 onboard_sandwich_lora_sr.py \
+  --mode eval \
+  --val_dir data/ucmerced/val_hr \
+  --lora_dir outputs/lora_grad_sandwichplus_top8_r8_lr1e5_1000_fp32_gpu \
+  --output_dir outputs/eval_grad_sandwichplus_top8_r8_lr1e5_1000_fp32_gpu_full \
+  --hr_size 256 \
+  --lr_size 64 \
+  --eval_max_images 0 \
+  --num_inference_steps 25 \
+  --base_summary_csv outputs/eval_base_gpu_full/eval_summary.csv \
+  --train_summary_csv outputs/lora_grad_sandwichplus_top8_r8_lr1e5_1000_fp32_gpu/summary.csv
+```
 
 ```bash
 python3 onboard_sandwich_lora_sr.py \
