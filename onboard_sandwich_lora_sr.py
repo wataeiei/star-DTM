@@ -970,6 +970,8 @@ def train(args: argparse.Namespace) -> None:
         topk_block_names = None
         if args.lora_scope == "grad_topk":
             topk_block_names = probe_gradient_topk_blocks(pipe, loader, args, device, dtype)
+            if args.reset_seed_after_probe:
+                set_seed(args.seed)
         info = inject_lora(
             pipe.unet,
             args.rank,
@@ -1144,6 +1146,7 @@ def train(args: argparse.Namespace) -> None:
         "grad_probe_normalize": args.grad_probe_normalize,
         "grad_probe_compute_lambda": args.grad_probe_compute_lambda,
         "grad_probe_budget_params": args.grad_probe_budget_params,
+        "reset_seed_after_probe": args.reset_seed_after_probe,
         "dynamic_shallow_freeze": args.dynamic_shallow_freeze,
         "freeze_warmup_steps": args.freeze_warmup_steps,
         "freeze_check_interval": args.freeze_check_interval,
@@ -1434,6 +1437,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no_grad_probe_normalize", dest="grad_probe_normalize", action="store_false")
     parser.add_argument("--grad_probe_compute_lambda", type=float, default=0.0)
     parser.add_argument("--grad_probe_budget_params", type=int, default=0)
+    parser.add_argument("--reset_seed_after_probe", dest="reset_seed_after_probe", action="store_true", default=True)
+    parser.add_argument("--no_reset_seed_after_probe", dest="reset_seed_after_probe", action="store_false")
     parser.add_argument("--dynamic_shallow_freeze", action="store_true")
     parser.add_argument("--freeze_warmup_steps", type=int, default=20)
     parser.add_argument("--freeze_check_interval", type=int, default=10)
