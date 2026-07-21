@@ -513,3 +513,93 @@ python3 summarize_base_sandwich.py \
   --output_csv outputs/base_vs_sandwich_vs_all_vs_full_summary.csv \
   --output_md outputs/base_vs_sandwich_vs_all_vs_full_report.md
 ```
+
+## 11. Hugging Face DiT4SR Gradient Profiling
+
+Use this when you want to test whether a Hugging Face DiT-style super-resolution
+model has stable layer-wise gradient patterns before doing full training. The
+script loads the model directly from Hugging Face, so no DiT4SR repository clone
+is needed.
+
+Because DiT4SR is large, put the Hugging Face cache on the 1 TB disk before the
+first download:
+
+```bash
+export HF_HOME=/mnt/disk1T/liyijuan/hf_cache
+export HUGGINGFACE_HUB_CACHE=/mnt/disk1T/liyijuan/hf_cache/hub
+```
+
+Install the extra packages if needed:
+
+```bash
+pip3 install -U diffusers transformers accelerate huggingface_hub safetensors matplotlib
+```
+
+First inspect the Hugging Face model structure and candidate LoRA blocks:
+
+```bash
+python3 profile_hf_dit4sr_grad.py \
+  --model_id acceptee/DiT4SR \
+  --data_dir data/ucmerced/train_hr \
+  --output_dir outputs/hf_dit4sr_inspect \
+  --dtype bf16 \
+  --target qv \
+  --inspect_only
+```
+
+Then run gradient profiling on UC Merced:
+
+```bash
+python3 profile_hf_dit4sr_grad.py \
+  --model_id acceptee/DiT4SR \
+  --data_dir data/ucmerced/train_hr \
+  --output_dir outputs/hf_dit4sr_grad_profile_ucmerced \
+  --image_size 512 \
+  --target qv \
+  --rank 8 \
+  --alpha 16 \
+  --topk_blocks 8 \
+  --probe_batches 20 \
+  --batch_size 1 \
+  --dtype bf16 \
+  --seed 42
+```
+
+If the first run has a forward-signature mismatch, rerun `--inspect_only` and
+set the component explicitly, for example:
+
+```bash
+--component_name transformer
+```
+
+Plot the layer scores:
+
+```bash
+python3 plot_dit_grad_scores.py \
+  --score_csv outputs/hf_dit4sr_grad_profile_ucmerced/hf_dit4sr_grad_scores.csv \
+  --output_png outputs/hf_dit4sr_grad_profile_ucmerced/hf_dit4sr_grad_scores_line.png \
+  --score_key normalized_grad_score \
+  --title "HF DiT4SR Gradient Layer Scores"
+```
+
+For SpaceNet, replace only `--data_dir` and `--output_dir`:
+
+```bash
+python3 profile_hf_dit4sr_grad.py \
+  --model_id acceptee/DiT4SR \
+  --data_dir data/spacenet/train_hr \
+  --output_dir outputs/hf_dit4sr_grad_profile_spacenet \
+  --image_size 512 \
+  --target qv \
+  --rank 8 \
+  --alpha 16 \
+  --topk_blocks 8 \
+  --probe_batches 20 \
+  --batch_size 1 \
+  --dtype bf16 \
+  --seed 42
+```
+
+The profiling loss is an internal transformer sensitivity loss, not a final SR
+PSNR/SSIM evaluation. Use it to compare which blocks are consistently important
+under different datasets, seeds, calibration subsets, or noise levels.
