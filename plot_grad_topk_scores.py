@@ -69,6 +69,10 @@ def std(values: list[float]) -> float:
     return math.sqrt(sum((v - m) ** 2 for v in values) / (len(values) - 1))
 
 
+def source_label(path: str | Path) -> str:
+    return Path(path).parent.name
+
+
 def plot_scores(
     score_paths: list[str],
     output_png: str,
@@ -76,9 +80,15 @@ def plot_scores(
     title: str,
     dpi: int,
     plot_type: str,
+    overlay_runs: bool,
+    labels: list[str],
 ) -> None:
     plt = require_matplotlib()
-    all_rows = [row for path in score_paths for row in read_score_csv(path)]
+    per_run_rows = [read_score_csv(path) for path in score_paths]
+    run_labels = labels or [source_label(path) for path in score_paths]
+    if len(run_labels) != len(per_run_rows):
+        raise SystemExit("--label count must match --score_csv count")
+    all_rows = [row for rows in per_run_rows for row in rows]
     by_block: dict[str, list[dict]] = defaultdict(list)
     for row in all_rows:
         by_block[row["block"]].append(row)
@@ -93,7 +103,24 @@ def plot_scores(
     fig_width = max(10, 0.65 * len(blocks))
     fig, ax = plt.subplots(figsize=(fig_width, 5.8))
     x = list(range(len(blocks)))
-    if plot_type == "bar":
+    if overlay_runs and plot_type != "line":
+        raise SystemExit("--overlay_runs requires --plot_type line")
+
+    if overlay_runs:
+        import itertools
+
+        palette = itertools.cycle(["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c", "#0891b2"])
+        block_to_x = {block: idx for idx, block in enumerate(blocks)}
+        for rows, label in zip(per_run_rows, run_labels):
+            color = next(palette)
+            ordered_rows = sorted(rows, key=lambda row: block_to_x[row["block"]])
+            xs = [block_to_x[row["block"]] for row in ordered_rows]
+            ys = [row[score_key] for row in ordered_rows]
+            ax.plot(xs, ys, marker="o", linewidth=1.8, markersize=4.5, label=label, color=color)
+            selected_x = [block_to_x[row["block"]] for row in ordered_rows if row["selected_bool"]]
+            selected_y = [row[score_key] for row in ordered_rows if row["selected_bool"]]
+            ax.scatter(selected_x, selected_y, s=54, facecolors="white", edgecolors=color, linewidths=1.8, zorder=3)
+    elif plot_type == "bar":
         ax.bar(x, values, yerr=errors if len(score_paths) > 1 else None, color=colors, capsize=4)
     else:
         ax.plot(x, values, color="#2563eb", linewidth=2.2, marker="o", markersize=5)
@@ -117,7 +144,9 @@ def plot_scores(
     not_selected_label = "Not selected"
     from matplotlib.patches import Patch
 
-    if plot_type == "bar":
+    if overlay_runs:
+        ax.legend(loc="upper right", fontsize=9)
+    elif plot_type == "bar":
         ax.legend(
             handles=[
                 Patch(facecolor="#2563eb", label=selected_label),
@@ -181,9 +210,20 @@ def main() -> None:
     parser.add_argument("--title", default="")
     parser.add_argument("--dpi", type=int, default=180)
     parser.add_argument("--plot_type", default="line", choices=["line", "bar"])
+    parser.add_argument("--overlay_runs", action="store_true")
+    parser.add_argument("--label", action="append", default=[], help="Repeatable label matching --score_csv order")
     args = parser.parse_args()
 
-    plot_scores(args.score_csv, args.output_png, args.score_key, args.title, args.dpi, args.plot_type)
+    plot_scores(
+        args.score_csv,
+        args.output_png,
+        args.score_key,
+        args.title,
+        args.dpi,
+        args.plot_type,
+        args.overlay_runs,
+        args.label,
+    )
     if args.output_rank_csv:
         write_rank_csv(args.score_csv, args.output_rank_csv, args.score_key)
 
