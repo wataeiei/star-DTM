@@ -122,6 +122,9 @@ class LoRALinear(nn.Module):
         self.scale = alpha / rank
         self.lora_down = nn.Linear(base.in_features, rank, bias=False)
         self.lora_up = nn.Linear(rank, base.out_features, bias=False)
+        device = base.weight.device
+        self.lora_down.to(device=device, dtype=torch.float32)
+        self.lora_up.to(device=device, dtype=torch.float32)
         nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_up.weight)
         for p in self.base.parameters():
