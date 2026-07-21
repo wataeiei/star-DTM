@@ -213,21 +213,50 @@ def lora_grad_norm(module: LoRALinear) -> float:
     return math.sqrt(total)
 
 
+class TransformerOnlyPipe:
+    def __init__(self, transformer: nn.Module):
+        self.transformer = transformer
+        self.vae = None
+
+
+def model_dtype(args: argparse.Namespace) -> torch.dtype:
+    if args.dtype == "bf16":
+        return torch.bfloat16
+    if args.dtype == "fp16":
+        return torch.float16
+    return torch.float32
+
+
 def load_pipe(args: argparse.Namespace, device: torch.device):
     require_packages()
+    dtype = model_dtype(args)
+    if args.load_mode == "transformer":
+        try:
+            from diffusers import SD3Transformer2DModel
+        except ImportError as exc:
+            raise SystemExit(
+                "Your diffusers version does not expose SD3Transformer2DModel.\n"
+                "Upgrade with: pip3 install -U diffusers transformers accelerate"
+            ) from exc
+        subfolder = args.transformer_subfolder or f"{args.variant}/transformer"
+        transformer = SD3Transformer2DModel.from_pretrained(
+            args.model_id,
+            subfolder=subfolder,
+            torch_dtype=dtype,
+            local_files_only=args.local_files_only,
+        )
+        return TransformerOnlyPipe(transformer.to(device))
+
     from diffusers import DiffusionPipeline
 
-    dtype = torch.float32
-    if args.dtype == "bf16":
-        dtype = torch.bfloat16
-    elif args.dtype == "fp16":
-        dtype = torch.float16
-    pipe = DiffusionPipeline.from_pretrained(
-        args.model_id,
-        torch_dtype=dtype,
-        trust_remote_code=True,
-        local_files_only=args.local_files_only,
-    )
+    pipe_kwargs = {
+        "torch_dtype": dtype,
+        "trust_remote_code": True,
+        "local_files_only": args.local_files_only,
+    }
+    if args.pipeline_subfolder:
+        pipe_kwargs["subfolder"] = args.pipeline_subfolder
+    pipe = DiffusionPipeline.from_pretrained(args.model_id, **pipe_kwargs)
     pipe = pipe.to(device)
     if hasattr(pipe, "set_progress_bar_config"):
         pipe.set_progress_bar_config(disable=True)
@@ -457,6 +486,10 @@ def profile(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model_id", default="acceptee/DiT4SR")
+    parser.add_argument("--load_mode", default="transformer", choices=["transformer", "pipeline"])
+    parser.add_argument("--variant", default="dit4sr_q", choices=["dit4sr_q", "dit4sr_f", "dit4sr_r1"])
+    parser.add_argument("--transformer_subfolder", default="", help="Override transformer subfolder, e.g. dit4sr_q/transformer")
+    parser.add_argument("--pipeline_subfolder", default="", help="Optional pipeline subfolder if a repo contains model_index.json there")
     parser.add_argument("--component_name", default="", help="Pipeline component to profile, default auto: transformer/dit/model/unet")
     parser.add_argument("--data_dir", required=True)
     parser.add_argument("--output_dir", required=True)
