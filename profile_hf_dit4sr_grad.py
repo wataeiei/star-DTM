@@ -324,7 +324,7 @@ def image_to_hidden_states(pipe, images: torch.Tensor, transformer: nn.Module, a
 
 def zeros_like_signature_arg(name: str, param, bsz: int, transformer: nn.Module, args: argparse.Namespace, device: torch.device):
     config = getattr(transformer, "config", None)
-    caption_dim = int(getattr(config, "caption_projection_dim", args.caption_dim))
+    caption_dim = int(getattr(config, "joint_attention_dim", args.caption_dim))
     pooled_dim = int(getattr(config, "pooled_projection_dim", caption_dim))
     seq_len = args.prompt_seq_len
     dtype = next(transformer.parameters()).dtype
