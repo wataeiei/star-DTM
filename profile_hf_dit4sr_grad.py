@@ -295,6 +295,7 @@ def image_to_hidden_states(pipe, images: torch.Tensor, transformer: nn.Module, a
     config = getattr(transformer, "config", None)
     in_channels = int(getattr(config, "in_channels", args.latent_channels))
     sample_size = int(getattr(config, "sample_size", args.latent_size))
+    dtype = next(transformer.parameters()).dtype
     if sample_size <= 0:
         sample_size = args.latent_size
 
@@ -310,7 +311,7 @@ def image_to_hidden_states(pipe, images: torch.Tensor, transformer: nn.Module, a
                 else:
                     pad = torch.zeros(bsz, in_channels - latent.shape[1], sample_size, sample_size, device=device)
                     latent = torch.cat([latent, pad], dim=1)
-            return latent
+            return latent.to(dtype=dtype)
 
     x = F.interpolate(images.to(device).float(), size=(sample_size, sample_size), mode="bilinear", align_corners=False)
     if x.shape[1] != in_channels:
@@ -318,7 +319,7 @@ def image_to_hidden_states(pipe, images: torch.Tensor, transformer: nn.Module, a
             x = x[:, :in_channels]
         else:
             x = torch.cat([x, torch.zeros(bsz, in_channels - x.shape[1], sample_size, sample_size, device=device)], dim=1)
-    return x
+    return x.to(dtype=dtype)
 
 
 def zeros_like_signature_arg(name: str, param, bsz: int, transformer: nn.Module, args: argparse.Namespace, device: torch.device):
@@ -326,12 +327,13 @@ def zeros_like_signature_arg(name: str, param, bsz: int, transformer: nn.Module,
     caption_dim = int(getattr(config, "caption_projection_dim", args.caption_dim))
     pooled_dim = int(getattr(config, "pooled_projection_dim", caption_dim))
     seq_len = args.prompt_seq_len
+    dtype = next(transformer.parameters()).dtype
     if name in ("timestep", "timesteps"):
         return torch.full((bsz,), args.timestep, device=device, dtype=torch.long)
     if name in ("encoder_hidden_states", "prompt_embeds"):
-        return torch.zeros(bsz, seq_len, caption_dim, device=device)
+        return torch.zeros(bsz, seq_len, caption_dim, device=device, dtype=dtype)
     if name in ("pooled_projections", "pooled_prompt_embeds"):
-        return torch.zeros(bsz, pooled_dim, device=device)
+        return torch.zeros(bsz, pooled_dim, device=device, dtype=dtype)
     if name in ("return_dict",):
         return True
     if name in ("joint_attention_kwargs", "attention_kwargs"):
