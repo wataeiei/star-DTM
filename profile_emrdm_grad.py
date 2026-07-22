@@ -47,8 +47,7 @@ def ensure_dir(path: str | Path) -> Path:
 
 
 def instantiate_from_config(config):
-    install_lightning_stub()
-    install_torchvision_stub()
+    install_runtime_stubs()
     target = config.get("target")
     if not target:
         raise ValueError("Config section has no target field.")
@@ -56,6 +55,14 @@ def instantiate_from_config(config):
     cls = getattr(importlib.import_module(module_name), cls_name)
     params = config.get("params", {})
     return cls(**params)
+
+
+def install_runtime_stubs() -> None:
+    """Install lightweight stubs for optional training/evaluation dependencies."""
+    install_lightning_stub()
+    install_torchvision_stub()
+    install_metric_stubs()
+    install_logging_stubs()
 
 
 class LightningModuleStub(nn.Module):
@@ -79,11 +86,57 @@ def install_lightning_stub() -> None:
     if "pytorch_lightning" in sys.modules:
         return
     pl = types.ModuleType("pytorch_lightning")
+    callbacks = types.ModuleType("pytorch_lightning.callbacks")
+    loggers = types.ModuleType("pytorch_lightning.loggers")
+    utilities = types.ModuleType("pytorch_lightning.utilities")
+    rank_zero = types.ModuleType("pytorch_lightning.utilities.rank_zero")
+
+    class Callback:
+        pass
+
+    class ModelCheckpoint(Callback):
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class LearningRateMonitor(Callback):
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class Trainer:
+        pass
+
+    class WandbLogger:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def log_metrics(self, *args, **kwargs):
+            return None
+
+        def log_image(self, *args, **kwargs):
+            return None
+
+    def rank_zero_only(fn=None, *args, **kwargs):
+        if fn is None:
+            return lambda inner: inner
+        return fn
+
     pl.LightningModule = LightningModuleStub
-    pl.Callback = object
-    pl.Trainer = object
+    pl.Callback = Callback
+    pl.Trainer = Trainer
     pl.seed_everything = lambda *args, **kwargs: None
+    callbacks.Callback = Callback
+    callbacks.ModelCheckpoint = ModelCheckpoint
+    callbacks.LearningRateMonitor = LearningRateMonitor
+    loggers.WandbLogger = WandbLogger
+    rank_zero.rank_zero_only = rank_zero_only
+    rank_zero.rank_zero_info = lambda *args, **kwargs: None
+    rank_zero.rank_zero_warn = lambda *args, **kwargs: None
+    utilities.rank_zero = rank_zero
     sys.modules["pytorch_lightning"] = pl
+    sys.modules["pytorch_lightning.callbacks"] = callbacks
+    sys.modules["pytorch_lightning.loggers"] = loggers
+    sys.modules["pytorch_lightning.utilities"] = utilities
+    sys.modules["pytorch_lightning.utilities.rank_zero"] = rank_zero
 
 
 def install_torchvision_stub() -> None:
@@ -95,6 +148,10 @@ def install_torchvision_stub() -> None:
     transforms = types.ModuleType("torchvision.transforms")
     transforms_v2 = types.ModuleType("torchvision.transforms.v2")
     utils = types.ModuleType("torchvision.utils")
+    models = types.ModuleType("torchvision.models")
+    datasets = types.ModuleType("torchvision.datasets")
+    ops = types.ModuleType("torchvision.ops")
+    ops_misc = types.ModuleType("torchvision.ops.misc")
 
     class IdentityTransform:
         def __init__(self, *args, **kwargs):
@@ -112,20 +169,85 @@ def install_torchvision_stub() -> None:
                 x = transform(x)
             return x
 
+    class ImageFolder:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("torchvision.datasets.ImageFolder is unavailable in this profiling environment.")
+
     transforms_v2.Compose = Compose
     transforms_v2.Normalize = IdentityTransform
     transforms_v2.ToImage = IdentityTransform
     transforms_v2.ToDtype = IdentityTransform
     transforms_v2.Resize = IdentityTransform
+    transforms.Compose = Compose
+    transforms.Normalize = IdentityTransform
+    transforms.Resize = IdentityTransform
+    transforms.ToTensor = IdentityTransform
+    transforms.CenterCrop = IdentityTransform
     transforms.v2 = transforms_v2
     utils.make_grid = lambda tensor, *args, **kwargs: tensor
+    datasets.ImageFolder = ImageFolder
+    ops_misc.FrozenBatchNorm2d = nn.BatchNorm2d
+    ops.misc = ops_misc
+    for model_name in ("alexnet", "vgg16", "squeezenet1_1"):
+        setattr(models, model_name, lambda *args, **kwargs: nn.Identity())
     torchvision.transforms = transforms
     torchvision.utils = utils
+    torchvision.models = models
+    torchvision.datasets = datasets
+    torchvision.ops = ops
 
     sys.modules["torchvision"] = torchvision
     sys.modules["torchvision.transforms"] = transforms
     sys.modules["torchvision.transforms.v2"] = transforms_v2
     sys.modules["torchvision.utils"] = utils
+    sys.modules["torchvision.models"] = models
+    sys.modules["torchvision.datasets"] = datasets
+    sys.modules["torchvision.ops"] = ops
+    sys.modules["torchvision.ops.misc"] = ops_misc
+
+
+def install_metric_stubs() -> None:
+    """Stub optional image metrics that are irrelevant for grad profiling."""
+    if "lpips" not in sys.modules:
+        lpips = types.ModuleType("lpips")
+
+        class LPIPS(nn.Module):
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+
+            def forward(self, x, y, *args, **kwargs):
+                return torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
+
+        lpips.LPIPS = LPIPS
+        sys.modules["lpips"] = lpips
+    if "torchmetrics" not in sys.modules:
+        torchmetrics = types.ModuleType("torchmetrics")
+        functional = types.ModuleType("torchmetrics.functional")
+
+        class Metric(nn.Module):
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+
+            def update(self, *args, **kwargs):
+                return None
+
+            def compute(self):
+                return torch.tensor(0.0)
+
+        torchmetrics.Metric = Metric
+        torchmetrics.functional = functional
+        sys.modules["torchmetrics"] = torchmetrics
+        sys.modules["torchmetrics.functional"] = functional
+
+
+def install_logging_stubs() -> None:
+    if "wandb" not in sys.modules:
+        wandb = types.ModuleType("wandb")
+        wandb.init = lambda *args, **kwargs: None
+        wandb.log = lambda *args, **kwargs: None
+        wandb.Image = lambda x, *args, **kwargs: x
+        wandb.finish = lambda *args, **kwargs: None
+        sys.modules["wandb"] = wandb
 
 
 def image_to_tensor(path: Path, image_size: int) -> torch.Tensor:
