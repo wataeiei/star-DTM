@@ -19,6 +19,7 @@ import math
 import random
 import re
 import sys
+import types
 from pathlib import Path
 from typing import Iterable
 
@@ -46,6 +47,7 @@ def ensure_dir(path: str | Path) -> Path:
 
 
 def instantiate_from_config(config):
+    install_lightning_stub()
     target = config.get("target")
     if not target:
         raise ValueError("Config section has no target field.")
@@ -53,6 +55,34 @@ def instantiate_from_config(config):
     cls = getattr(importlib.import_module(module_name), cls_name)
     params = config.get("params", {})
     return cls(**params)
+
+
+class LightningModuleStub(nn.Module):
+    def log(self, *args, **kwargs):
+        return None
+
+    def log_dict(self, *args, **kwargs):
+        return None
+
+    def save_hyperparameters(self, *args, **kwargs):
+        return None
+
+
+def install_lightning_stub() -> None:
+    """Avoid importing Lightning's torchmetrics/torchvision stack.
+
+    EMRDM modules subclass pl.LightningModule, but this profiler only needs
+    ordinary nn.Module behavior and direct forward/shared_step calls. On Jetson,
+    Lightning imports torchmetrics, which imports an incompatible torchvision.
+    """
+    if "pytorch_lightning" in sys.modules:
+        return
+    pl = types.ModuleType("pytorch_lightning")
+    pl.LightningModule = LightningModuleStub
+    pl.Callback = object
+    pl.Trainer = object
+    pl.seed_everything = lambda *args, **kwargs: None
+    sys.modules["pytorch_lightning"] = pl
 
 
 def image_to_tensor(path: Path, image_size: int) -> torch.Tensor:
