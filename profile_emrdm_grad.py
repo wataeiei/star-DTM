@@ -299,8 +299,10 @@ def native_or_torch_na2d(query, key, value, kernel_size, scale=None, **kwargs):
                 if isinstance(out, (tuple, list)):
                     out = out[0]
                 return out
-            except TypeError as exc:
+            except Exception as exc:
                 last_error = exc
+                if NATTEN_BACKEND == "native" and not isinstance(exc, TypeError):
+                    raise
                 continue
         if NATTEN_BACKEND == "native":
             raise last_error if last_error is not None else RuntimeError("Native NATTEN na2d failed.")
