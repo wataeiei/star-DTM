@@ -77,16 +77,23 @@ def install_torchvision_stub_for_timm() -> None:
     torchvision = types.ModuleType("torchvision")
     models = types.ModuleType("torchvision.models")
     feature_extraction = types.ModuleType("torchvision.models.feature_extraction")
+    ops = types.ModuleType("torchvision.ops")
+    ops_misc = types.ModuleType("torchvision.ops.misc")
 
     def create_feature_extractor(*args, **kwargs):
         raise RuntimeError("torchvision feature_extraction is not available in this profiling environment.")
 
     feature_extraction.create_feature_extractor = create_feature_extractor
+    ops_misc.FrozenBatchNorm2d = nn.BatchNorm2d
+    ops.misc = ops_misc
     models.feature_extraction = feature_extraction
     torchvision.models = models
+    torchvision.ops = ops
     sys.modules["torchvision"] = torchvision
     sys.modules["torchvision.models"] = models
     sys.modules["torchvision.models.feature_extraction"] = feature_extraction
+    sys.modules["torchvision.ops"] = ops
+    sys.modules["torchvision.ops.misc"] = ops_misc
 
 
 class ImageFolderDataset(Dataset):
