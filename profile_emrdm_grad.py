@@ -437,6 +437,8 @@ def load_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
     if args.ckpt_path:
         config.model.params.ckpt_path = args.ckpt_path
     model = instantiate_from_config(config.model)
+    if not hasattr(model, "global_step"):
+        model.global_step = 0
     model.to(device)
     model.eval()
     return model
