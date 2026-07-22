@@ -407,7 +407,7 @@ class PairedImageDataset(Dataset):
 
 
 class LoRALinear(nn.Module):
-    def __init__(self, base: nn.Linear, rank: int, alpha: int) -> None:
+    def __init__(self, base: nn.Linear, rank: int, alpha: int, up_init_scale: float = 1e-4) -> None:
         super().__init__()
         self.base = base
         self.rank = rank
@@ -418,7 +418,10 @@ class LoRALinear(nn.Module):
         self.lora_down.to(device=base.weight.device, dtype=torch.float32)
         self.lora_up.to(device=base.weight.device, dtype=torch.float32)
         nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_up.weight)
+        if up_init_scale > 0:
+            nn.init.normal_(self.lora_up.weight, mean=0.0, std=up_init_scale)
+        else:
+            nn.init.zeros_(self.lora_up.weight)
         for param in self.base.parameters():
             param.requires_grad_(False)
 
@@ -514,7 +517,7 @@ def iter_lora_modules(root: nn.Module) -> Iterable[tuple[str, LoRALinear]]:
             yield name, module
 
 
-def inject_lora(root: nn.Module, target: str, rank: int, alpha: int, block_regex: str) -> list[str]:
+def inject_lora(root: nn.Module, target: str, rank: int, alpha: int, block_regex: str, up_init_scale: float) -> list[str]:
     replacements = []
     for name, module in root.named_modules():
         if isinstance(module, nn.Linear) and block_key(name, block_regex) and target_match(name, target):
@@ -523,7 +526,7 @@ def inject_lora(root: nn.Module, target: str, rank: int, alpha: int, block_regex
         raise SystemExit("No target Linear modules found. Run --inspect_only and consider --target attention_linear.")
     for name, module in replacements:
         parent, child_name = split_parent_name(root, name)
-        setattr(parent, child_name, LoRALinear(module, rank=rank, alpha=alpha))
+        setattr(parent, child_name, LoRALinear(module, rank=rank, alpha=alpha, up_init_scale=up_init_scale))
     return [name for name, _ in replacements]
 
 
@@ -533,6 +536,15 @@ def lora_grad_norm(module: LoRALinear) -> float:
         if param.grad is not None:
             total += float(param.grad.detach().float().pow(2).sum().cpu())
     return math.sqrt(total)
+
+
+def lora_part_grad_norms(module: LoRALinear) -> tuple[float, float]:
+    def norm(param: torch.Tensor) -> float:
+        if param.grad is None:
+            return 0.0
+        return math.sqrt(float(param.grad.detach().float().pow(2).sum().cpu()))
+
+    return norm(module.lora_down.weight), norm(module.lora_up.weight)
 
 
 def load_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
@@ -591,7 +603,7 @@ def profile(args: argparse.Namespace) -> None:
 
     for param in model.parameters():
         param.requires_grad_(False)
-    injected = inject_lora(model, args.target, args.rank, args.alpha, args.block_regex)
+    injected = inject_lora(model, args.target, args.rank, args.alpha, args.block_regex, args.lora_up_init_scale)
     model.train()
 
     dataset = PairedImageDataset(args.cloudy_dir, args.clear_dir, args.image_size, args.max_images)
@@ -635,7 +647,10 @@ def profile(args: argparse.Namespace) -> None:
         if not bkey:
             continue
         row = by_block.setdefault(bkey, {"grad_norm": 0.0, "lora_param_count": 0, "module_count": 0})
+        down_grad, up_grad = lora_part_grad_norms(module)
         row["grad_norm"] += lora_grad_norm(module)
+        row["down_grad_norm"] = row.get("down_grad_norm", 0.0) + down_grad
+        row["up_grad_norm"] = row.get("up_grad_norm", 0.0) + up_grad
         row["lora_param_count"] += module.lora_down.weight.numel() + module.lora_up.weight.numel()
         row["module_count"] += 1
 
@@ -653,6 +668,8 @@ def profile(args: argparse.Namespace) -> None:
                 "block": block,
                 "block_index": block_index,
                 "grad_norm": row["grad_norm"],
+                "down_grad_norm": row.get("down_grad_norm", 0.0),
+                "up_grad_norm": row.get("up_grad_norm", 0.0),
                 "lora_param_count": p_count,
                 "module_count": int(row["module_count"]),
                 "normalized_grad_score": norm_score,
@@ -679,6 +696,7 @@ def profile(args: argparse.Namespace) -> None:
         "target": args.target,
         "rank": args.rank,
         "alpha": args.alpha,
+        "lora_up_init_scale": args.lora_up_init_scale,
         "topk_blocks": args.topk_blocks,
         "probe_batches": args.probe_batches,
         "seed": args.seed,
@@ -703,6 +721,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target", default="qkv", choices=["q", "v", "qv", "qkv", "attention_linear", "all_linear"])
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--alpha", type=int, default=16)
+    parser.add_argument("--lora_up_init_scale", type=float, default=1e-4)
     parser.add_argument("--topk_blocks", type=int, default=8)
     parser.add_argument("--probe_batches", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=1)
