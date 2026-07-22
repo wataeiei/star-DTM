@@ -48,6 +48,7 @@ def ensure_dir(path: str | Path) -> Path:
 
 def instantiate_from_config(config):
     install_lightning_stub()
+    install_torchvision_stub()
     target = config.get("target")
     if not target:
         raise ValueError("Config section has no target field.")
@@ -83,6 +84,44 @@ def install_lightning_stub() -> None:
     pl.Trainer = object
     pl.seed_everything = lambda *args, **kwargs: None
     sys.modules["pytorch_lightning"] = pl
+
+
+def install_torchvision_stub() -> None:
+    """Avoid importing an incompatible torchvision build on Jetson."""
+    if "torchvision" in sys.modules:
+        return
+
+    torchvision = types.ModuleType("torchvision")
+    transforms = types.ModuleType("torchvision.transforms")
+    transforms_v2 = types.ModuleType("torchvision.transforms.v2")
+
+    class IdentityTransform:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, x):
+            return x
+
+    class Compose:
+        def __init__(self, transforms_list):
+            self.transforms = list(transforms_list)
+
+        def __call__(self, x):
+            for transform in self.transforms:
+                x = transform(x)
+            return x
+
+    transforms_v2.Compose = Compose
+    transforms_v2.Normalize = IdentityTransform
+    transforms_v2.ToImage = IdentityTransform
+    transforms_v2.ToDtype = IdentityTransform
+    transforms_v2.Resize = IdentityTransform
+    transforms.v2 = transforms_v2
+    torchvision.transforms = transforms
+
+    sys.modules["torchvision"] = torchvision
+    sys.modules["torchvision.transforms"] = transforms
+    sys.modules["torchvision.transforms.v2"] = transforms_v2
 
 
 def image_to_tensor(path: Path, image_size: int) -> torch.Tensor:
