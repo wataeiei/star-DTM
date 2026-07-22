@@ -557,36 +557,48 @@ def is_profile_layer(name: str, module: nn.Module) -> bool:
 class ActivationGradRecorder:
     def __init__(self, model: nn.Module, block_regex: str = "") -> None:
         self.records: dict[str, dict] = {}
+        self.saved_outputs: list[tuple[str, torch.Tensor]] = []
         self.handles = []
         for name, module in model.named_modules():
             if not is_profile_layer(name, module):
                 continue
             bkey = block_key(name, block_regex) or name
-            self.records.setdefault(bkey, {"grad_norm": 0.0, "activation_elements": 0, "module_count": 0})
+            self.records.setdefault(
+                bkey,
+                {
+                    "grad_norm": 0.0,
+                    "activation_elements": 0,
+                    "module_count": 0,
+                    "requires_grad_forwards": 0,
+                },
+            )
             self.records[bkey]["module_count"] += 1
             self.handles.append(module.register_forward_hook(self._forward_hook(bkey)))
-            self.handles.append(module.register_full_backward_hook(self._backward_hook(bkey)))
 
     def _forward_hook(self, bkey: str):
         def hook(module, inputs, output):
             tensor = output[0] if isinstance(output, (tuple, list)) else output
             if torch.is_tensor(tensor):
                 self.records[bkey]["activation_elements"] += int(tensor.numel())
+                if tensor.requires_grad:
+                    tensor.retain_grad()
+                    self.saved_outputs.append((bkey, tensor))
+                    self.records[bkey]["requires_grad_forwards"] += 1
 
         return hook
 
-    def _backward_hook(self, bkey: str):
-        def hook(module, grad_input, grad_output):
-            tensor = grad_output[0] if grad_output else None
-            if torch.is_tensor(tensor):
-                self.records[bkey]["grad_norm"] += math.sqrt(float(tensor.detach().float().pow(2).sum().cpu()))
-
-        return hook
+    def collect_and_clear(self) -> None:
+        for bkey, tensor in self.saved_outputs:
+            if tensor.grad is None:
+                continue
+            self.records[bkey]["grad_norm"] += math.sqrt(float(tensor.grad.detach().float().pow(2).sum().cpu()))
+        self.saved_outputs.clear()
 
     def close(self) -> None:
         for handle in self.handles:
             handle.remove()
         self.handles.clear()
+        self.saved_outputs.clear()
 
 
 def load_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
@@ -679,6 +691,8 @@ def profile(args: argparse.Namespace) -> None:
             batch_t["cond_image"].requires_grad_(True)
         if args.input_noise_std > 0:
             batch_t["cond_image"] = batch_t["cond_image"] + torch.randn_like(batch_t["cond_image"]) * args.input_noise_std
+            if args.importance_mode == "activation":
+                batch_t["cond_image"].requires_grad_(True)
 
         loss, _ = model.shared_step(batch_t)
         if not torch.isfinite(loss):
@@ -686,6 +700,9 @@ def profile(args: argparse.Namespace) -> None:
             model.zero_grad(set_to_none=True)
             continue
         loss.backward()
+        if args.importance_mode == "activation":
+            assert recorder is not None
+            recorder.collect_and_clear()
         valid += 1
         total_loss += float(loss.detach().cpu())
         print(f"probe batch {idx:03d}/{args.probe_batches} loss={float(loss.detach().cpu()):.6f}")
@@ -730,6 +747,7 @@ def profile(args: argparse.Namespace) -> None:
                 "lora_param_count": p_count,
                 "activation_elements": int(row.get("activation_elements", 0)),
                 "module_count": int(row["module_count"]),
+                "requires_grad_forwards": int(row.get("requires_grad_forwards", 0)),
                 "normalized_grad_score": norm_score,
                 "bp_cost": bp_cost,
                 "compute_lambda": args.compute_lambda,
