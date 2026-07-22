@@ -335,9 +335,25 @@ def target_match(name: str, target: str) -> bool:
     if target == "v":
         return leaf in {"v", "to_v", "v_proj", "wv"}
     if target == "qv":
-        return leaf in {"q", "v", "to_q", "to_v", "q_proj", "v_proj", "wq", "wv"}
+        return leaf in {"q", "v", "to_q", "to_v", "q_proj", "v_proj", "wq", "wv", "qkv_proj"}
     if target == "qkv":
-        return leaf in {"qkv", "to_qkv", "q", "k", "v", "to_q", "to_k", "to_v", "q_proj", "k_proj", "v_proj", "wq", "wk", "wv"}
+        return leaf in {
+            "qkv",
+            "qkv_proj",
+            "to_qkv",
+            "q",
+            "k",
+            "v",
+            "to_q",
+            "to_k",
+            "to_v",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "wq",
+            "wk",
+            "wv",
+        }
     if target == "attention_linear":
         return any(key in full for key in ("attn", "attention", "self_attn")) and leaf not in {"norm", "dropout"}
     if target == "all_linear":
@@ -352,6 +368,19 @@ def block_key(name: str, block_regex: str = "") -> str:
             return m.group(1) if m.groups() else m.group(0)
 
     parts = name.split(".")
+    if "down_levels" in parts:
+        idx = parts.index("down_levels")
+        if idx + 2 < len(parts):
+            return f"down_levels.{parts[idx + 1]}.{parts[idx + 2]}"
+    if "up_levels" in parts:
+        idx = parts.index("up_levels")
+        if idx + 2 < len(parts):
+            return f"up_levels.{parts[idx + 1]}.{parts[idx + 2]}"
+    if "mid_level" in parts:
+        idx = parts.index("mid_level")
+        if idx + 1 < len(parts):
+            return f"mid_level.{parts[idx + 1]}"
+
     for marker in ("levels", "layers", "stages", "blocks", "transformer_blocks"):
         if marker in parts:
             idx = parts.index(marker)
