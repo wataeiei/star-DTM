@@ -26,6 +26,7 @@ import math
 import random
 import re
 import sys
+import types
 from pathlib import Path
 from typing import Iterable
 
@@ -53,6 +54,7 @@ def ensure_dir(path: str | Path) -> Path:
 
 
 def instantiate_from_config(config):
+    install_torchvision_stub_for_timm()
     target = config.get("target")
     if not target:
         raise ValueError("Config section has no target field.")
@@ -60,6 +62,31 @@ def instantiate_from_config(config):
     cls = getattr(importlib.import_module(module_name), cls_name)
     params = config.get("params", {})
     return cls(**params)
+
+
+def install_torchvision_stub_for_timm() -> None:
+    """Avoid importing an incompatible torchvision just for timm feature hooks.
+
+    DiT-SR only needs timm.layers.DropPath/to_2tuple/trunc_normal_ through
+    timm.models.layers. Recent timm imports torchvision feature_extraction at
+    module import time, which can fail on Jetson when torchvision does not match
+    the installed NVIDIA PyTorch wheel. A tiny stub is enough for this profiler.
+    """
+    if "torchvision" in sys.modules:
+        return
+    torchvision = types.ModuleType("torchvision")
+    models = types.ModuleType("torchvision.models")
+    feature_extraction = types.ModuleType("torchvision.models.feature_extraction")
+
+    def create_feature_extractor(*args, **kwargs):
+        raise RuntimeError("torchvision feature_extraction is not available in this profiling environment.")
+
+    feature_extraction.create_feature_extractor = create_feature_extractor
+    models.feature_extraction = feature_extraction
+    torchvision.models = models
+    sys.modules["torchvision"] = torchvision
+    sys.modules["torchvision.models"] = models
+    sys.modules["torchvision.models.feature_extraction"] = feature_extraction
 
 
 class ImageFolderDataset(Dataset):
