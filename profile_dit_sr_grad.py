@@ -54,6 +54,7 @@ def ensure_dir(path: str | Path) -> Path:
 
 
 def instantiate_from_config(config):
+    install_timm_layers_stub()
     install_torchvision_stub_for_timm()
     target = config.get("target")
     if not target:
@@ -62,6 +63,50 @@ def instantiate_from_config(config):
     cls = getattr(importlib.import_module(module_name), cls_name)
     params = config.get("params", {})
     return cls(**params)
+
+
+class DropPath(nn.Module):
+    def __init__(self, drop_prob: float = 0.0) -> None:
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+        return x.div(keep_prob) * random_tensor
+
+
+def to_2tuple(x):
+    return x if isinstance(x, tuple) else (x, x)
+
+
+def trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0):
+    return nn.init.trunc_normal_(tensor, mean=mean, std=std, a=a, b=b)
+
+
+def install_timm_layers_stub() -> None:
+    """Provide only the timm symbols DiT-SR imports.
+
+    The full timm import pulls torchvision datasets/models during module init.
+    On Jetson, torchvision often mismatches the NVIDIA PyTorch wheel. DiT-SR's
+    Swin code only needs these three layer helpers, so a small stub is safer.
+    """
+    if "timm.models.layers" in sys.modules:
+        return
+    timm = types.ModuleType("timm")
+    timm_models = types.ModuleType("timm.models")
+    timm_layers = types.ModuleType("timm.models.layers")
+    timm_layers.DropPath = DropPath
+    timm_layers.to_2tuple = to_2tuple
+    timm_layers.trunc_normal_ = trunc_normal_
+    timm_models.layers = timm_layers
+    timm.models = timm_models
+    sys.modules["timm"] = timm
+    sys.modules["timm.models"] = timm_models
+    sys.modules["timm.models.layers"] = timm_layers
 
 
 def install_torchvision_stub_for_timm() -> None:
