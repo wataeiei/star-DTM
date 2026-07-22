@@ -32,6 +32,9 @@ from torch.utils.data import DataLoader, Dataset
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+NATTEN_BACKEND = "auto"
+NATTEN_NATIVE_NA2D = None
+NATTEN_WARNED_FALLBACK = False
 
 
 def set_seed(seed: int) -> None:
@@ -258,6 +261,7 @@ def install_natten_compat() -> None:
     or removed legacy functions such as na2d_qk/na2d_av. For profiling we prefer
     a slower but stable implementation over chasing CUDA extension variants.
     """
+    global NATTEN_NATIVE_NA2D
     try:
         import natten
     except ImportError:
@@ -266,8 +270,44 @@ def install_natten_compat() -> None:
     if not hasattr(natten, "functional"):
         natten.functional = types.ModuleType("natten.functional")
         sys.modules["natten.functional"] = natten.functional
-    natten.functional.na2d = torch_na2d
+    NATTEN_NATIVE_NA2D = getattr(natten, "na2d", None)
+    if NATTEN_BACKEND == "torch" or NATTEN_NATIVE_NA2D is None:
+        natten.functional.na2d = torch_na2d
+    else:
+        natten.functional.na2d = native_or_torch_na2d
     natten.has_fused_na = lambda: True
+
+
+def native_or_torch_na2d(query, key, value, kernel_size, scale=None, **kwargs):
+    """Use native NATTEN when possible, with a pure PyTorch fallback."""
+    global NATTEN_WARNED_FALLBACK
+    if NATTEN_NATIVE_NA2D is not None and NATTEN_BACKEND in {"auto", "native"}:
+        q = query.contiguous()
+        k = key.contiguous()
+        v = value.contiguous()
+        attempts = (
+            lambda: NATTEN_NATIVE_NA2D(q, k, v, kernel_size=kernel_size, dilation=1, scale=scale),
+            lambda: NATTEN_NATIVE_NA2D(q, k, v, kernel_size, dilation=1, scale=scale),
+            lambda: NATTEN_NATIVE_NA2D(q, k, v, kernel_size=kernel_size, scale=scale),
+            lambda: NATTEN_NATIVE_NA2D(q, k, v, kernel_size, scale=scale),
+            lambda: NATTEN_NATIVE_NA2D(q, k, v, kernel_size),
+        )
+        last_error = None
+        for attempt in attempts:
+            try:
+                out = attempt()
+                if isinstance(out, (tuple, list)):
+                    out = out[0]
+                return out
+            except TypeError as exc:
+                last_error = exc
+                continue
+        if NATTEN_BACKEND == "native":
+            raise last_error if last_error is not None else RuntimeError("Native NATTEN na2d failed.")
+        if not NATTEN_WARNED_FALLBACK:
+            print(f"Warning: native NATTEN na2d failed ({last_error}); falling back to torch_na2d.")
+            NATTEN_WARNED_FALLBACK = True
+    return torch_na2d(query, key, value, kernel_size, scale=scale, **kwargs)
 
 
 def torch_na2d(query, key, value, kernel_size, scale=None, **kwargs):
@@ -669,13 +709,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input_noise_std", type=float, default=0.0)
     parser.add_argument("--compute_lambda", type=float, default=0.0)
     parser.add_argument("--block_regex", default="")
+    parser.add_argument("--neighborhood_backend", default="auto", choices=["auto", "native", "torch"])
     parser.add_argument("--inspect_only", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     return parser
 
 
 def main() -> None:
+    global NATTEN_BACKEND
     args = build_parser().parse_args()
+    NATTEN_BACKEND = args.neighborhood_backend
     profile(args)
 
 
