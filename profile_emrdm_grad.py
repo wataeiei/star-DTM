@@ -63,6 +63,7 @@ def install_runtime_stubs() -> None:
     install_torchvision_stub()
     install_metric_stubs()
     install_logging_stubs()
+    install_natten_compat()
 
 
 class LightningModuleStub(nn.Module):
@@ -248,6 +249,16 @@ def install_logging_stubs() -> None:
         wandb.Image = lambda x, *args, **kwargs: x
         wandb.finish = lambda *args, **kwargs: None
         sys.modules["wandb"] = wandb
+
+
+def install_natten_compat() -> None:
+    """Patch small NATTEN API differences across versions."""
+    try:
+        import natten
+    except ImportError:
+        return
+    if not hasattr(natten, "has_fused_na"):
+        natten.has_fused_na = lambda: False
 
 
 def image_to_tensor(path: Path, image_size: int) -> torch.Tensor:
