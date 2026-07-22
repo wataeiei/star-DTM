@@ -252,13 +252,53 @@ def install_logging_stubs() -> None:
 
 
 def install_natten_compat() -> None:
-    """Patch small NATTEN API differences across versions."""
+    """Patch NATTEN API differences with a pure PyTorch fallback.
+
+    EMRDM was written against an older NATTEN API. Recent NATTEN releases moved
+    or removed legacy functions such as na2d_qk/na2d_av. For profiling we prefer
+    a slower but stable implementation over chasing CUDA extension variants.
+    """
     try:
         import natten
     except ImportError:
-        return
-    if not hasattr(natten, "has_fused_na"):
-        natten.has_fused_na = lambda: False
+        natten = types.ModuleType("natten")
+        sys.modules["natten"] = natten
+    if not hasattr(natten, "functional"):
+        natten.functional = types.ModuleType("natten.functional")
+        sys.modules["natten.functional"] = natten.functional
+    natten.functional.na2d = torch_na2d
+    natten.has_fused_na = lambda: True
+
+
+def torch_na2d(query, key, value, kernel_size, scale=None, **kwargs):
+    """Pure PyTorch 2D neighborhood attention.
+
+    Expected layout follows the fused EMRDM branch:
+      query/key/value: [batch, height, width, heads, head_dim]
+      output:          [batch, height, width, heads, head_dim]
+    """
+    if isinstance(kernel_size, int):
+        kh = kw = kernel_size
+    else:
+        kh, kw = int(kernel_size[0]), int(kernel_size[1])
+    if kh % 2 == 0 or kw % 2 == 0:
+        raise ValueError(f"Only odd neighborhood kernel sizes are supported, got {kernel_size}")
+    bsz, height, width, heads, dim = query.shape
+    scale = float(scale) if scale is not None else dim ** -0.5
+
+    def neighborhoods(x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 3, 4, 1, 2).reshape(bsz * heads, dim, height, width)
+        x = F.pad(x, (kw // 2, kw // 2, kh // 2, kh // 2))
+        patches = F.unfold(x, kernel_size=(kh, kw))
+        patches = patches.view(bsz, heads, dim, kh * kw, height, width)
+        return patches.permute(0, 4, 5, 1, 3, 2)
+
+    k_neigh = neighborhoods(key)
+    v_neigh = neighborhoods(value)
+    scores = (query.unsqueeze(-2).float() * k_neigh.float()).sum(dim=-1) * scale
+    attn = torch.softmax(scores, dim=-1).to(dtype=value.dtype)
+    out = (attn.unsqueeze(-1) * v_neigh).sum(dim=-2)
+    return out
 
 
 def image_to_tensor(path: Path, image_size: int) -> torch.Tensor:
