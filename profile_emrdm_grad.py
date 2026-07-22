@@ -517,11 +517,25 @@ def iter_lora_modules(root: nn.Module) -> Iterable[tuple[str, LoRALinear]]:
             yield name, module
 
 
-def inject_lora(root: nn.Module, target: str, rank: int, alpha: int, block_regex: str, up_init_scale: float) -> list[str]:
-    replacements = []
+def iter_target_linears(root: nn.Module, target: str, block_regex: str) -> Iterable[tuple[str, nn.Linear]]:
     for name, module in root.named_modules():
         if isinstance(module, nn.Linear) and block_key(name, block_regex) and target_match(name, target):
-            replacements.append((name, module))
+            yield name, module
+
+
+def enable_target_weight_grads(root: nn.Module, target: str, block_regex: str) -> list[tuple[str, nn.Linear]]:
+    modules = list(iter_target_linears(root, target, block_regex))
+    if not modules:
+        raise SystemExit("No target Linear modules found. Run --inspect_only and consider --target attention_linear.")
+    for _, module in modules:
+        module.weight.requires_grad_(True)
+        if module.bias is not None:
+            module.bias.requires_grad_(True)
+    return modules
+
+
+def inject_lora(root: nn.Module, target: str, rank: int, alpha: int, block_regex: str, up_init_scale: float) -> list[str]:
+    replacements = list(iter_target_linears(root, target, block_regex))
     if not replacements:
         raise SystemExit("No target Linear modules found. Run --inspect_only and consider --target attention_linear.")
     for name, module in replacements:
@@ -545,6 +559,15 @@ def lora_part_grad_norms(module: LoRALinear) -> tuple[float, float]:
         return math.sqrt(float(param.grad.detach().float().pow(2).sum().cpu()))
 
     return norm(module.lora_down.weight), norm(module.lora_up.weight)
+
+
+def linear_weight_grad_norm(module: nn.Linear) -> float:
+    total = 0.0
+    if module.weight.grad is not None:
+        total += float(module.weight.grad.detach().float().pow(2).sum().cpu())
+    if module.bias is not None and module.bias.grad is not None:
+        total += float(module.bias.grad.detach().float().pow(2).sum().cpu())
+    return math.sqrt(total)
 
 
 def is_profile_layer(name: str, module: nn.Module) -> bool:
@@ -659,12 +682,15 @@ def profile(args: argparse.Namespace) -> None:
         param.requires_grad_(False)
     injected = []
     recorder = None
+    weight_targets: list[tuple[str, nn.Linear]] = []
     if args.importance_mode == "lora":
         injected = inject_lora(model, args.target, args.rank, args.alpha, args.block_regex, args.lora_up_init_scale)
-    else:
+    elif args.importance_mode == "activation":
         recorder = ActivationGradRecorder(model, args.block_regex)
         if not recorder.records:
             raise SystemExit("No EMRDM transformer layers found for activation-gradient profiling.")
+    else:
+        weight_targets = enable_target_weight_grads(model, args.target, args.block_regex)
     model.train()
 
     dataset = PairedImageDataset(args.cloudy_dir, args.clear_dir, args.image_size, args.max_images)
@@ -724,16 +750,26 @@ def profile(args: argparse.Namespace) -> None:
             row["lora_param_count"] += module.lora_down.weight.numel() + module.lora_up.weight.numel()
             row["module_count"] += 1
     else:
-        assert recorder is not None
-        by_block = recorder.records
-        recorder.close()
+        if args.importance_mode == "activation":
+            assert recorder is not None
+            by_block = recorder.records
+            recorder.close()
+        else:
+            for name, module in weight_targets:
+                bkey = block_key(name, args.block_regex)
+                if not bkey:
+                    continue
+                row = by_block.setdefault(bkey, {"grad_norm": 0.0, "weight_param_count": 0, "module_count": 0})
+                row["grad_norm"] += linear_weight_grad_norm(module)
+                row["weight_param_count"] += module.weight.numel() + (module.bias.numel() if module.bias is not None else 0)
+                row["module_count"] += 1
 
     blocks = sorted(by_block, key=natural_key)
     total_blocks = max(len(blocks), 1)
     rows = []
     for block_index, block in enumerate(blocks):
         row = by_block[block]
-        p_count = int(row.get("lora_param_count") or row.get("activation_elements") or 1)
+        p_count = int(row.get("lora_param_count") or row.get("weight_param_count") or row.get("activation_elements") or 1)
         norm_score = row["grad_norm"] / math.sqrt(max(p_count, 1))
         bp_cost = total_blocks - block_index
         selection = norm_score / (p_count + args.compute_lambda * bp_cost) if args.compute_lambda > 0 else norm_score
@@ -744,7 +780,8 @@ def profile(args: argparse.Namespace) -> None:
                 "grad_norm": row["grad_norm"],
                 "down_grad_norm": row.get("down_grad_norm", 0.0),
                 "up_grad_norm": row.get("up_grad_norm", 0.0),
-                "lora_param_count": p_count,
+                "lora_param_count": int(row.get("lora_param_count", 0)),
+                "weight_param_count": int(row.get("weight_param_count", 0)),
                 "activation_elements": int(row.get("activation_elements", 0)),
                 "module_count": int(row["module_count"]),
                 "requires_grad_forwards": int(row.get("requires_grad_forwards", 0)),
@@ -779,6 +816,7 @@ def profile(args: argparse.Namespace) -> None:
         "seed": args.seed,
         "selected_blocks": sorted(selected, key=natural_key),
         "injected_module_count": len(injected),
+        "weight_target_module_count": len(weight_targets),
     }
     (out_dir / "emrdm_grad_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(f"Wrote {out_dir / 'emrdm_grad_scores.csv'}")
@@ -798,9 +836,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target", default="qkv", choices=["q", "v", "qv", "qkv", "attention_linear", "all_linear"])
     parser.add_argument(
         "--importance_mode",
-        default="activation",
-        choices=["activation", "lora"],
-        help="activation records block output-gradient sensitivity; lora records probe LoRA parameter gradients.",
+        default="weight",
+        choices=["weight", "activation", "lora"],
+        help="weight records original target Linear weight gradients; activation records block output gradients; lora records probe LoRA parameter gradients.",
     )
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--alpha", type=int, default=16)
