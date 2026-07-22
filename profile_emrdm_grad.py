@@ -547,6 +547,48 @@ def lora_part_grad_norms(module: LoRALinear) -> tuple[float, float]:
     return norm(module.lora_down.weight), norm(module.lora_up.weight)
 
 
+def is_profile_layer(name: str, module: nn.Module) -> bool:
+    cls = module.__class__.__name__
+    if cls not in {"NeighborhoodTransformerLayer", "GlobalTransformerLayer", "ShiftedWindowTransformerLayer"}:
+        return False
+    return any(marker in name for marker in ("down_levels", "up_levels", "mid_level"))
+
+
+class ActivationGradRecorder:
+    def __init__(self, model: nn.Module, block_regex: str = "") -> None:
+        self.records: dict[str, dict] = {}
+        self.handles = []
+        for name, module in model.named_modules():
+            if not is_profile_layer(name, module):
+                continue
+            bkey = block_key(name, block_regex) or name
+            self.records.setdefault(bkey, {"grad_norm": 0.0, "activation_elements": 0, "module_count": 0})
+            self.records[bkey]["module_count"] += 1
+            self.handles.append(module.register_forward_hook(self._forward_hook(bkey)))
+            self.handles.append(module.register_full_backward_hook(self._backward_hook(bkey)))
+
+    def _forward_hook(self, bkey: str):
+        def hook(module, inputs, output):
+            tensor = output[0] if isinstance(output, (tuple, list)) else output
+            if torch.is_tensor(tensor):
+                self.records[bkey]["activation_elements"] += int(tensor.numel())
+
+        return hook
+
+    def _backward_hook(self, bkey: str):
+        def hook(module, grad_input, grad_output):
+            tensor = grad_output[0] if grad_output else None
+            if torch.is_tensor(tensor):
+                self.records[bkey]["grad_norm"] += math.sqrt(float(tensor.detach().float().pow(2).sum().cpu()))
+
+        return hook
+
+    def close(self) -> None:
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+
+
 def load_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
     try:
         from omegaconf import OmegaConf
@@ -603,7 +645,14 @@ def profile(args: argparse.Namespace) -> None:
 
     for param in model.parameters():
         param.requires_grad_(False)
-    injected = inject_lora(model, args.target, args.rank, args.alpha, args.block_regex, args.lora_up_init_scale)
+    injected = []
+    recorder = None
+    if args.importance_mode == "lora":
+        injected = inject_lora(model, args.target, args.rank, args.alpha, args.block_regex, args.lora_up_init_scale)
+    else:
+        recorder = ActivationGradRecorder(model, args.block_regex)
+        if not recorder.records:
+            raise SystemExit("No EMRDM transformer layers found for activation-gradient profiling.")
     model.train()
 
     dataset = PairedImageDataset(args.cloudy_dir, args.clear_dir, args.image_size, args.max_images)
@@ -625,6 +674,9 @@ def profile(args: argparse.Namespace) -> None:
             "cond_image": pad_or_trim_channels(batch["cond_image"].to(device), args.image_channels),
             "global_step": 0,
         }
+        if args.importance_mode == "activation":
+            batch_t["label"].requires_grad_(True)
+            batch_t["cond_image"].requires_grad_(True)
         if args.input_noise_std > 0:
             batch_t["cond_image"] = batch_t["cond_image"] + torch.randn_like(batch_t["cond_image"]) * args.input_noise_std
 
@@ -642,24 +694,29 @@ def profile(args: argparse.Namespace) -> None:
         raise SystemExit("No valid probe batches.")
 
     by_block: dict[str, dict] = {}
-    for name, module in iter_lora_modules(model):
-        bkey = block_key(name, args.block_regex)
-        if not bkey:
-            continue
-        row = by_block.setdefault(bkey, {"grad_norm": 0.0, "lora_param_count": 0, "module_count": 0})
-        down_grad, up_grad = lora_part_grad_norms(module)
-        row["grad_norm"] += lora_grad_norm(module)
-        row["down_grad_norm"] = row.get("down_grad_norm", 0.0) + down_grad
-        row["up_grad_norm"] = row.get("up_grad_norm", 0.0) + up_grad
-        row["lora_param_count"] += module.lora_down.weight.numel() + module.lora_up.weight.numel()
-        row["module_count"] += 1
+    if args.importance_mode == "lora":
+        for name, module in iter_lora_modules(model):
+            bkey = block_key(name, args.block_regex)
+            if not bkey:
+                continue
+            row = by_block.setdefault(bkey, {"grad_norm": 0.0, "lora_param_count": 0, "module_count": 0})
+            down_grad, up_grad = lora_part_grad_norms(module)
+            row["grad_norm"] += lora_grad_norm(module)
+            row["down_grad_norm"] = row.get("down_grad_norm", 0.0) + down_grad
+            row["up_grad_norm"] = row.get("up_grad_norm", 0.0) + up_grad
+            row["lora_param_count"] += module.lora_down.weight.numel() + module.lora_up.weight.numel()
+            row["module_count"] += 1
+    else:
+        assert recorder is not None
+        by_block = recorder.records
+        recorder.close()
 
     blocks = sorted(by_block, key=natural_key)
     total_blocks = max(len(blocks), 1)
     rows = []
     for block_index, block in enumerate(blocks):
         row = by_block[block]
-        p_count = int(row["lora_param_count"])
+        p_count = int(row.get("lora_param_count") or row.get("activation_elements") or 1)
         norm_score = row["grad_norm"] / math.sqrt(max(p_count, 1))
         bp_cost = total_blocks - block_index
         selection = norm_score / (p_count + args.compute_lambda * bp_cost) if args.compute_lambda > 0 else norm_score
@@ -671,6 +728,7 @@ def profile(args: argparse.Namespace) -> None:
                 "down_grad_norm": row.get("down_grad_norm", 0.0),
                 "up_grad_norm": row.get("up_grad_norm", 0.0),
                 "lora_param_count": p_count,
+                "activation_elements": int(row.get("activation_elements", 0)),
                 "module_count": int(row["module_count"]),
                 "normalized_grad_score": norm_score,
                 "bp_cost": bp_cost,
@@ -694,6 +752,7 @@ def profile(args: argparse.Namespace) -> None:
         "cloudy_dir": args.cloudy_dir,
         "clear_dir": args.clear_dir,
         "target": args.target,
+        "importance_mode": args.importance_mode,
         "rank": args.rank,
         "alpha": args.alpha,
         "lora_up_init_scale": args.lora_up_init_scale,
@@ -719,6 +778,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image_channels", type=int, default=0, help="0 auto-infers half of patch_in input channels")
     parser.add_argument("--max_images", type=int, default=0)
     parser.add_argument("--target", default="qkv", choices=["q", "v", "qv", "qkv", "attention_linear", "all_linear"])
+    parser.add_argument(
+        "--importance_mode",
+        default="activation",
+        choices=["activation", "lora"],
+        help="activation records block output-gradient sensitivity; lora records probe LoRA parameter gradients.",
+    )
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--alpha", type=int, default=16)
     parser.add_argument("--lora_up_init_scale", type=float, default=1e-4)
