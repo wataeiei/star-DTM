@@ -94,6 +94,7 @@ def install_torchvision_stub() -> None:
     torchvision = types.ModuleType("torchvision")
     transforms = types.ModuleType("torchvision.transforms")
     transforms_v2 = types.ModuleType("torchvision.transforms.v2")
+    utils = types.ModuleType("torchvision.utils")
 
     class IdentityTransform:
         def __init__(self, *args, **kwargs):
@@ -117,11 +118,14 @@ def install_torchvision_stub() -> None:
     transforms_v2.ToDtype = IdentityTransform
     transforms_v2.Resize = IdentityTransform
     transforms.v2 = transforms_v2
+    utils.make_grid = lambda tensor, *args, **kwargs: tensor
     torchvision.transforms = transforms
+    torchvision.utils = utils
 
     sys.modules["torchvision"] = torchvision
     sys.modules["torchvision.transforms"] = transforms
     sys.modules["torchvision.transforms.v2"] = transforms_v2
+    sys.modules["torchvision.utils"] = utils
 
 
 def image_to_tensor(path: Path, image_size: int) -> torch.Tensor:
