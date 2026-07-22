@@ -257,6 +257,22 @@ def image_to_tensor(path: Path, image_size: int) -> torch.Tensor:
     return x * 2.0 - 1.0
 
 
+def pad_or_trim_channels(x: torch.Tensor, channels: int) -> torch.Tensor:
+    if x.shape[1] == channels:
+        return x
+    if x.shape[1] > channels:
+        return x[:, :channels]
+    pad = torch.zeros(
+        x.shape[0],
+        channels - x.shape[1],
+        x.shape[2],
+        x.shape[3],
+        device=x.device,
+        dtype=x.dtype,
+    )
+    return torch.cat([x, pad], dim=1)
+
+
 class PairedImageDataset(Dataset):
     def __init__(
         self,
@@ -439,6 +455,10 @@ def load_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
     model = instantiate_from_config(config.model)
     if not hasattr(model, "global_step"):
         model.global_step = 0
+    in_features = getattr(getattr(getattr(model.model.diffusion_model, "patch_in", None), "proj", None), "in_features", 0)
+    if in_features and args.image_channels <= 0:
+        args.image_channels = max(1, int(in_features) // 2)
+        print(f"Auto-set --image_channels {args.image_channels} from patch_in in_features={in_features}")
     model.to(device)
     model.eval()
     return model
@@ -496,8 +516,8 @@ def profile(args: argparse.Namespace) -> None:
             batch = next(data_iter)
 
         batch_t = {
-            "label": batch["label"].to(device),
-            "cond_image": batch["cond_image"].to(device),
+            "label": pad_or_trim_channels(batch["label"].to(device), args.image_channels),
+            "cond_image": pad_or_trim_channels(batch["cond_image"].to(device), args.image_channels),
             "global_step": 0,
         }
         if args.input_noise_std > 0:
@@ -585,6 +605,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clear_dir", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--image_size", type=int, default=256)
+    parser.add_argument("--image_channels", type=int, default=0, help="0 auto-infers half of patch_in input channels")
     parser.add_argument("--max_images", type=int, default=0)
     parser.add_argument("--target", default="qkv", choices=["q", "v", "qv", "qkv", "attention_linear", "all_linear"])
     parser.add_argument("--rank", type=int, default=8)
