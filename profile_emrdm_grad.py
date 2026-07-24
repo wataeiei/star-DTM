@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import importlib
 import json
 import math
@@ -570,6 +571,84 @@ def linear_weight_grad_norm(module: nn.Linear) -> float:
     return math.sqrt(total)
 
 
+def first_tensor(value):
+    if torch.is_tensor(value):
+        return value
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            tensor = first_tensor(item)
+            if tensor is not None:
+                return tensor
+    if isinstance(value, dict):
+        for item in value.values():
+            tensor = first_tensor(item)
+            if tensor is not None:
+                return tensor
+    return None
+
+
+def direct_denoiser_probe_loss(model: nn.Module, batch_t: dict[str, torch.Tensor], args: argparse.Namespace) -> torch.Tensor:
+    diffusion_model = getattr(getattr(model, "model", None), "diffusion_model", None)
+    if diffusion_model is None:
+        raise RuntimeError("Cannot find model.model.diffusion_model for direct denoiser probing.")
+
+    label = batch_t["label"]
+    cond = batch_t["cond_image"]
+    x = torch.cat([label, cond], dim=1)
+    sigma = torch.ones(label.shape[0], device=label.device, dtype=label.dtype)
+    cond_dicts = [
+        {},
+        {"cond_image": cond},
+        {"image": cond},
+        {"concat": cond},
+        {"c_concat": [cond]},
+        {"control": cond},
+    ]
+
+    callables = []
+    for cond_dict in cond_dicts:
+        callables.extend(
+            [
+                lambda c=cond_dict: diffusion_model(x, sigma, c),
+                lambda c=cond_dict: diffusion_model(x, sigma=sigma, cond=c),
+                lambda c=cond_dict: diffusion_model(x=x, sigma=sigma, cond=c),
+                lambda c=cond_dict: diffusion_model(input=x, sigma=sigma, cond=c),
+            ]
+        )
+    callables.extend(
+        [
+            lambda: diffusion_model(x, sigma),
+            lambda: diffusion_model(x),
+        ]
+    )
+
+    last_error = None
+    preferred = getattr(args, "_direct_call_index", None)
+    order = [preferred] if preferred is not None else []
+    order.extend(i for i in range(len(callables)) if i != preferred)
+
+    for call_index in order:
+        try:
+            output = callables[call_index]()
+            tensor = first_tensor(output)
+            if tensor is None:
+                raise RuntimeError("direct denoiser output contains no tensor")
+            if not torch.is_floating_point(tensor):
+                tensor = tensor.float()
+            args._direct_call_index = call_index
+            return tensor.float().pow(2).mean()
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    signature = ""
+    try:
+        signature = str(inspect.signature(diffusion_model.forward))
+    except Exception:
+        pass
+    raise RuntimeError(f"Direct denoiser probe failed for all call patterns. forward signature={signature}. Last error: {last_error}")
+
+
 def is_profile_layer(name: str, module: nn.Module) -> bool:
     cls = module.__class__.__name__
     if cls not in {"NeighborhoodTransformerLayer", "GlobalTransformerLayer", "ShiftedWindowTransformerLayer"}:
@@ -720,7 +799,10 @@ def profile(args: argparse.Namespace) -> None:
             if args.importance_mode == "activation":
                 batch_t["cond_image"].requires_grad_(True)
 
-        loss, _ = model.shared_step(batch_t)
+        if args.loss_mode == "shared_step":
+            loss, _ = model.shared_step(batch_t)
+        else:
+            loss = direct_denoiser_probe_loss(model, batch_t, args)
         if not torch.isfinite(loss):
             print(f"probe batch {idx}/{args.probe_batches} skipped: non-finite loss")
             model.zero_grad(set_to_none=True)
@@ -731,6 +813,10 @@ def profile(args: argparse.Namespace) -> None:
             recorder.collect_and_clear()
         valid += 1
         total_loss += float(loss.detach().cpu())
+        if valid == 1:
+            direct_index = getattr(args, "_direct_call_index", "")
+            suffix = f" direct_call_index={direct_index}" if direct_index != "" else ""
+            print(f"first valid loss requires_grad={loss.requires_grad}{suffix}")
         print(f"probe batch {idx:03d}/{args.probe_batches} loss={float(loss.detach().cpu()):.6f}")
 
     if valid == 0:
@@ -808,6 +894,7 @@ def profile(args: argparse.Namespace) -> None:
         "clear_dir": args.clear_dir,
         "target": args.target,
         "importance_mode": args.importance_mode,
+        "loss_mode": args.loss_mode,
         "rank": args.rank,
         "alpha": args.alpha,
         "lora_up_init_scale": args.lora_up_init_scale,
@@ -839,6 +926,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="weight",
         choices=["weight", "activation", "lora"],
         help="weight records original target Linear weight gradients; activation records block output gradients; lora records probe LoRA parameter gradients.",
+    )
+    parser.add_argument(
+        "--loss_mode",
+        default="shared_step",
+        choices=["shared_step", "direct_denoiser"],
+        help="shared_step uses the repository loss; direct_denoiser probes model.model.diffusion_model directly when shared_step has no gradients.",
     )
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--alpha", type=int, default=16)
