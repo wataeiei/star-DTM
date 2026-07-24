@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train All-LoRA on the HF DiT4SR proxy objective and track importance."""
+"""Train All-LoRA on the official DiT4SR flow objective and track importance."""
 
 from __future__ import annotations
 
@@ -29,30 +29,7 @@ def write_csv(path, rows):
 
 
 def batch_loss(pipe, transformer, batch, args, device):
-    hidden = core.image_to_hidden_states(pipe, batch["image"], transformer, args, device)
-    control_image = F.interpolate(
-        batch["image"],
-        scale_factor=1.0 / args.sr_scale,
-        mode="bicubic",
-        align_corners=False,
-    )
-    control_image = F.interpolate(
-        control_image,
-        size=batch["image"].shape[-2:],
-        mode="bicubic",
-        align_corners=False,
-    )
-    control_hidden = core.image_to_hidden_states(
-        pipe, control_image, transformer, args, device
-    )
-    if args.input_noise_std > 0:
-        hidden = hidden + torch.randn_like(hidden) * args.input_noise_std
-    output = core.output_tensor(
-        core.transformer_forward(
-            transformer, hidden, args, controlnet_image=control_hidden
-        )
-    ).float()
-    return F.mse_loss(output, hidden.float()) if output.shape == hidden.shape else output.pow(2).mean()
+    return core.flow_matching_batch_loss(pipe, transformer, batch, args, device)
 
 
 def profile_importance(pipe, transformer, loader, args, device, train_step):
@@ -114,6 +91,7 @@ def profile_importance(pipe, transformer, loader, args, device, train_step):
                     "normalized_update_score": update_norm / math.sqrt(max(params, 1)),
                     "probe_batches": valid,
                     "mean_probe_loss": loss_sum / valid,
+                    "loss_mode": args.loss_mode,
                 }
             )
         ranked = sorted(rows, key=lambda row: row["normalized_grad_score"], reverse=True)
@@ -160,6 +138,8 @@ def topk_summary(rows):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model_id", default="acceptee/DiT4SR")
+    parser.add_argument("--base_model_id", default="stabilityai/stable-diffusion-3.5-medium")
+    parser.add_argument("--loss_mode", default="official_flow", choices=["official_flow", "proxy"])
     parser.add_argument("--load_mode", default="transformer", choices=["transformer", "pipeline"])
     parser.add_argument("--model_impl", default="official", choices=["official", "standard"])
     parser.add_argument("--dit4sr_code_repo", default="acceptee/DiT4SR")
@@ -259,7 +239,7 @@ def main():
         "profile_steps": sorted(profile_steps),
         "injected_module_count": len(injected),
         "model": "DiT4SR-HF",
-        "objective": "transformer_proxy",
+        "objective": args.loss_mode,
     }
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(f"Wrote results to {output_dir}")

@@ -307,6 +307,96 @@ def load_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
     return model
 
 
+def _load_state(module: nn.Module, path: str | Path, label: str) -> None:
+    ckpt = torch.load(path, map_location="cpu")
+    state = ckpt
+    for key in ("state_dict", "model", "params", "ema"):
+        if isinstance(state, dict) and key in state and isinstance(state[key], dict):
+            state = state[key]
+            break
+    if not isinstance(state, dict):
+        raise SystemExit(f"Unsupported {label} checkpoint format: {type(ckpt)}")
+    cleaned = {}
+    for key, value in state.items():
+        new_key = key
+        for prefix in ("module.", "model.", "model_ema.", "autoencoder."):
+            if new_key.startswith(prefix):
+                new_key = new_key[len(prefix) :]
+        cleaned[new_key] = value
+    missing, unexpected = module.load_state_dict(cleaned, strict=False)
+    print(f"Loaded {label}: missing={len(missing)} unexpected={len(unexpected)}")
+    if missing:
+        print(f"First missing {label} keys:", missing[:10])
+    if unexpected:
+        print(f"First unexpected {label} keys:", unexpected[:10])
+
+
+def load_official_objective(args: argparse.Namespace, device: torch.device):
+    """Load the diffusion process and first-stage model used by DiT-SR training."""
+    if args.loss_mode != "official":
+        return None, None
+    from omegaconf import OmegaConf
+
+    config = OmegaConf.load(args.config_path)
+    diffusion = instantiate_from_config(config.diffusion)
+    autoencoder = instantiate_from_config(config.autoencoder)
+    ae_path = args.autoencoder_ckpt or str(config.autoencoder.get("ckpt_path", ""))
+    if not ae_path:
+        raise SystemExit("Official DiT-SR loss requires --autoencoder_ckpt or autoencoder.ckpt_path.")
+    _load_state(autoencoder, ae_path, "autoencoder")
+    autoencoder.to(device).eval().requires_grad_(False)
+    print(
+        "Using official DiT-SR diffusion objective: "
+        f"predict_type={getattr(diffusion, 'predict_type', 'config-defined')}"
+    )
+    return diffusion, autoencoder
+
+
+def diffusion_batch_loss(
+    model: nn.Module,
+    diffusion,
+    autoencoder: nn.Module | None,
+    batch: dict,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> torch.Tensor:
+    image = batch["image"].to(device)
+    lq = F.interpolate(
+        image, size=(args.lq_size, args.lq_size), mode="bicubic", align_corners=False
+    )
+    if args.loss_mode == "proxy":
+        timesteps = torch.full(
+            (image.shape[0],), args.timestep, device=device, dtype=torch.long
+        )
+        output = model(image, timesteps, lq=lq)
+        return (
+            F.mse_loss(output.float(), image.float())
+            if output.shape == image.shape
+            else output.float().pow(2).mean()
+        )
+
+    timesteps = torch.randint(
+        0, diffusion.num_timesteps, (image.shape[0],), device=device, dtype=torch.long
+    )
+    model_kwargs = {"lq": lq}
+    result = diffusion.training_losses(
+        model,
+        image,
+        lq,
+        timesteps,
+        first_stage_model=autoencoder,
+        model_kwargs=model_kwargs,
+        noise=None,
+    )
+    losses = result[0] if isinstance(result, (tuple, list)) else result
+    if not isinstance(losses, dict):
+        raise RuntimeError(f"Unexpected DiT-SR training_losses result: {type(losses)}")
+    loss = losses.get("mse", losses.get("loss"))
+    if loss is None:
+        raise RuntimeError(f"DiT-SR loss dictionary has no mse/loss key: {list(losses)}")
+    return loss.mean()
+
+
 def inspect_model(model: nn.Module, args: argparse.Namespace) -> None:
     print("== Attention/BasicLayer-like modules ==")
     for name, module in model.named_modules():
@@ -334,6 +424,7 @@ def profile(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     model = load_model(args, device)
+    diffusion, autoencoder = load_official_objective(args, device)
 
     if args.inspect_only:
         inspect_model(model, args)
@@ -358,15 +449,7 @@ def profile(args: argparse.Namespace) -> None:
             data_iter = iter(loader)
             batch = next(data_iter)
 
-        img = batch["image"].to(device)
-        lq = F.interpolate(img, size=(args.lq_size, args.lq_size), mode="bicubic", align_corners=False)
-        x = F.interpolate(img, size=(args.image_size, args.image_size), mode="bicubic", align_corners=False)
-        if args.input_noise_std > 0:
-            x = x + torch.randn_like(x) * args.input_noise_std
-        timesteps = torch.full((x.shape[0],), args.timestep, device=device, dtype=torch.long)
-
-        output = model(x, timesteps, lq=lq)
-        loss = F.mse_loss(output.float(), x.float()) if output.shape == x.shape else output.float().pow(2).mean()
+        loss = diffusion_batch_loss(model, diffusion, autoencoder, batch, args, device)
         if not torch.isfinite(loss):
             print(f"probe batch {idx}/{args.probe_batches} skipped: non-finite loss")
             model.zero_grad(set_to_none=True)
@@ -412,6 +495,7 @@ def profile(args: argparse.Namespace) -> None:
                 "selection_score": selection,
                 "probe_batches": valid,
                 "mean_probe_loss": total_loss / valid,
+                "loss_mode": args.loss_mode,
                 "selected": False,
             }
         )
@@ -432,6 +516,7 @@ def profile(args: argparse.Namespace) -> None:
         "topk_blocks": args.topk_blocks,
         "probe_batches": args.probe_batches,
         "seed": args.seed,
+        "loss_mode": args.loss_mode,
         "selected_blocks": sorted(selected, key=natural_key),
         "injected_module_count": len(injected),
     }
@@ -446,8 +531,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ckpt_path", default="weights/realsr.pth")
     parser.add_argument("--data_dir", required=True)
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--image_size", type=int, default=64)
+    parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--lq_size", type=int, default=64)
+    parser.add_argument("--loss_mode", default="official", choices=["official", "proxy"])
+    parser.add_argument("--autoencoder_ckpt", default="")
     parser.add_argument("--max_images", type=int, default=0)
     parser.add_argument("--target", default="qkv", choices=["q", "v", "qv", "qkv", "all_linear"])
     parser.add_argument("--rank", type=int, default=8)

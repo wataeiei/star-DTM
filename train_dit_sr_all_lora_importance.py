@@ -27,24 +27,13 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
-def batch_loss(model, batch, args, device):
-    image = batch["image"].to(device)
-    lq = F.interpolate(
-        image, size=(args.lq_size, args.lq_size), mode="bicubic", align_corners=False
+def batch_loss(model, diffusion, autoencoder, batch, args, device):
+    return core.diffusion_batch_loss(
+        model, diffusion, autoencoder, batch, args, device
     )
-    model_input = image
-    if args.input_noise_std > 0:
-        model_input = model_input + torch.randn_like(model_input) * args.input_noise_std
-    timesteps = torch.full(
-        (image.shape[0],), args.timestep, device=device, dtype=torch.long
-    )
-    output = model(model_input, timesteps, lq=lq)
-    if output.shape == image.shape:
-        return F.mse_loss(output.float(), image.float())
-    return output.float().pow(2).mean()
 
 
-def profile_importance(model, loader, args, device, train_step):
+def profile_importance(model, diffusion, autoencoder, loader, args, device, train_step):
     cpu_state = torch.random.get_rng_state()
     cuda_state = torch.cuda.get_rng_state_all() if device.type == "cuda" else None
     python_state = random.getstate()
@@ -60,7 +49,7 @@ def profile_importance(model, loader, args, device, train_step):
             except StopIteration:
                 iterator = iter(loader)
                 batch = next(iterator)
-            loss = batch_loss(model, batch, args, device)
+            loss = batch_loss(model, diffusion, autoencoder, batch, args, device)
             if not torch.isfinite(loss):
                 model.zero_grad(set_to_none=True)
                 continue
@@ -104,6 +93,7 @@ def profile_importance(model, loader, args, device, train_step):
                     "normalized_update_score": update_norm / math.sqrt(max(params, 1)),
                     "probe_batches": valid,
                     "mean_probe_loss": total_loss / valid,
+                    "loss_mode": args.loss_mode,
                 }
             )
         ranked = sorted(rows, key=lambda row: row["normalized_grad_score"], reverse=True)
@@ -158,8 +148,10 @@ def main():
     parser.add_argument("--ckpt_path", default="weights/realsr.pth")
     parser.add_argument("--data_dir", required=True)
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--image_size", type=int, default=64)
+    parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--lq_size", type=int, default=64)
+    parser.add_argument("--loss_mode", default="official", choices=["official", "proxy"])
+    parser.add_argument("--autoencoder_ckpt", default="")
     parser.add_argument("--target", default="qkv", choices=["q", "v", "qv", "qkv", "all_linear"])
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--alpha", type=int, default=16)
@@ -184,6 +176,7 @@ def main():
     core.set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     model = core.load_model(args, device)
+    diffusion, autoencoder = core.load_official_objective(args, device)
     model.requires_grad_(False)
     injected = core.inject_lora(model, args.target, args.rank, args.alpha, args.block_regex)
     model.train()
@@ -202,7 +195,9 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     profile_steps = {step for step in args.profile_steps if 0 <= step <= args.train_steps}
     profile_steps.update({0, args.train_steps})
-    importance_rows = profile_importance(model, profile_loader, args, device, 0)
+    importance_rows = profile_importance(
+        model, diffusion, autoencoder, profile_loader, args, device, 0
+    )
     train_rows = []
     iterator = iter(train_loader)
     write_csv(output_dir / "lora_importance_evolution.csv", importance_rows)
@@ -215,7 +210,7 @@ def main():
             iterator = iter(train_loader)
             batch = next(iterator)
         optimizer.zero_grad(set_to_none=True)
-        loss = batch_loss(model, batch, args, device)
+        loss = batch_loss(model, diffusion, autoencoder, batch, args, device)
         if not torch.isfinite(loss):
             raise SystemExit(f"Non-finite training loss at step {step}.")
         loss.backward()
@@ -229,7 +224,9 @@ def main():
         if step % args.log_every == 0 or step == 1:
             print(f"step {step:05d}/{args.train_steps} loss={float(loss):.6f}")
         if step in profile_steps:
-            current = profile_importance(model, profile_loader, args, device, step)
+            current = profile_importance(
+                model, diffusion, autoencoder, profile_loader, args, device, step
+            )
             importance_rows.extend(current)
             write_csv(output_dir / "lora_importance_evolution.csv", importance_rows)
             write_csv(output_dir / "lora_importance_topk.csv", topk_summary(importance_rows))

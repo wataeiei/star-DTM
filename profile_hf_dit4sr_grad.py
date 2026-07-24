@@ -351,9 +351,10 @@ def lora_grad_norm(module: LoRALinear) -> float:
 
 
 class TransformerOnlyPipe:
-    def __init__(self, transformer: nn.Module):
+    def __init__(self, transformer: nn.Module, vae=None, scheduler=None):
         self.transformer = transformer
-        self.vae = None
+        self.vae = vae
+        self.scheduler = scheduler
 
 
 def model_dtype(args: argparse.Namespace) -> torch.dtype:
@@ -416,7 +417,25 @@ def load_pipe(args: argparse.Namespace, device: torch.device):
             torch_dtype=dtype,
             local_files_only=args.local_files_only,
         )
-        return TransformerOnlyPipe(transformer.to(device))
+        vae = None
+        scheduler = None
+        if args.loss_mode == "official_flow":
+            from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler
+
+            vae = AutoencoderKL.from_pretrained(
+                args.base_model_id,
+                subfolder="vae",
+                torch_dtype=dtype,
+                local_files_only=args.local_files_only,
+            ).to(device)
+            vae.eval().requires_grad_(False)
+            scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+                args.base_model_id,
+                subfolder="scheduler",
+                local_files_only=args.local_files_only,
+            )
+            print(f"Using official SD3 FlowMatch objective from {args.base_model_id}")
+        return TransformerOnlyPipe(transformer.to(device), vae=vae, scheduler=scheduler)
 
     from diffusers import DiffusionPipeline
 
@@ -472,10 +491,12 @@ def image_to_hidden_states(pipe, images: torch.Tensor, transformer: nn.Module, a
 
     if hasattr(pipe, "vae") and pipe.vae is not None:
         with torch.no_grad():
-            latent = pipe.vae.encode(images.to(device)).latent_dist.sample()
+            latent = pipe.vae.encode(images.to(device, dtype=next(pipe.vae.parameters()).dtype)).latent_dist.sample()
             scale = getattr(getattr(pipe.vae, "config", None), "scaling_factor", 1.0)
-            latent = latent * scale
-            latent = F.interpolate(latent.float(), size=(sample_size, sample_size), mode="bilinear", align_corners=False)
+            shift = getattr(getattr(pipe.vae, "config", None), "shift_factor", 0.0)
+            latent = (latent - shift) * scale
+            if args.loss_mode != "official_flow":
+                latent = F.interpolate(latent.float(), size=(sample_size, sample_size), mode="bilinear", align_corners=False)
             if latent.shape[1] != in_channels:
                 if latent.shape[1] > in_channels:
                     latent = latent[:, :in_channels]
@@ -519,6 +540,7 @@ def transformer_forward(
     hidden_states: torch.Tensor,
     args: argparse.Namespace,
     controlnet_image: torch.Tensor | None = None,
+    timesteps: torch.Tensor | None = None,
 ):
     sig = inspect.signature(transformer.forward)
     kwargs = {}
@@ -530,9 +552,56 @@ def transformer_forward(
             kwargs[name] = hidden_states
         elif name == "controlnet_image":
             kwargs[name] = controlnet_image if controlnet_image is not None else hidden_states
+        elif name in ("timestep", "timesteps") and timesteps is not None:
+            kwargs[name] = timesteps
         else:
             kwargs[name] = zeros_like_signature_arg(name, param, bsz, transformer, args, hidden_states.device)
     return transformer(**kwargs)
+
+
+def flow_matching_batch_loss(pipe, transformer, batch, args, device):
+    """Official SD3-style rectified-flow objective with DiT4SR LR control."""
+    images = batch["image"]
+    clean = image_to_hidden_states(pipe, images, transformer, args, device)
+    control_image = F.interpolate(
+        images, scale_factor=1.0 / args.sr_scale, mode="bicubic", align_corners=False
+    )
+    control_image = F.interpolate(
+        control_image, size=images.shape[-2:], mode="bicubic", align_corners=False
+    )
+    control = image_to_hidden_states(pipe, control_image, transformer, args, device)
+
+    if args.loss_mode == "proxy":
+        output = output_tensor(
+            transformer_forward(transformer, clean, args, controlnet_image=control)
+        ).float()
+        return (
+            F.mse_loss(output, clean.float())
+            if output.shape == clean.shape
+            else output.pow(2).mean()
+        )
+
+    if getattr(pipe, "scheduler", None) is None or getattr(pipe, "vae", None) is None:
+        raise RuntimeError("official_flow requires both the SD3 VAE and FlowMatch scheduler.")
+    scheduler = pipe.scheduler
+    count = len(scheduler.timesteps)
+    indices = torch.randint(0, count, (clean.shape[0],), device=device)
+    timesteps = scheduler.timesteps.to(device=device)[indices]
+    sigmas = scheduler.sigmas.to(device=device, dtype=clean.dtype)[indices]
+    sigmas = sigmas.view(-1, *([1] * (clean.ndim - 1)))
+    noise = torch.randn_like(clean)
+    noisy = (1.0 - sigmas) * clean + sigmas * noise
+    target = noise - clean
+    prediction = output_tensor(
+        transformer_forward(
+            transformer,
+            noisy,
+            args,
+            controlnet_image=control,
+            timesteps=timesteps,
+        )
+    )
+    return F.mse_loss(prediction.float(), target.float())
 
 
 def output_tensor(output):
@@ -578,32 +647,7 @@ def profile(args: argparse.Namespace) -> None:
         except StopIteration:
             data_iter = iter(loader)
             batch = next(data_iter)
-        hidden = image_to_hidden_states(pipe, batch["image"], transformer, args, device)
-        control_image = F.interpolate(
-            batch["image"],
-            scale_factor=1.0 / args.sr_scale,
-            mode="bicubic",
-            align_corners=False,
-        )
-        control_image = F.interpolate(
-            control_image,
-            size=batch["image"].shape[-2:],
-            mode="bicubic",
-            align_corners=False,
-        )
-        control_hidden = image_to_hidden_states(
-            pipe, control_image, transformer, args, device
-        )
-        if args.input_noise_std > 0:
-            hidden = hidden + torch.randn_like(hidden) * args.input_noise_std
-        output = transformer_forward(
-            transformer, hidden, args, controlnet_image=control_hidden
-        )
-        out = output_tensor(output).float()
-        if out.shape == hidden.shape:
-            loss = F.mse_loss(out, hidden.float())
-        else:
-            loss = out.pow(2).mean()
+        loss = flow_matching_batch_loss(pipe, transformer, batch, args, device)
         if not torch.isfinite(loss):
             print(f"probe batch {idx}/{args.probe_batches} skipped: non-finite loss")
             transformer.zero_grad(set_to_none=True)
@@ -652,6 +696,7 @@ def profile(args: argparse.Namespace) -> None:
                 "selection_score": selection,
                 "probe_batches": valid,
                 "mean_probe_loss": total_loss / valid,
+                "loss_mode": args.loss_mode,
                 "selected": False,
             }
         )
@@ -672,6 +717,8 @@ def profile(args: argparse.Namespace) -> None:
         "topk_blocks": args.topk_blocks,
         "probe_batches": args.probe_batches,
         "seed": args.seed,
+        "loss_mode": args.loss_mode,
+        "base_model_id": args.base_model_id,
         "selected_blocks": sorted(selected, key=natural_key),
         "injected_module_count": len(injected),
     }
@@ -683,6 +730,8 @@ def profile(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model_id", default="acceptee/DiT4SR")
+    parser.add_argument("--base_model_id", default="stabilityai/stable-diffusion-3.5-medium")
+    parser.add_argument("--loss_mode", default="official_flow", choices=["official_flow", "proxy"])
     parser.add_argument("--load_mode", default="transformer", choices=["transformer", "pipeline"])
     parser.add_argument(
         "--model_impl",
