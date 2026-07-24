@@ -205,6 +205,8 @@ def main():
     importance_rows = profile_importance(model, profile_loader, args, device, 0)
     train_rows = []
     iterator = iter(train_loader)
+    write_csv(output_dir / "lora_importance_evolution.csv", importance_rows)
+    write_csv(output_dir / "lora_importance_topk.csv", topk_summary(importance_rows))
 
     for step in range(1, args.train_steps + 1):
         try:
