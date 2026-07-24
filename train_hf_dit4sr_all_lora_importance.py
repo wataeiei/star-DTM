@@ -30,9 +30,28 @@ def write_csv(path, rows):
 
 def batch_loss(pipe, transformer, batch, args, device):
     hidden = core.image_to_hidden_states(pipe, batch["image"], transformer, args, device)
+    control_image = F.interpolate(
+        batch["image"],
+        scale_factor=1.0 / args.sr_scale,
+        mode="bicubic",
+        align_corners=False,
+    )
+    control_image = F.interpolate(
+        control_image,
+        size=batch["image"].shape[-2:],
+        mode="bicubic",
+        align_corners=False,
+    )
+    control_hidden = core.image_to_hidden_states(
+        pipe, control_image, transformer, args, device
+    )
     if args.input_noise_std > 0:
         hidden = hidden + torch.randn_like(hidden) * args.input_noise_std
-    output = core.output_tensor(core.transformer_forward(transformer, hidden, args)).float()
+    output = core.output_tensor(
+        core.transformer_forward(
+            transformer, hidden, args, controlnet_image=control_hidden
+        )
+    ).float()
     return F.mse_loss(output, hidden.float()) if output.shape == hidden.shape else output.pow(2).mean()
 
 
@@ -142,6 +161,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model_id", default="acceptee/DiT4SR")
     parser.add_argument("--load_mode", default="transformer", choices=["transformer", "pipeline"])
+    parser.add_argument("--model_impl", default="official", choices=["official", "standard"])
+    parser.add_argument("--dit4sr_code_repo", default="acceptee/DiT4SR")
+    parser.add_argument("--dit4sr_code_dir", default="")
     parser.add_argument("--variant", default="dit4sr_q", choices=["dit4sr_q", "dit4sr_f", "dit4sr_r1"])
     parser.add_argument("--transformer_subfolder", default="")
     parser.add_argument("--pipeline_subfolder", default="")
@@ -173,6 +195,7 @@ def main():
     parser.add_argument("--prompt_seq_len", type=int, default=77)
     parser.add_argument("--timestep", type=int, default=500)
     parser.add_argument("--input_noise_std", type=float, default=0.0)
+    parser.add_argument("--sr_scale", type=float, default=4.0)
     parser.add_argument("--log_every", type=int, default=10)
     args = parser.parse_args()
 
@@ -213,7 +236,10 @@ def main():
         optimizer.step()
         train_rows.append({"step": step, "loss": float(loss.detach().cpu()), "grad_norm": float(grad_norm)})
         if step % args.log_every == 0 or step == 1:
-            print(f"step {step:05d}/{args.train_steps} loss={float(loss):.6f}")
+            print(
+                f"step {step:05d}/{args.train_steps} "
+                f"loss={float(loss.detach().cpu()):.6f}"
+            )
         if step in profile_steps:
             current = profile_importance(pipe, transformer, profile_loader, args, device, step)
             importance_rows.extend(current)

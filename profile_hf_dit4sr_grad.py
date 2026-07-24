@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib
 import inspect
 import json
 import math
@@ -266,13 +267,42 @@ def block_key(name: str, block_regex: str = "") -> str:
 def target_match(name: str, target: str) -> bool:
     leaf = name.lower().split(".")[-1]
     if target == "q":
-        return leaf in {"q", "to_q", "q_proj"}
+        return leaf in {"q", "to_q", "q_proj", "to_q_control", "add_q_proj"}
     if target == "v":
-        return leaf in {"v", "to_v", "v_proj"}
+        return leaf in {"v", "to_v", "v_proj", "to_v_control", "add_v_proj"}
     if target == "qv":
-        return leaf in {"q", "v", "to_q", "to_v", "q_proj", "v_proj"}
+        return leaf in {
+            "q",
+            "v",
+            "to_q",
+            "to_v",
+            "q_proj",
+            "v_proj",
+            "to_q_control",
+            "to_v_control",
+            "add_q_proj",
+            "add_v_proj",
+        }
     if target == "qkv":
-        return leaf in {"qkv", "to_qkv", "q", "k", "v", "to_q", "to_k", "to_v", "q_proj", "k_proj", "v_proj"}
+        return leaf in {
+            "qkv",
+            "to_qkv",
+            "q",
+            "k",
+            "v",
+            "to_q",
+            "to_k",
+            "to_v",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "to_q_control",
+            "to_k_control",
+            "to_v_control",
+            "add_q_proj",
+            "add_k_proj",
+            "add_v_proj",
+        }
     if target == "qkvo":
         return leaf in {
             "qkv",
@@ -334,20 +364,53 @@ def model_dtype(args: argparse.Namespace) -> torch.dtype:
     return torch.float32
 
 
+def load_dit4sr_transformer_class(args: argparse.Namespace):
+    if args.model_impl == "standard":
+        from diffusers import SD3Transformer2DModel
+
+        return SD3Transformer2DModel
+
+    from huggingface_hub import snapshot_download
+
+    if args.dit4sr_code_dir:
+        code_root = Path(args.dit4sr_code_dir).resolve()
+    else:
+        code_root = Path(
+            snapshot_download(
+                repo_id=args.dit4sr_code_repo,
+                repo_type="space",
+                allow_patterns=["model_dit4sr/*.py", "model_dit4sr/**/*.py"],
+                local_files_only=args.local_files_only,
+            )
+        )
+    if not (code_root / "model_dit4sr" / "transformer_sd3.py").exists():
+        raise SystemExit(
+            f"Missing official DiT4SR model code under {code_root / 'model_dit4sr'}"
+        )
+    root_text = str(code_root)
+    if root_text not in sys.path:
+        sys.path.insert(0, root_text)
+    importlib.invalidate_caches()
+    module = importlib.import_module("model_dit4sr.transformer_sd3")
+    model_class = getattr(module, "SD3Transformer2DModel")
+    print(f"Using official DiT4SR transformer class from {Path(module.__file__).resolve()}")
+    return model_class
+
+
 def load_pipe(args: argparse.Namespace, device: torch.device):
     install_torchvision_stub()
     require_packages()
     dtype = model_dtype(args)
     if args.load_mode == "transformer":
         try:
-            from diffusers import SD3Transformer2DModel
+            transformer_class = load_dit4sr_transformer_class(args)
         except ImportError as exc:
             raise SystemExit(
-                "Your diffusers version does not expose SD3Transformer2DModel.\n"
-                "Upgrade with: pip3 install -U diffusers transformers accelerate"
+                "Could not import the DiT4SR transformer implementation.\n"
+                "Check diffusers and the Hugging Face Space code cache."
             ) from exc
         subfolder = args.transformer_subfolder or f"{args.variant}/transformer"
-        transformer = SD3Transformer2DModel.from_pretrained(
+        transformer = transformer_class.from_pretrained(
             args.model_id,
             subfolder=subfolder,
             torch_dtype=dtype,
@@ -451,7 +514,12 @@ def zeros_like_signature_arg(name: str, param, bsz: int, transformer: nn.Module,
     raise SystemExit(f"Do not know how to build required transformer argument: {name}")
 
 
-def transformer_forward(transformer: nn.Module, hidden_states: torch.Tensor, args: argparse.Namespace):
+def transformer_forward(
+    transformer: nn.Module,
+    hidden_states: torch.Tensor,
+    args: argparse.Namespace,
+    controlnet_image: torch.Tensor | None = None,
+):
     sig = inspect.signature(transformer.forward)
     kwargs = {}
     bsz = hidden_states.shape[0]
@@ -460,6 +528,8 @@ def transformer_forward(transformer: nn.Module, hidden_states: torch.Tensor, arg
             kwargs[name] = hidden_states
         elif name == "sample":
             kwargs[name] = hidden_states
+        elif name == "controlnet_image":
+            kwargs[name] = controlnet_image if controlnet_image is not None else hidden_states
         else:
             kwargs[name] = zeros_like_signature_arg(name, param, bsz, transformer, args, hidden_states.device)
     return transformer(**kwargs)
@@ -509,9 +579,26 @@ def profile(args: argparse.Namespace) -> None:
             data_iter = iter(loader)
             batch = next(data_iter)
         hidden = image_to_hidden_states(pipe, batch["image"], transformer, args, device)
+        control_image = F.interpolate(
+            batch["image"],
+            scale_factor=1.0 / args.sr_scale,
+            mode="bicubic",
+            align_corners=False,
+        )
+        control_image = F.interpolate(
+            control_image,
+            size=batch["image"].shape[-2:],
+            mode="bicubic",
+            align_corners=False,
+        )
+        control_hidden = image_to_hidden_states(
+            pipe, control_image, transformer, args, device
+        )
         if args.input_noise_std > 0:
             hidden = hidden + torch.randn_like(hidden) * args.input_noise_std
-        output = transformer_forward(transformer, hidden, args)
+        output = transformer_forward(
+            transformer, hidden, args, controlnet_image=control_hidden
+        )
         out = output_tensor(output).float()
         if out.shape == hidden.shape:
             loss = F.mse_loss(out, hidden.float())
@@ -597,6 +684,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model_id", default="acceptee/DiT4SR")
     parser.add_argument("--load_mode", default="transformer", choices=["transformer", "pipeline"])
+    parser.add_argument(
+        "--model_impl",
+        default="official",
+        choices=["official", "standard"],
+        help="Use DiT4SR's official custom transformer or the incomplete standard SD3 class.",
+    )
+    parser.add_argument("--dit4sr_code_repo", default="acceptee/DiT4SR")
+    parser.add_argument(
+        "--dit4sr_code_dir",
+        default="",
+        help="Optional local snapshot root containing model_dit4sr/.",
+    )
     parser.add_argument("--variant", default="dit4sr_q", choices=["dit4sr_q", "dit4sr_f", "dit4sr_r1"])
     parser.add_argument("--transformer_subfolder", default="", help="Override transformer subfolder, e.g. dit4sr_q/transformer")
     parser.add_argument("--pipeline_subfolder", default="", help="Optional pipeline subfolder if a repo contains model_index.json there")
@@ -624,6 +723,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt_seq_len", type=int, default=77)
     parser.add_argument("--timestep", type=int, default=500)
     parser.add_argument("--input_noise_std", type=float, default=0.0)
+    parser.add_argument("--sr_scale", type=float, default=4.0)
     parser.add_argument("--compute_lambda", type=float, default=0.0)
     return parser
 
