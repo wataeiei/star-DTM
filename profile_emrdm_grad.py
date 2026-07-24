@@ -887,6 +887,7 @@ def load_config_train_loader(args: argparse.Namespace):
         raise SystemExit("The YAML config has no top-level data section; cannot use --data_mode config_train.")
     if args.official_data_root:
         override_dataset_roots(config.data, args.official_data_root, args.official_nir_data_root)
+    override_official_data_runtime(config.data, args.image_size, args.batch_size, args.num_workers)
 
     data = instantiate_from_config(config.data)
     if hasattr(data, "prepare_data"):
@@ -907,6 +908,39 @@ def load_config_train_loader(args: argparse.Namespace):
     else:
         raise SystemExit("Config data object has no train_dataloader method.")
     return loader
+
+
+def override_official_data_runtime(node, image_size: int, batch_size: int, num_workers: int) -> None:
+    """Shrink official data config for profiling on memory-limited edge GPUs."""
+    try:
+        from omegaconf import DictConfig, ListConfig
+    except ImportError:
+        DictConfig = dict
+        ListConfig = list
+
+    size_keys = {
+        "size",
+        "image_size",
+        "img_size",
+        "crop_size",
+        "patch_size",
+        "resolution",
+        "load_size",
+        "fine_size",
+    }
+    if isinstance(node, (dict, DictConfig)):
+        for key in list(node.keys()):
+            if key in size_keys and isinstance(node[key], (int, float)):
+                node[key] = int(image_size)
+            elif key == "batch_size":
+                node[key] = int(batch_size)
+            elif key in {"num_workers", "num_worker", "workers"}:
+                node[key] = int(num_workers)
+            else:
+                override_official_data_runtime(node[key], image_size, batch_size, num_workers)
+    elif isinstance(node, (list, tuple, ListConfig)):
+        for item in node:
+            override_official_data_runtime(item, image_size, batch_size, num_workers)
 
 
 def infer_nir_root(data_root: str) -> str:
@@ -1226,6 +1260,9 @@ def profile(args: argparse.Namespace) -> None:
         "data_mode": args.data_mode,
         "official_data_root": args.official_data_root,
         "official_nir_data_root": args.official_nir_data_root,
+        "image_size": args.image_size,
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
         "target": args.target,
         "importance_mode": args.importance_mode,
         "loss_mode": args.loss_mode,
