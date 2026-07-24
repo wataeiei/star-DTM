@@ -160,6 +160,7 @@ def install_torchvision_stub() -> None:
 
     torchvision = types.ModuleType("torchvision")
     transforms = types.ModuleType("torchvision.transforms")
+    transforms_functional = types.ModuleType("torchvision.transforms.functional")
     transforms_v2 = types.ModuleType("torchvision.transforms.v2")
     utils = types.ModuleType("torchvision.utils")
     models = types.ModuleType("torchvision.models")
@@ -187,6 +188,107 @@ def install_torchvision_stub() -> None:
         def __init__(self, *args, **kwargs):
             raise RuntimeError("torchvision.datasets.ImageFolder is unavailable in this profiling environment.")
 
+    class InterpolationMode:
+        NEAREST = "nearest"
+        BILINEAR = "bilinear"
+        BICUBIC = "bicubic"
+        LANCZOS = "lanczos"
+        BOX = "box"
+        HAMMING = "hamming"
+
+    def _pil_resample(interpolation=None):
+        if str(interpolation).lower().endswith("nearest") or interpolation == InterpolationMode.NEAREST:
+            return Image.Resampling.NEAREST
+        if str(interpolation).lower().endswith("bicubic") or interpolation == InterpolationMode.BICUBIC:
+            return Image.Resampling.BICUBIC
+        if str(interpolation).lower().endswith("lanczos") or interpolation == InterpolationMode.LANCZOS:
+            return Image.Resampling.LANCZOS
+        return Image.Resampling.BILINEAR
+
+    def functional_to_tensor(image):
+        if torch.is_tensor(image):
+            tensor = image
+            if tensor.ndim == 2:
+                tensor = tensor.unsqueeze(0)
+            if tensor.ndim == 3 and tensor.shape[-1] in (1, 3, 4):
+                tensor = tensor.permute(2, 0, 1)
+            return tensor.float().div(255.0) if tensor.dtype == torch.uint8 else tensor.float()
+        import numpy as np
+
+        arr = np.array(image)
+        if arr.ndim == 2:
+            arr = arr[:, :, None]
+        tensor = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+        return tensor.float().div(255.0)
+
+    def functional_resize(image, size, interpolation=None, *args, **kwargs):
+        if isinstance(size, int):
+            out_size = (size, size)
+        else:
+            out_size = tuple(size)
+        if torch.is_tensor(image):
+            squeeze = image.ndim == 3
+            tensor = image.unsqueeze(0) if squeeze else image
+            resized = F.interpolate(tensor.float(), size=out_size, mode="bilinear", align_corners=False)
+            return resized.squeeze(0).to(dtype=image.dtype) if squeeze else resized.to(dtype=image.dtype)
+        return image.resize((out_size[1], out_size[0]), resample=_pil_resample(interpolation))
+
+    def functional_normalize(tensor, mean, std, inplace=False):
+        if not inplace:
+            tensor = tensor.clone()
+        mean_t = torch.as_tensor(mean, dtype=tensor.dtype, device=tensor.device).view(-1, 1, 1)
+        std_t = torch.as_tensor(std, dtype=tensor.dtype, device=tensor.device).view(-1, 1, 1)
+        return tensor.sub_(mean_t).div_(std_t)
+
+    def functional_hflip(image):
+        if torch.is_tensor(image):
+            return torch.flip(image, dims=[-1])
+        return image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+
+    def functional_vflip(image):
+        if torch.is_tensor(image):
+            return torch.flip(image, dims=[-2])
+        return image.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+
+    def functional_crop(image, top, left, height, width):
+        if torch.is_tensor(image):
+            return image[..., top : top + height, left : left + width]
+        return image.crop((left, top, left + width, top + height))
+
+    def functional_center_crop(image, output_size):
+        if isinstance(output_size, int):
+            th = tw = output_size
+        else:
+            th, tw = output_size
+        h, w = image.shape[-2:] if torch.is_tensor(image) else (image.height, image.width)
+        top = max((h - th) // 2, 0)
+        left = max((w - tw) // 2, 0)
+        return functional_crop(image, top, left, th, tw)
+
+    def functional_to_pil_image(image):
+        if isinstance(image, Image.Image):
+            return image
+        import numpy as np
+
+        tensor = image.detach().cpu()
+        if tensor.ndim == 3:
+            tensor = tensor.permute(1, 2, 0)
+        arr = tensor.numpy()
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 1)
+            arr = (arr * 255).astype(np.uint8)
+        return Image.fromarray(arr.squeeze())
+
+    transforms_functional.to_tensor = functional_to_tensor
+    transforms_functional.pil_to_tensor = lambda image: (functional_to_tensor(image) * 255).to(torch.uint8)
+    transforms_functional.resize = functional_resize
+    transforms_functional.normalize = functional_normalize
+    transforms_functional.hflip = functional_hflip
+    transforms_functional.vflip = functional_vflip
+    transforms_functional.crop = functional_crop
+    transforms_functional.center_crop = functional_center_crop
+    transforms_functional.to_pil_image = functional_to_pil_image
+    transforms_functional.InterpolationMode = InterpolationMode
     transforms_v2.Compose = Compose
     transforms_v2.Normalize = IdentityTransform
     transforms_v2.ToImage = IdentityTransform
@@ -197,6 +299,8 @@ def install_torchvision_stub() -> None:
     transforms.Resize = IdentityTransform
     transforms.ToTensor = IdentityTransform
     transforms.CenterCrop = IdentityTransform
+    transforms.functional = transforms_functional
+    transforms.InterpolationMode = InterpolationMode
     transforms.v2 = transforms_v2
     utils.make_grid = lambda tensor, *args, **kwargs: tensor
     datasets.ImageFolder = ImageFolder
@@ -212,6 +316,7 @@ def install_torchvision_stub() -> None:
 
     sys.modules["torchvision"] = torchvision
     sys.modules["torchvision.transforms"] = transforms
+    sys.modules["torchvision.transforms.functional"] = transforms_functional
     sys.modules["torchvision.transforms.v2"] = transforms_v2
     sys.modules["torchvision.utils"] = utils
     sys.modules["torchvision.models"] = models
