@@ -614,6 +614,15 @@ class LinearForwardUsageRecorder:
             self.records[bkey]["output_grad_norm"] += math.sqrt(float(tensor.grad.detach().float().pow(2).sum().cpu()))
         self.saved_outputs.clear()
 
+    def activation_energy_loss(self) -> torch.Tensor:
+        terms = []
+        for _, tensor in self.saved_outputs:
+            if torch.is_floating_point(tensor):
+                terms.append(tensor.float().pow(2).mean())
+        if not terms:
+            raise RuntimeError("No target Linear outputs were captured for target_activation loss.")
+        return torch.stack(terms).mean()
+
     def close(self) -> None:
         for handle in self.handles:
             handle.remove()
@@ -853,8 +862,14 @@ def profile(args: argparse.Namespace) -> None:
 
         if args.loss_mode == "shared_step":
             loss, _ = model.shared_step(batch_t)
-        else:
+        elif args.loss_mode == "direct_denoiser":
             loss = direct_denoiser_probe_loss(model, batch_t, args)
+        else:
+            if args.importance_mode != "weight":
+                raise RuntimeError("--loss_mode target_activation requires --importance_mode weight.")
+            assert weight_usage_recorder is not None
+            _ = direct_denoiser_probe_loss(model, batch_t, args)
+            loss = weight_usage_recorder.activation_energy_loss()
         if not torch.isfinite(loss):
             print(f"probe batch {idx}/{args.probe_batches} skipped: non-finite loss")
             model.zero_grad(set_to_none=True)
@@ -997,8 +1012,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--loss_mode",
         default="shared_step",
-        choices=["shared_step", "direct_denoiser"],
-        help="shared_step uses the repository loss; direct_denoiser probes model.model.diffusion_model directly when shared_step has no gradients.",
+        choices=["shared_step", "direct_denoiser", "target_activation"],
+        help="shared_step uses the repository loss; direct_denoiser probes model.model.diffusion_model output; target_activation probes captured target Linear outputs directly.",
     )
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--alpha", type=int, default=16)

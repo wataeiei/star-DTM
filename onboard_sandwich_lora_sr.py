@@ -888,6 +888,180 @@ def select_gradient_blocks(rows: list[dict], args: argparse.Namespace) -> list[s
     return [row["block"] for row in rows[: args.topk_blocks]]
 
 
+def profile_step_set(args: argparse.Namespace) -> set[int]:
+    steps = {int(step) for step in args.importance_profile_steps if int(step) >= 0}
+    if args.importance_profile_interval > 0:
+        steps.update(range(0, args.train_steps + 1, args.importance_profile_interval))
+    steps.add(0)
+    steps.add(args.train_steps)
+    return {step for step in steps if step <= args.train_steps}
+
+
+def rank_values(rows: list[dict], score_key: str) -> dict[str, int]:
+    ranked = sorted(rows, key=lambda row: (-float(row[score_key]), int(row["block_index"])))
+    return {str(row["block"]): rank for rank, row in enumerate(ranked, start=1)}
+
+
+def profile_current_lora_importance(
+    pipe,
+    loader: DataLoader,
+    args: argparse.Namespace,
+    device: torch.device,
+    dtype: torch.dtype,
+    train_step: int,
+) -> list[dict]:
+    """Measure current All-LoRA gradient importance on a fixed calibration stream."""
+    modules = list(iter_lora_modules(pipe.unet))
+    if not modules:
+        raise SystemExit("Layer-importance tracking requires --train_method lora.")
+
+    cpu_rng_state = torch.random.get_rng_state()
+    cuda_rng_state = torch.cuda.get_rng_state_all() if device.type == "cuda" else None
+    python_rng_state = random.getstate()
+    was_training = pipe.unet.training
+
+    set_seed(args.importance_profile_seed)
+    pipe.unet.train()
+    pipe.unet.zero_grad(set_to_none=True)
+    data_iter = iter(loader)
+    valid_batches = 0
+    total_loss = 0.0
+    requested_batches = max(1, args.importance_profile_batches)
+
+    try:
+        for _probe_idx in range(requested_batches):
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(loader)
+                batch = next(data_iter)
+            loss, _pred, _target = diffusion_train_loss(
+                pipe, batch, args, device, dtype, use_amp=False
+            )
+            if not torch.isfinite(loss):
+                pipe.unet.zero_grad(set_to_none=True)
+                continue
+            loss.backward()
+            total_loss += float(loss.detach().cpu())
+            valid_batches += 1
+
+        if valid_batches == 0:
+            raise SystemExit(
+                f"Importance profile at step {train_step} failed: all losses were non-finite."
+            )
+
+        block_grad_sq: dict[str, float] = {}
+        block_param_counts: dict[str, int] = {}
+        block_update_sq: dict[str, float] = {}
+        for name, module in modules:
+            block = lora_block_key(name)
+            if not block:
+                continue
+            param_count = module.lora_down.weight.numel() + module.lora_up.weight.numel()
+            block_param_counts[block] = block_param_counts.get(block, 0) + param_count
+            for param in (module.lora_down.weight, module.lora_up.weight):
+                if param.grad is not None:
+                    block_grad_sq[block] = block_grad_sq.get(block, 0.0) + float(
+                        param.grad.detach().float().pow(2).sum().cpu()
+                    )
+            delta = module.lora_up.weight.detach().float() @ module.lora_down.weight.detach().float()
+            block_update_sq[block] = block_update_sq.get(block, 0.0) + float(
+                delta.pow(2).sum().cpu()
+            )
+
+        order = block_order(block_param_counts)
+        rows = []
+        for block in sorted(block_param_counts, key=lambda key: order[key]):
+            param_count = block_param_counts[block]
+            grad_norm = math.sqrt(block_grad_sq.get(block, 0.0))
+            normalized_grad = (
+                grad_norm / math.sqrt(max(param_count, 1))
+                if args.grad_probe_normalize
+                else grad_norm
+            )
+            update_norm = math.sqrt(block_update_sq.get(block, 0.0))
+            rows.append(
+                {
+                    "train_step": train_step,
+                    "block": block,
+                    "block_index": order[block],
+                    "grad_norm": grad_norm,
+                    "lora_param_count": param_count,
+                    "normalized_grad_score": normalized_grad,
+                    "update_norm": update_norm,
+                    "normalized_update_score": update_norm / math.sqrt(max(param_count, 1)),
+                    "probe_batches": valid_batches,
+                    "mean_probe_loss": total_loss / valid_batches,
+                }
+            )
+
+        ranks = rank_values(rows, "normalized_grad_score")
+        topk = set(
+            block
+            for block, _rank in sorted(ranks.items(), key=lambda item: item[1])[
+                : args.importance_profile_topk
+            ]
+        )
+        for row in rows:
+            row["importance_rank"] = ranks[str(row["block"])]
+            row["selected_topk"] = str(row["block"]) in topk
+        return rows
+    finally:
+        pipe.unet.zero_grad(set_to_none=True)
+        pipe.unet.train(was_training)
+        random.setstate(python_rng_state)
+        torch.random.set_rng_state(cpu_rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_state)
+
+
+def importance_topk_summary(all_rows: list[dict], topk: int) -> list[dict]:
+    by_step: dict[int, list[dict]] = {}
+    for row in all_rows:
+        by_step.setdefault(int(row["train_step"]), []).append(row)
+    if not by_step:
+        return []
+
+    baseline_rows = by_step[min(by_step)]
+    baseline_ranks = rank_values(baseline_rows, "normalized_grad_score")
+    baseline_topk = {
+        block for block, rank in baseline_ranks.items() if rank <= topk
+    }
+    summaries = []
+    for step in sorted(by_step):
+        rows = by_step[step]
+        ranks = rank_values(rows, "normalized_grad_score")
+        current_topk = {block for block, rank in ranks.items() if rank <= topk}
+        common_blocks = sorted(set(baseline_ranks) & set(ranks))
+        if len(common_blocks) > 1:
+            x = [float(baseline_ranks[block]) for block in common_blocks]
+            y = [float(ranks[block]) for block in common_blocks]
+            mean_x = sum(x) / len(x)
+            mean_y = sum(y) / len(y)
+            numerator = sum((a - mean_x) * (b - mean_y) for a, b in zip(x, y))
+            denom_x = math.sqrt(sum((a - mean_x) ** 2 for a in x))
+            denom_y = math.sqrt(sum((b - mean_y) ** 2 for b in y))
+            rank_correlation = safe_div(numerator, denom_x * denom_y)
+        else:
+            rank_correlation = 1.0
+        overlap = len(baseline_topk & current_topk)
+        union = len(baseline_topk | current_topk)
+        summaries.append(
+            {
+                "train_step": step,
+                "topk": topk,
+                "topk_blocks": ";".join(
+                    block for block, _rank in sorted(ranks.items(), key=lambda item: item[1])[:topk]
+                ),
+                "topk_overlap_count_vs_step0": overlap,
+                "topk_overlap_ratio_vs_step0": safe_div(overlap, max(len(baseline_topk), 1)),
+                "topk_jaccard_vs_step0": safe_div(overlap, union),
+                "rank_correlation_vs_step0": rank_correlation,
+            }
+        )
+    return summaries
+
+
 def probe_gradient_topk_blocks(
     pipe,
     loader: DataLoader,
@@ -1013,6 +1187,12 @@ def train(args: argparse.Namespace) -> None:
 
     dataset = HrImageDataset(args.train_dir, args.hr_size, args.lr_size)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    profile_loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
 
     if args.train_method == "lora":
         pipe.unet.requires_grad_(False)
@@ -1060,6 +1240,25 @@ def train(args: argparse.Namespace) -> None:
     optimizer.zero_grad(set_to_none=True)
     skipped_nonfinite_steps = 0
     freeze_state = init_freeze_state(pipe.unet) if args.dynamic_shallow_freeze and args.train_method == "lora" else None
+    importance_rows: list[dict] = []
+    importance_profile_time_s = 0.0
+    importance_steps = profile_step_set(args) if args.track_lora_importance else set()
+    if args.track_lora_importance:
+        if args.train_method != "lora" or args.lora_scope != "all":
+            raise SystemExit(
+                "--track_lora_importance currently requires "
+                "--train_method lora --lora_scope all."
+            )
+        output_dir = ensure_dir(args.output_dir)
+        print(f"Tracking LoRA layer importance at steps: {sorted(importance_steps)}")
+        profile_started = time.time()
+        importance_rows.extend(
+            profile_current_lora_importance(
+                pipe, profile_loader, args, device, dtype, train_step=0
+            )
+        )
+        importance_profile_time_s += time.time() - profile_started
+        save_csv(output_dir / "lora_importance_evolution.csv", importance_rows)
 
     for step in range(1, args.train_steps + 1):
         accum_loss = 0.0
@@ -1144,7 +1343,7 @@ def train(args: argparse.Namespace) -> None:
                 dynamic_freeze_check(pipe.unet, step, args, freeze_state)
             optimizer.zero_grad(set_to_none=True)
 
-        elapsed = time.time() - start
+        elapsed = time.time() - start - importance_profile_time_s
         mem_stats = cuda_memory_stats_mb(device)
         logs.append(
             {
@@ -1175,6 +1374,29 @@ def train(args: argparse.Namespace) -> None:
             else:
                 print(f"step {step:05d}/{args.train_steps} loss={accum_loss:.6f} elapsed={elapsed:.1f}s{mem_msg}")
 
+        if step in importance_steps:
+            profile_started = time.time()
+            current_rows = profile_current_lora_importance(
+                pipe, profile_loader, args, device, dtype, train_step=step
+            )
+            importance_profile_time_s += time.time() - profile_started
+            importance_rows.extend(current_rows)
+            output_dir = ensure_dir(args.output_dir)
+            save_csv(output_dir / "lora_importance_evolution.csv", importance_rows)
+            save_csv(
+                output_dir / "lora_importance_topk.csv",
+                importance_topk_summary(importance_rows, args.importance_profile_topk),
+            )
+            top_blocks = [
+                str(row["block"])
+                for row in sorted(
+                    current_rows,
+                    key=lambda row: float(row["normalized_grad_score"]),
+                    reverse=True,
+                )[: args.importance_profile_topk]
+            ]
+            print(f"Importance profile step {step}: top blocks={top_blocks}")
+
     output_dir = ensure_dir(args.output_dir)
     metadata = {
         "model_id": MODEL_ID,
@@ -1196,6 +1418,12 @@ def train(args: argparse.Namespace) -> None:
         "grad_probe_compute_lambda": args.grad_probe_compute_lambda,
         "grad_probe_budget_params": args.grad_probe_budget_params,
         "reset_seed_after_probe": args.reset_seed_after_probe,
+        "track_lora_importance": args.track_lora_importance,
+        "importance_profile_steps": sorted(importance_steps),
+        "importance_profile_batches": args.importance_profile_batches,
+        "importance_profile_seed": args.importance_profile_seed,
+        "importance_profile_topk": args.importance_profile_topk,
+        "importance_profile_time_s": importance_profile_time_s,
         "dynamic_shallow_freeze": args.dynamic_shallow_freeze,
         "freeze_warmup_steps": args.freeze_warmup_steps,
         "freeze_check_interval": args.freeze_check_interval,
@@ -1216,7 +1444,7 @@ def train(args: argparse.Namespace) -> None:
         update_size_mb = sum(p.stat().st_size for p in unet_dir.rglob("*") if p.is_file()) / (1024 * 1024)
         saved_update_path = str(unet_dir)
 
-    elapsed = time.time() - start
+    elapsed = time.time() - start - importance_profile_time_s
     energy_wh = args.power_w * elapsed / 3600.0
     effective_samples = args.train_steps * args.batch_size * args.grad_accum
     full_model_size_mb = args.full_model_size_mb
@@ -1242,6 +1470,7 @@ def train(args: argparse.Namespace) -> None:
                 "samples_per_second": safe_div(effective_samples, elapsed),
                 "images_per_hour": safe_div(effective_samples * 3600.0, elapsed),
                 "estimated_energy_wh": energy_wh,
+                "importance_profile_time_s": importance_profile_time_s,
                 "fp16": args.fp16,
                 "save_lora_dtype": args.save_lora_dtype if args.train_method == "lora" else "",
                 "grad_clip": args.grad_clip,
@@ -1492,6 +1721,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grad_probe_budget_params", type=int, default=0)
     parser.add_argument("--reset_seed_after_probe", dest="reset_seed_after_probe", action="store_true", default=True)
     parser.add_argument("--no_reset_seed_after_probe", dest="reset_seed_after_probe", action="store_false")
+    parser.add_argument("--track_lora_importance", action="store_true")
+    parser.add_argument(
+        "--importance_profile_steps",
+        type=int,
+        nargs="*",
+        default=[0, 100, 250, 500, 750, 1000],
+    )
+    parser.add_argument("--importance_profile_interval", type=int, default=0)
+    parser.add_argument("--importance_profile_batches", type=int, default=5)
+    parser.add_argument("--importance_profile_seed", type=int, default=2026)
+    parser.add_argument("--importance_profile_topk", type=int, default=5)
     parser.add_argument("--dynamic_shallow_freeze", action="store_true")
     parser.add_argument("--freeze_warmup_steps", type=int, default=20)
     parser.add_argument("--freeze_check_interval", type=int, default=10)
