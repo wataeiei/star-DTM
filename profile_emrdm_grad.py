@@ -885,6 +885,8 @@ def load_config_train_loader(args: argparse.Namespace):
     config = OmegaConf.load(args.config_path)
     if "data" not in config:
         raise SystemExit("The YAML config has no top-level data section; cannot use --data_mode config_train.")
+    if args.official_data_root:
+        override_dataset_roots(config.data, args.official_data_root)
 
     data = instantiate_from_config(config.data)
     if hasattr(data, "prepare_data"):
@@ -905,6 +907,26 @@ def load_config_train_loader(args: argparse.Namespace):
     else:
         raise SystemExit("Config data object has no train_dataloader method.")
     return loader
+
+
+def override_dataset_roots(node, data_root: str) -> None:
+    """Override EMRDM dataset roots in nested OmegaConf config objects."""
+    try:
+        from omegaconf import DictConfig, ListConfig
+    except ImportError:
+        DictConfig = dict
+        ListConfig = list
+
+    root = str(data_root)
+    if isinstance(node, (dict, DictConfig)):
+        for key in list(node.keys()):
+            if key in {"datasets_dir", "data_dir", "root", "root_dir", "dataroot"}:
+                node[key] = root
+            else:
+                override_dataset_roots(node[key], root)
+    elif isinstance(node, (list, tuple, ListConfig)):
+        for item in node:
+            override_dataset_roots(item, root)
 
 
 def is_profile_layer(name: str, module: nn.Module) -> bool:
@@ -1186,6 +1208,7 @@ def profile(args: argparse.Namespace) -> None:
         "cloudy_dir": args.cloudy_dir,
         "clear_dir": args.clear_dir,
         "data_mode": args.data_mode,
+        "official_data_root": args.official_data_root,
         "target": args.target,
         "importance_mode": args.importance_mode,
         "loss_mode": args.loss_mode,
@@ -1212,6 +1235,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cloudy_dir", default="")
     parser.add_argument("--clear_dir", default="")
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument(
+        "--official_data_root",
+        default="",
+        help="Override datasets_dir/data_dir/root fields inside the official YAML data config.",
+    )
     parser.add_argument(
         "--data_mode",
         default="paired_dirs",
