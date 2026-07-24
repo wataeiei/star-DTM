@@ -81,6 +81,9 @@ def install_torchvision_stub() -> None:
     def module(name: str, package: bool = False):
         result = types.ModuleType(name)
         result.__spec__ = ModuleSpec(name, loader=None, is_package=package)
+        result.__file__ = f"<{name}-stub>"
+        result.__loader__ = None
+        result.__cached__ = None
         if package:
             result.__path__ = []
         return result
@@ -99,6 +102,11 @@ def install_torchvision_stub() -> None:
     def unavailable(*_args, **_kwargs):
         raise RuntimeError("This DiT4SR experiment does not provide torchvision image operators.")
 
+    def missing_torchvision_attr(name: str):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return unavailable
+
     for stub_module in (
         transforms,
         transforms_functional,
@@ -110,7 +118,7 @@ def install_torchvision_stub() -> None:
         datasets,
         utils,
     ):
-        stub_module.__getattr__ = lambda _name: unavailable
+        stub_module.__getattr__ = missing_torchvision_attr
 
     transforms.InterpolationMode = InterpolationMode
     transforms.functional = transforms_functional
