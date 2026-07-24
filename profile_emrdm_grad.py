@@ -81,6 +81,14 @@ class LightningModuleStub(nn.Module):
         return None
 
 
+class LightningDataModuleStub:
+    def prepare_data(self, *args, **kwargs):
+        return None
+
+    def setup(self, *args, **kwargs):
+        return None
+
+
 def install_lightning_stub() -> None:
     """Avoid importing Lightning's torchmetrics/torchvision stack.
 
@@ -126,6 +134,7 @@ def install_lightning_stub() -> None:
         return fn
 
     pl.LightningModule = LightningModuleStub
+    pl.LightningDataModule = LightningDataModuleStub
     pl.Callback = Callback
     pl.Trainer = Trainer
     pl.seed_everything = lambda *args, **kwargs: None
@@ -708,6 +717,91 @@ def direct_denoiser_probe_loss(model: nn.Module, batch_t: dict[str, torch.Tensor
     raise RuntimeError(f"Direct denoiser probe failed for all call patterns. forward signature={signature}. Last error: {last_error}")
 
 
+def move_to_device(value, device: torch.device):
+    if torch.is_tensor(value):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {key: move_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [move_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(move_to_device(item, device) for item in value)
+    return value
+
+
+def extract_loss(value) -> torch.Tensor:
+    if torch.is_tensor(value):
+        return value
+    if isinstance(value, dict):
+        for key in ("loss", "train/loss", "total_loss"):
+            if key in value and torch.is_tensor(value[key]):
+                return value[key]
+        for item in value.values():
+            try:
+                return extract_loss(item)
+            except RuntimeError:
+                continue
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            try:
+                return extract_loss(item)
+            except RuntimeError:
+                continue
+    raise RuntimeError(f"Could not extract a tensor loss from output type {type(value).__name__}.")
+
+
+def official_task_loss(model: nn.Module, batch, batch_idx: int, args: argparse.Namespace) -> torch.Tensor:
+    if isinstance(batch, dict) and "global_step" not in batch:
+        batch["global_step"] = getattr(model, "global_step", 0)
+
+    if args.official_loss_entry == "training_step":
+        output = model.training_step(batch, batch_idx)
+    elif args.official_loss_entry == "shared_step":
+        output = model.shared_step(batch)
+    else:
+        if hasattr(model, "training_step"):
+            try:
+                output = model.training_step(batch, batch_idx)
+            except Exception:
+                output = model.shared_step(batch)
+        else:
+            output = model.shared_step(batch)
+    return extract_loss(output)
+
+
+def load_config_train_loader(args: argparse.Namespace):
+    try:
+        from omegaconf import OmegaConf
+    except ImportError as exc:
+        raise SystemExit("Missing package: omegaconf\nInstall with: pip3 install omegaconf") from exc
+
+    install_runtime_stubs()
+    sys.path.insert(0, str(Path.cwd()))
+    config = OmegaConf.load(args.config_path)
+    if "data" not in config:
+        raise SystemExit("The YAML config has no top-level data section; cannot use --data_mode config_train.")
+
+    data = instantiate_from_config(config.data)
+    if hasattr(data, "prepare_data"):
+        try:
+            data.prepare_data()
+        except TypeError:
+            data.prepare_data(None)
+    if hasattr(data, "setup"):
+        try:
+            data.setup("fit")
+        except TypeError:
+            data.setup()
+
+    if hasattr(data, "train_dataloader"):
+        loader = data.train_dataloader()
+    elif hasattr(data, "_train_dataloader"):
+        loader = data._train_dataloader()
+    else:
+        raise SystemExit("Config data object has no train_dataloader method.")
+    return loader
+
+
 def is_profile_layer(name: str, module: nn.Module) -> bool:
     cls = module.__class__.__name__
     if cls not in {"NeighborhoodTransformerLayer", "GlobalTransformerLayer", "ShiftedWindowTransformerLayer"}:
@@ -833,8 +927,13 @@ def profile(args: argparse.Namespace) -> None:
         weight_usage_recorder = LinearForwardUsageRecorder(weight_targets, args.block_regex)
     model.train()
 
-    dataset = PairedImageDataset(args.cloudy_dir, args.clear_dir, args.image_size, args.max_images)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    if args.data_mode == "config_train":
+        loader = load_config_train_loader(args)
+    else:
+        if not args.cloudy_dir or not args.clear_dir:
+            raise SystemExit("--cloudy_dir and --clear_dir are required when --data_mode paired_dirs.")
+        dataset = PairedImageDataset(args.cloudy_dir, args.clear_dir, args.image_size, args.max_images)
+        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     data_iter = iter(loader)
 
     total_loss = 0.0
@@ -847,20 +946,27 @@ def profile(args: argparse.Namespace) -> None:
             data_iter = iter(loader)
             batch = next(data_iter)
 
-        batch_t = {
-            "label": pad_or_trim_channels(batch["label"].to(device), args.image_channels),
-            "cond_image": pad_or_trim_channels(batch["cond_image"].to(device), args.image_channels),
-            "global_step": 0,
-        }
-        if args.importance_mode == "activation":
-            batch_t["label"].requires_grad_(True)
-            batch_t["cond_image"].requires_grad_(True)
-        if args.input_noise_std > 0:
-            batch_t["cond_image"] = batch_t["cond_image"] + torch.randn_like(batch_t["cond_image"]) * args.input_noise_std
+        if args.data_mode == "config_train":
+            batch_t = move_to_device(batch, device)
+            if isinstance(batch_t, dict) and "global_step" not in batch_t:
+                batch_t["global_step"] = getattr(model, "global_step", 0)
+        else:
+            batch_t = {
+                "label": pad_or_trim_channels(batch["label"].to(device), args.image_channels),
+                "cond_image": pad_or_trim_channels(batch["cond_image"].to(device), args.image_channels),
+                "global_step": 0,
+            }
             if args.importance_mode == "activation":
+                batch_t["label"].requires_grad_(True)
                 batch_t["cond_image"].requires_grad_(True)
+            if args.input_noise_std > 0:
+                batch_t["cond_image"] = batch_t["cond_image"] + torch.randn_like(batch_t["cond_image"]) * args.input_noise_std
+                if args.importance_mode == "activation":
+                    batch_t["cond_image"].requires_grad_(True)
 
-        if args.loss_mode == "shared_step":
+        if args.loss_mode == "official_task":
+            loss = official_task_loss(model, batch_t, idx - 1, args)
+        elif args.loss_mode == "shared_step":
             loss, _ = model.shared_step(batch_t)
         elif args.loss_mode == "direct_denoiser":
             loss = direct_denoiser_probe_loss(model, batch_t, args)
@@ -974,9 +1080,11 @@ def profile(args: argparse.Namespace) -> None:
         "ckpt_path": args.ckpt_path,
         "cloudy_dir": args.cloudy_dir,
         "clear_dir": args.clear_dir,
+        "data_mode": args.data_mode,
         "target": args.target,
         "importance_mode": args.importance_mode,
         "loss_mode": args.loss_mode,
+        "official_loss_entry": args.official_loss_entry,
         "rank": args.rank,
         "alpha": args.alpha,
         "lora_up_init_scale": args.lora_up_init_scale,
@@ -996,9 +1104,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config_path", default="configs/example_training/cuhk.yaml")
     parser.add_argument("--ckpt_path", default="", help="Optional .ckpt checkpoint path")
-    parser.add_argument("--cloudy_dir", required=True)
-    parser.add_argument("--clear_dir", required=True)
+    parser.add_argument("--cloudy_dir", default="")
+    parser.add_argument("--clear_dir", default="")
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument(
+        "--data_mode",
+        default="paired_dirs",
+        choices=["paired_dirs", "config_train"],
+        help="paired_dirs uses --cloudy_dir/--clear_dir; config_train instantiates the official train dataloader from --config_path.",
+    )
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--image_channels", type=int, default=0, help="0 auto-infers half of patch_in input channels")
     parser.add_argument("--max_images", type=int, default=0)
@@ -1012,8 +1126,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--loss_mode",
         default="shared_step",
-        choices=["shared_step", "direct_denoiser", "target_activation"],
+        choices=["official_task", "shared_step", "direct_denoiser", "target_activation"],
         help="shared_step uses the repository loss; direct_denoiser probes model.model.diffusion_model output; target_activation probes captured target Linear outputs directly.",
+    )
+    parser.add_argument(
+        "--official_loss_entry",
+        default="training_step",
+        choices=["training_step", "shared_step", "auto"],
+        help="Entry point used when --loss_mode official_task.",
     )
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--alpha", type=int, default=16)
