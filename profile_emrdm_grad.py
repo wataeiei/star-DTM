@@ -571,6 +571,56 @@ def linear_weight_grad_norm(module: nn.Linear) -> float:
     return math.sqrt(total)
 
 
+class LinearForwardUsageRecorder:
+    def __init__(self, named_modules: list[tuple[str, nn.Linear]], block_regex: str = "") -> None:
+        self.records: dict[str, dict] = {}
+        self.saved_outputs: list[tuple[str, torch.Tensor]] = []
+        self.handles = []
+        for name, module in named_modules:
+            bkey = block_key(name, block_regex)
+            if not bkey:
+                continue
+            row = self.records.setdefault(
+                bkey,
+                {
+                    "forward_calls": 0,
+                    "output_elements": 0,
+                    "output_requires_grad_forwards": 0,
+                    "output_grad_norm": 0.0,
+                },
+            )
+            row["target_names"] = row.get("target_names", []) + [name]
+            self.handles.append(module.register_forward_hook(self._hook(bkey)))
+
+    def _hook(self, bkey: str):
+        def hook(module, inputs, output):
+            tensor = first_tensor(output)
+            if tensor is None:
+                return
+            row = self.records[bkey]
+            row["forward_calls"] += 1
+            row["output_elements"] += int(tensor.numel())
+            if tensor.requires_grad:
+                tensor.retain_grad()
+                self.saved_outputs.append((bkey, tensor))
+                row["output_requires_grad_forwards"] += 1
+
+        return hook
+
+    def collect_and_clear(self) -> None:
+        for bkey, tensor in self.saved_outputs:
+            if tensor.grad is None:
+                continue
+            self.records[bkey]["output_grad_norm"] += math.sqrt(float(tensor.grad.detach().float().pow(2).sum().cpu()))
+        self.saved_outputs.clear()
+
+    def close(self) -> None:
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+        self.saved_outputs.clear()
+
+
 def first_tensor(value):
     if torch.is_tensor(value):
         return value
@@ -762,6 +812,7 @@ def profile(args: argparse.Namespace) -> None:
     injected = []
     recorder = None
     weight_targets: list[tuple[str, nn.Linear]] = []
+    weight_usage_recorder = None
     if args.importance_mode == "lora":
         injected = inject_lora(model, args.target, args.rank, args.alpha, args.block_regex, args.lora_up_init_scale)
     elif args.importance_mode == "activation":
@@ -770,6 +821,7 @@ def profile(args: argparse.Namespace) -> None:
             raise SystemExit("No EMRDM transformer layers found for activation-gradient profiling.")
     else:
         weight_targets = enable_target_weight_grads(model, args.target, args.block_regex)
+        weight_usage_recorder = LinearForwardUsageRecorder(weight_targets, args.block_regex)
     model.train()
 
     dataset = PairedImageDataset(args.cloudy_dir, args.clear_dir, args.image_size, args.max_images)
@@ -811,6 +863,9 @@ def profile(args: argparse.Namespace) -> None:
         if args.importance_mode == "activation":
             assert recorder is not None
             recorder.collect_and_clear()
+        if args.importance_mode == "weight":
+            assert weight_usage_recorder is not None
+            weight_usage_recorder.collect_and_clear()
         valid += 1
         total_loss += float(loss.detach().cpu())
         if valid == 1:
@@ -849,6 +904,14 @@ def profile(args: argparse.Namespace) -> None:
                 row["grad_norm"] += linear_weight_grad_norm(module)
                 row["weight_param_count"] += module.weight.numel() + (module.bias.numel() if module.bias is not None else 0)
                 row["module_count"] += 1
+            assert weight_usage_recorder is not None
+            for bkey, usage in weight_usage_recorder.records.items():
+                row = by_block.setdefault(bkey, {"grad_norm": 0.0, "weight_param_count": 0, "module_count": 0})
+                row["forward_calls"] = usage.get("forward_calls", 0)
+                row["output_elements"] = usage.get("output_elements", 0)
+                row["output_requires_grad_forwards"] = usage.get("output_requires_grad_forwards", 0)
+                row["output_grad_norm"] = usage.get("output_grad_norm", 0.0)
+            weight_usage_recorder.close()
 
     blocks = sorted(by_block, key=natural_key)
     total_blocks = max(len(blocks), 1)
@@ -871,6 +934,10 @@ def profile(args: argparse.Namespace) -> None:
                 "activation_elements": int(row.get("activation_elements", 0)),
                 "module_count": int(row["module_count"]),
                 "requires_grad_forwards": int(row.get("requires_grad_forwards", 0)),
+                "forward_calls": int(row.get("forward_calls", 0)),
+                "output_elements": int(row.get("output_elements", 0)),
+                "output_requires_grad_forwards": int(row.get("output_requires_grad_forwards", 0)),
+                "output_grad_norm": row.get("output_grad_norm", 0.0),
                 "normalized_grad_score": norm_score,
                 "bp_cost": bp_cost,
                 "compute_lambda": args.compute_lambda,
