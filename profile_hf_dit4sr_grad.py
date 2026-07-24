@@ -32,6 +32,10 @@ import json
 import math
 import random
 import re
+import sys
+import types
+from enum import Enum
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 from typing import Iterable
 
@@ -44,6 +48,98 @@ from torch.utils.data import DataLoader, Dataset
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+def install_torchvision_stub() -> None:
+    """Bypass a binary-incompatible torchvision when only tensor models are used."""
+    try:
+        import torchvision  # noqa: F401
+        return
+    except Exception as exc:
+        print(f"torchvision is unavailable/incompatible ({exc}); using a minimal import stub.")
+
+    for name in list(sys.modules):
+        if name == "torchvision" or name.startswith("torchvision."):
+            sys.modules.pop(name, None)
+
+    class InterpolationMode(Enum):
+        NEAREST = "nearest"
+        NEAREST_EXACT = "nearest-exact"
+        BILINEAR = "bilinear"
+        BICUBIC = "bicubic"
+        BOX = "box"
+        HAMMING = "hamming"
+        LANCZOS = "lanczos"
+
+    class ImageReadMode(Enum):
+        UNCHANGED = 0
+        GRAY = 1
+        GRAY_ALPHA = 2
+        RGB = 3
+        RGB_ALPHA = 4
+
+    def module(name: str, package: bool = False):
+        result = types.ModuleType(name)
+        result.__spec__ = ModuleSpec(name, loader=None, is_package=package)
+        if package:
+            result.__path__ = []
+        return result
+
+    torchvision = module("torchvision", package=True)
+    transforms = module("torchvision.transforms", package=True)
+    transforms_functional = module("torchvision.transforms.functional")
+    transforms_v2 = module("torchvision.transforms.v2", package=True)
+    transforms_v2_functional = module("torchvision.transforms.v2.functional")
+    io = module("torchvision.io")
+    models = module("torchvision.models", package=True)
+    ops = module("torchvision.ops", package=True)
+    datasets = module("torchvision.datasets", package=True)
+    utils = module("torchvision.utils")
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("This DiT4SR experiment does not provide torchvision image operators.")
+
+    for stub_module in (
+        transforms,
+        transforms_functional,
+        transforms_v2,
+        transforms_v2_functional,
+        io,
+        models,
+        ops,
+        datasets,
+        utils,
+    ):
+        stub_module.__getattr__ = lambda _name: unavailable
+
+    transforms.InterpolationMode = InterpolationMode
+    transforms.functional = transforms_functional
+    transforms.v2 = transforms_v2
+    transforms_v2.functional = transforms_v2_functional
+    io.ImageReadMode = ImageReadMode
+    io.decode_image = unavailable
+    utils.make_grid = unavailable
+    torchvision.transforms = transforms
+    torchvision.io = io
+    torchvision.models = models
+    torchvision.ops = ops
+    torchvision.datasets = datasets
+    torchvision.utils = utils
+
+    sys.modules.update(
+        {
+            "torchvision": torchvision,
+            "torchvision.transforms": transforms,
+            "torchvision.transforms.functional": transforms_functional,
+            "torchvision.transforms.v2": transforms_v2,
+            "torchvision.transforms.v2.functional": transforms_v2_functional,
+            "torchvision.io": io,
+            "torchvision.models": models,
+            "torchvision.ops": ops,
+            "torchvision.datasets": datasets,
+            "torchvision.utils": utils,
+        }
+    )
 
 
 def require_packages() -> None:
@@ -231,6 +327,7 @@ def model_dtype(args: argparse.Namespace) -> torch.dtype:
 
 
 def load_pipe(args: argparse.Namespace, device: torch.device):
+    install_torchvision_stub()
     require_packages()
     dtype = model_dtype(args)
     if args.load_mode == "transformer":
