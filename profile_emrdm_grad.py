@@ -886,7 +886,7 @@ def load_config_train_loader(args: argparse.Namespace):
     if "data" not in config:
         raise SystemExit("The YAML config has no top-level data section; cannot use --data_mode config_train.")
     if args.official_data_root:
-        override_dataset_roots(config.data, args.official_data_root)
+        override_dataset_roots(config.data, args.official_data_root, args.official_nir_data_root)
 
     data = instantiate_from_config(config.data)
     if hasattr(data, "prepare_data"):
@@ -909,7 +909,20 @@ def load_config_train_loader(args: argparse.Namespace):
     return loader
 
 
-def override_dataset_roots(node, data_root: str) -> None:
+def infer_nir_root(data_root: str) -> str:
+    root = Path(data_root)
+    candidate = root.parent / "nir" / root.name
+    if candidate.exists():
+        return str(candidate)
+    if root.parent.name == "nir":
+        return str(root)
+    candidate = root.parent.parent / "nir" / root.name
+    if candidate.exists():
+        return str(candidate)
+    return ""
+
+
+def override_dataset_roots(node, data_root: str, nir_data_root: str = "") -> None:
     """Override EMRDM dataset roots in nested OmegaConf config objects."""
     try:
         from omegaconf import DictConfig, ListConfig
@@ -918,15 +931,18 @@ def override_dataset_roots(node, data_root: str) -> None:
         ListConfig = list
 
     root = str(data_root)
+    nir_root = str(nir_data_root or infer_nir_root(root))
     if isinstance(node, (dict, DictConfig)):
         for key in list(node.keys()):
-            if key in {"datasets_dir", "data_dir", "root", "root_dir", "dataroot"}:
+            if key in {"nir_datasets_dir", "nir_data_dir", "nir_root", "nir_root_dir"}:
+                node[key] = nir_root or root
+            elif key in {"datasets_dir", "data_dir", "root", "root_dir", "dataroot"}:
                 node[key] = root
             else:
-                override_dataset_roots(node[key], root)
+                override_dataset_roots(node[key], root, nir_root)
     elif isinstance(node, (list, tuple, ListConfig)):
         for item in node:
-            override_dataset_roots(item, root)
+            override_dataset_roots(item, root, nir_root)
 
 
 def is_profile_layer(name: str, module: nn.Module) -> bool:
@@ -1209,6 +1225,7 @@ def profile(args: argparse.Namespace) -> None:
         "clear_dir": args.clear_dir,
         "data_mode": args.data_mode,
         "official_data_root": args.official_data_root,
+        "official_nir_data_root": args.official_nir_data_root,
         "target": args.target,
         "importance_mode": args.importance_mode,
         "loss_mode": args.loss_mode,
@@ -1239,6 +1256,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--official_data_root",
         default="",
         help="Override datasets_dir/data_dir/root fields inside the official YAML data config.",
+    )
+    parser.add_argument(
+        "--official_nir_data_root",
+        default="",
+        help="Override nir_datasets_dir fields inside the official YAML data config; inferred from --official_data_root when omitted.",
     )
     parser.add_argument(
         "--data_mode",
