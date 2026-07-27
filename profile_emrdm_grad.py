@@ -702,13 +702,21 @@ def enable_block_parameter_grads(root: nn.Module, block_regex: str) -> list[tupl
     return params
 
 
+def enable_all_parameter_grads(root: nn.Module) -> list[tuple[str, nn.Parameter]]:
+    params = []
+    for name, param in root.named_parameters():
+        param.requires_grad_(True)
+        params.append((name, param))
+    if not params:
+        raise SystemExit("No model parameters found for --importance_mode all_param_debug.")
+    return params
+
+
 def collect_parameter_grad_rows(named_params: list[tuple[str, nn.Parameter]], block_regex: str) -> tuple[dict[str, dict], list[dict]]:
     by_block: dict[str, dict] = {}
     param_rows = []
     for name, param in named_params:
-        bkey = block_key(name, block_regex)
-        if not bkey:
-            continue
+        bkey = block_key(name, block_regex) or "__unmapped__"
         grad_norm = param_grad_norm(param)
         row = by_block.setdefault(bkey, {"grad_norm": 0.0, "weight_param_count": 0, "module_count": 0})
         row["grad_norm"] += grad_norm
@@ -1145,6 +1153,8 @@ def profile(args: argparse.Namespace) -> None:
             raise SystemExit("No EMRDM transformer layers found for activation-gradient profiling.")
     elif args.importance_mode == "param":
         param_targets = enable_block_parameter_grads(model, args.block_regex)
+    elif args.importance_mode == "all_param_debug":
+        param_targets = enable_all_parameter_grads(model)
     else:
         weight_targets = enable_target_weight_grads(model, args.target, args.block_regex)
         weight_usage_recorder = LinearForwardUsageRecorder(weight_targets, args.block_regex)
@@ -1300,7 +1310,7 @@ def profile(args: argparse.Namespace) -> None:
 
     out_dir = ensure_dir(args.output_dir)
     write_csv(out_dir / "emrdm_grad_scores.csv", rows)
-    if args.importance_mode == "param":
+    if args.importance_mode in {"param", "all_param_debug"}:
         param_rows = sorted(param_rows, key=lambda row: row["normalized_grad_score"], reverse=True)
         write_csv(out_dir / "emrdm_param_grad_debug.csv", param_rows[: args.debug_top_params])
     metadata = {
@@ -1364,8 +1374,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--importance_mode",
         default="weight",
-        choices=["weight", "param", "activation", "lora"],
-        help="weight records target Linear gradients; param records all block parameter gradients; activation records block output gradients; lora records probe LoRA gradients.",
+        choices=["weight", "param", "all_param_debug", "activation", "lora"],
+        help="weight records target Linear gradients; param records block parameter gradients; all_param_debug records every model parameter; activation records block output gradients; lora records probe LoRA gradients.",
     )
     parser.add_argument(
         "--loss_mode",
