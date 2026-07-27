@@ -136,16 +136,38 @@ def target_match(name: str, target: str) -> bool:
     raise SystemExit(f"Unknown target={target}")
 
 
-def iter_target_modules(root: nn.Module, target: str, block_regex: str):
+def iter_dgmr_named_modules(root):
+    if isinstance(root, nn.Module):
+        yield from root.named_modules()
+        return
+    for prefix in ("net_G", "diffusion"):
+        module = getattr(root, prefix, None)
+        if isinstance(module, nn.Module):
+            for name, child in module.named_modules():
+                full_name = prefix if not name else f"{prefix}.{name}"
+                yield full_name, child
+
+
+def iter_dgmr_parameters(root):
+    if isinstance(root, nn.Module):
+        yield from root.parameters()
+        return
+    for prefix in ("net_G", "diffusion"):
+        module = getattr(root, prefix, None)
+        if isinstance(module, nn.Module):
+            yield from module.parameters()
+
+
+def iter_target_modules(root, target: str, block_regex: str):
     module_types = (nn.Linear, nn.Conv2d) if target == "all_conv_linear" else (nn.Linear,)
-    for name, module in root.named_modules():
+    for name, module in iter_dgmr_named_modules(root):
         if isinstance(module, module_types) and target_match(name, target):
             bkey = block_key(name, block_regex)
             if bkey:
                 yield name, module
 
 
-def enable_target_grads(root: nn.Module, target: str, block_regex: str):
+def enable_target_grads(root, target: str, block_regex: str):
     modules = list(iter_target_modules(root, target, block_regex))
     if not modules:
         raise SystemExit("No target modules found. Try --target all_conv_linear or run --inspect_only.")
@@ -262,9 +284,9 @@ def disable_optimizer_steps(model) -> None:
     model.save_checkpoint = lambda *args, **kwargs: None
 
 
-def inspect_model(model: nn.Module, args: argparse.Namespace) -> None:
+def inspect_model(model, args: argparse.Namespace) -> None:
     print("== Candidate modules ==")
-    for name, module in model.named_modules():
+    for name, module in iter_dgmr_named_modules(model):
         if isinstance(module, (nn.Linear, nn.Conv2d)):
             if args.target == "all_conv_linear":
                 mark = "*"
@@ -296,7 +318,7 @@ def profile(args: argparse.Namespace) -> None:
         inspect_model(model, args)
         return
 
-    for param in model.parameters():
+    for param in iter_dgmr_parameters(model):
         param.requires_grad_(False)
     targets = enable_target_grads(model, args.target, args.block_regex)
 
