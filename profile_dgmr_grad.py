@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.machinery
 import math
 import os
 import random
@@ -26,8 +27,11 @@ def install_runtime_stubs() -> None:
     """Avoid optional import failures on minimal Jetson environments."""
     if "torchvision" not in sys.modules:
         tv = types.ModuleType("torchvision")
+        tv.__spec__ = importlib.machinery.ModuleSpec("torchvision", loader=None)
         tv.transforms = types.ModuleType("torchvision.transforms")
+        tv.transforms.__spec__ = importlib.machinery.ModuleSpec("torchvision.transforms", loader=None)
         tv.utils = types.ModuleType("torchvision.utils")
+        tv.utils.__spec__ = importlib.machinery.ModuleSpec("torchvision.utils", loader=None)
         tv.utils.make_grid = lambda x, *args, **kwargs: x
         sys.modules["torchvision"] = tv
         sys.modules["torchvision.transforms"] = tv.transforms
@@ -350,7 +354,38 @@ def hf_sen12mscr_iter(args: argparse.Namespace, device: torch.device):
                 break
 
 
+def cached_sample_iter(args: argparse.Namespace, device: torch.device):
+    cache_dir = Path(args.cached_sample_dir)
+    files = sorted(cache_dir.glob("*.npz"), key=lambda p: natural_key(p.name))
+    if not files:
+        raise SystemExit(f"No cached .npz samples found in {cache_dir}")
+
+    idx = 0
+    while True:
+        batch = []
+        for _ in range(args.batch_size):
+            path = files[idx % len(files)]
+            idx += 1
+            with np.load(path) as sample:
+                batch.append(
+                    {
+                        "input": {
+                            "S2": torch.from_numpy(sample["cloudy"].astype(np.float32, copy=False)),
+                            "S1": torch.from_numpy(sample["sar"].astype(np.float32, copy=False)),
+                            "masks": torch.from_numpy(sample["mask"].astype(np.float32, copy=False)),
+                        },
+                        "target": {
+                            "S2": torch.from_numpy(sample["target"].astype(np.float32, copy=False)),
+                        },
+                    }
+                )
+        yield collate_dgmr_batches(batch, device)
+
+
 def load_data_iter(args: argparse.Namespace, sen12_dir: Path, device: torch.device):
+    if args.cached_sample_dir:
+        yield from cached_sample_iter(args, device)
+
     if args.hf_dataset:
         yield from hf_sen12mscr_iter(args, device)
 
@@ -490,6 +525,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hf_dataset", default="", help="Streaming Hugging Face dataset id, e.g. Hermanni/sen12mscr")
     parser.add_argument("--hf_split", default="train")
     parser.add_argument("--hf_max_samples", type=int, default=0, help="Restart stream after this many samples; 0 means no limit")
+    parser.add_argument("--cached_sample_dir", default="", help="Directory of cached SEN12MS-CR .npz samples")
     parser.add_argument("--ckpt_path", default="")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--target", default="all_linear", choices=["qkv", "attention_linear", "all_linear", "all_conv_linear"])
