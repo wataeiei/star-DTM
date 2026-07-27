@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""Gradient profiling for DGMR SEN12MS-CR.
+
+Copy this file into the DGMR repository root or run it from
+dgmr_code/SEN12MS-CR. It profiles DGMR's official optimize_parameters loss
+without saving checkpoints and without applying optimizer updates.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+import os
+import random
+import sys
+import types
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+
+
+def install_runtime_stubs() -> None:
+    """Avoid optional import failures on minimal Jetson environments."""
+    if "torchvision" not in sys.modules:
+        tv = types.ModuleType("torchvision")
+        tv.transforms = types.ModuleType("torchvision.transforms")
+        tv.utils = types.ModuleType("torchvision.utils")
+        tv.utils.make_grid = lambda x, *args, **kwargs: x
+        sys.modules["torchvision"] = tv
+        sys.modules["torchvision.transforms"] = tv.transforms
+        sys.modules["torchvision.utils"] = tv.utils
+
+    if "timm" not in sys.modules:
+        timm = types.ModuleType("timm")
+        models = types.ModuleType("timm.models")
+        layers = types.ModuleType("timm.models.layers")
+
+        class DropPath(nn.Identity):
+            pass
+
+        def to_2tuple(x):
+            return x if isinstance(x, tuple) else (x, x)
+
+        def trunc_normal_(tensor, mean=0.0, std=1.0, *args, **kwargs):
+            return nn.init.trunc_normal_(tensor, mean=mean, std=std)
+
+        layers.DropPath = DropPath
+        layers.to_2tuple = to_2tuple
+        layers.trunc_normal_ = trunc_normal_
+        models.layers = layers
+        timm.models = models
+        sys.modules["timm"] = timm
+        sys.modules["timm.models"] = models
+        sys.modules["timm.models.layers"] = layers
+
+    if "focal_frequency_loss" not in sys.modules:
+        ffl_mod = types.ModuleType("focal_frequency_loss")
+
+        class FocalFrequencyLoss(nn.Module):
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+
+            def forward(self, x, target):
+                return torch.mean(torch.abs(x - target))
+
+        ffl_mod.FocalFrequencyLoss = FocalFrequencyLoss
+        sys.modules["focal_frequency_loss"] = ffl_mod
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def ensure_dir(path: str | Path) -> Path:
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def natural_key(text: str) -> list:
+    import re
+
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", text)]
+
+
+def block_key(name: str, block_regex: str = "") -> str:
+    import re
+
+    if block_regex:
+        m = re.search(block_regex, name)
+        if m:
+            return m.group(1) if m.groups() else m.group(0)
+
+    parts = name.split(".")
+    for marker in (
+        "layers",
+        "blocks",
+        "encoder",
+        "decoder",
+        "down",
+        "up",
+        "body",
+        "resblocks",
+        "patch_embed",
+        "patch_unembed",
+    ):
+        if marker in parts:
+            idx = parts.index(marker)
+            if idx + 1 < len(parts):
+                return ".".join(parts[max(idx - 1, 0) : idx + 2])
+            return marker
+
+    # Keep major DGMR sub-networks separate when no obvious block name exists.
+    if name.startswith("net_G."):
+        return ".".join(parts[: min(3, len(parts))])
+    if name.startswith("diffusion."):
+        return ".".join(parts[: min(4, len(parts))])
+    return ".".join(parts[: min(2, len(parts))]) or "__root__"
+
+
+def target_match(name: str, target: str) -> bool:
+    leaf = name.split(".")[-1]
+    full = name.lower()
+    if target == "qkv":
+        return leaf in {"qkv", "q", "k", "v", "to_q", "to_k", "to_v", "q_proj", "k_proj", "v_proj"}
+    if target == "attention_linear":
+        return any(key in full for key in ("attn", "attention", "qkv", "proj"))
+    if target == "all_linear":
+        return True
+    if target == "all_conv_linear":
+        return True
+    raise SystemExit(f"Unknown target={target}")
+
+
+def iter_target_modules(root: nn.Module, target: str, block_regex: str):
+    module_types = (nn.Linear, nn.Conv2d) if target == "all_conv_linear" else (nn.Linear,)
+    for name, module in root.named_modules():
+        if isinstance(module, module_types) and target_match(name, target):
+            bkey = block_key(name, block_regex)
+            if bkey:
+                yield name, module
+
+
+def enable_target_grads(root: nn.Module, target: str, block_regex: str):
+    modules = list(iter_target_modules(root, target, block_regex))
+    if not modules:
+        raise SystemExit("No target modules found. Try --target all_conv_linear or run --inspect_only.")
+    for _, module in modules:
+        for param in module.parameters(recurse=False):
+            param.requires_grad_(True)
+    return modules
+
+
+def module_grad_norm_and_params(module: nn.Module) -> tuple[float, int]:
+    total = 0.0
+    count = 0
+    for param in module.parameters(recurse=False):
+        count += param.numel()
+        if param.grad is not None:
+            total += float(param.grad.detach().float().pow(2).sum().cpu())
+    return math.sqrt(total), count
+
+
+def write_csv(path: str | Path, rows: list[dict]) -> None:
+    path = Path(path)
+    ensure_dir(path.parent)
+    if not rows:
+        raise SystemExit(f"No rows to write: {path}")
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def make_opts(args: argparse.Namespace):
+    opts = argparse.Namespace()
+    opts.batch_sz = args.batch_size
+    opts.load_size = args.load_size
+    opts.crop_size = args.crop_size
+    opts.input_data_folder = args.data_root
+    opts.is_use_cloudmask = True
+    opts.cloud_threshold = 0.2
+    opts.data_list_filepath = args.data_list_filepath
+    opts.optimizer = "Adam"
+    opts.lr = args.lr
+    opts.lr_step = 5
+    opts.lr_start_epoch_decay = 0
+    opts.max_epochs = 1
+    opts.save_freq = 999999
+    opts.log_freq = 999999
+    opts.save_model_dir = str(Path(args.output_dir) / "_no_save_dgmr")
+    opts.save_model_dir1 = str(Path(args.output_dir) / "_no_save_cdgm")
+    opts.is_test = False
+    opts.load_pretrained_model = bool(args.ckpt_path)
+    opts.pretrained_model = args.ckpt_path
+    opts.gpu_ids = args.gpu_ids
+    return opts
+
+
+def locate_sen12_dir(start: Path) -> Path:
+    if (start / "dgmr.py").exists() and (start / "dataload_new_128.py").exists():
+        return start
+    candidate = start / "dgmr_code" / "SEN12MS-CR"
+    if (candidate / "dgmr.py").exists():
+        return candidate
+    raise SystemExit("Run from DGMR root or dgmr_code/SEN12MS-CR; cannot find dgmr.py.")
+
+
+def make_synthetic_batch(batch_size: int, crop_size: int, device: torch.device) -> dict:
+    return {
+        "input": {
+            "S2": torch.rand(batch_size, 13, crop_size, crop_size, device=device),
+            "S1": torch.rand(batch_size, 2, crop_size, crop_size, device=device),
+        },
+        "target": {
+            "S2": torch.rand(batch_size, 13, crop_size, crop_size, device=device),
+        },
+    }
+
+
+def move_to_device(value, device: torch.device):
+    if torch.is_tensor(value):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {k: move_to_device(v, device) for k, v in value.items()}
+    if isinstance(value, list):
+        return [move_to_device(v, device) for v in value]
+    if isinstance(value, tuple):
+        return tuple(move_to_device(v, device) for v in value)
+    return value
+
+
+def load_data_iter(args: argparse.Namespace, sen12_dir: Path, device: torch.device):
+    if args.synthetic:
+        while True:
+            yield make_synthetic_batch(args.batch_size, args.crop_size, device)
+
+    from dataload_new_128 import SEN12MSCR_train
+
+    dataset = SEN12MSCR_train(args.data_root, split=args.split, region=args.region)
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=False,
+    )
+    while True:
+        for batch in loader:
+            yield move_to_device(batch, device)
+
+
+def disable_optimizer_steps(model) -> None:
+    for opt_name in ("optimizer_G", "optimizer_G1"):
+        opt = getattr(model, opt_name, None)
+        if opt is not None:
+            opt.step = lambda *args, **kwargs: None
+    model.save_checkpoint = lambda *args, **kwargs: None
+
+
+def inspect_model(model: nn.Module, args: argparse.Namespace) -> None:
+    print("== Candidate modules ==")
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
+            if args.target == "all_conv_linear":
+                mark = "*"
+            else:
+                mark = "*" if isinstance(module, nn.Linear) and target_match(name, args.target) else " "
+            shape = ""
+            if isinstance(module, nn.Linear):
+                shape = f"{module.in_features}->{module.out_features}"
+            elif isinstance(module, nn.Conv2d):
+                shape = f"{module.in_channels}->{module.out_channels} k={module.kernel_size}"
+            print(f"{mark} {name} [{module.__class__.__name__} {shape}] block={block_key(name, args.block_regex)}")
+
+
+def profile(args: argparse.Namespace) -> None:
+    set_seed(args.seed)
+    install_runtime_stubs()
+    sen12_dir = locate_sen12_dir(Path.cwd())
+    sys.path.insert(0, str(sen12_dir))
+    os.chdir(sen12_dir)
+
+    from dgmr import DGMR
+
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    opts = make_opts(args)
+    model = DGMR(opts)
+    disable_optimizer_steps(model)
+
+    if args.inspect_only:
+        inspect_model(model, args)
+        return
+
+    for param in model.parameters():
+        param.requires_grad_(False)
+    targets = enable_target_grads(model, args.target, args.block_regex)
+
+    data_iter = load_data_iter(args, sen12_dir, device)
+    total_loss = 0.0
+    valid = 0
+    accum: dict[str, dict] = {}
+
+    for step in range(1, args.probe_batches + 1):
+        batch = next(data_iter)
+        model.set_input(batch)
+        loss_value = model.optimize_parameters(epoch=0)
+        loss_tensor = getattr(model, "loss_G", None)
+        if not torch.is_tensor(loss_tensor):
+            print(f"probe batch {step}/{args.probe_batches} skipped: no tensor loss_G")
+            continue
+        if not torch.isfinite(loss_tensor.detach()):
+            print(f"probe batch {step}/{args.probe_batches} skipped: non-finite loss")
+            continue
+
+        valid += 1
+        total_loss += float(loss_tensor.detach().cpu())
+        print(f"probe batch {step:03d}/{args.probe_batches} loss={float(loss_tensor.detach().cpu()):.6f}")
+
+        for name, module in targets:
+            bkey = block_key(name, args.block_regex)
+            grad_norm, param_count = module_grad_norm_and_params(module)
+            row = accum.setdefault(bkey, {"grad_norm": 0.0, "param_count": 0, "module_count": 0})
+            row["grad_norm"] += grad_norm
+            row["param_count"] += param_count
+            row["module_count"] += 1
+
+    if valid == 0:
+        raise SystemExit("No valid probe batches.")
+
+    rows = []
+    blocks = sorted(accum, key=natural_key)
+    total_blocks = max(len(blocks), 1)
+    for idx, block in enumerate(blocks):
+        row = accum[block]
+        p_count = max(int(row["param_count"]), 1)
+        score = row["grad_norm"] / math.sqrt(p_count)
+        rows.append(
+            {
+                "block": block,
+                "block_index": idx,
+                "grad_norm": row["grad_norm"],
+                "weight_param_count": int(row["param_count"]),
+                "module_count": int(row["module_count"]),
+                "normalized_grad_score": score,
+                "bp_cost": total_blocks - idx,
+                "selection_score": score,
+                "probe_batches": valid,
+                "mean_probe_loss": total_loss / valid,
+                "selected": False,
+            }
+        )
+
+    selected = {r["block"] for r in sorted(rows, key=lambda r: r["selection_score"], reverse=True)[: args.topk_blocks]}
+    for row in rows:
+        row["selected"] = row["block"] in selected
+
+    out_dir = ensure_dir(args.output_dir)
+    write_csv(out_dir / "dgmr_grad_scores.csv", rows)
+    print(f"Wrote {out_dir / 'dgmr_grad_scores.csv'}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data_root", default="", help="SEN12MS-CR root directory")
+    parser.add_argument("--data_list_filepath", default="")
+    parser.add_argument("--ckpt_path", default="")
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--target", default="all_linear", choices=["qkv", "attention_linear", "all_linear", "all_conv_linear"])
+    parser.add_argument("--split", default="train", choices=["all", "train", "val", "test"])
+    parser.add_argument("--region", default="all")
+    parser.add_argument("--load_size", type=int, default=128)
+    parser.add_argument("--crop_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--probe_batches", type=int, default=2)
+    parser.add_argument("--topk_blocks", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--gpu_ids", default="0")
+    parser.add_argument("--block_regex", default="")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--synthetic", action="store_true", help="Use synthetic SEN12MS-like tensors for a smoke test")
+    parser.add_argument("--inspect_only", action="store_true")
+    parser.add_argument("--cpu", action="store_true")
+    return parser
+
+
+def main() -> None:
+    profile(build_parser().parse_args())
+
+
+if __name__ == "__main__":
+    main()
