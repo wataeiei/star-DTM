@@ -17,6 +17,7 @@ import sys
 import types
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -257,7 +258,102 @@ def move_to_device(value, device: torch.device):
     return value
 
 
+def chw_array(array: np.ndarray) -> np.ndarray:
+    if array.ndim == 3 and array.shape[-1] in (1, 2, 3, 4, 13):
+        return np.transpose(array, (2, 0, 1))
+    if array.ndim == 3:
+        return array
+    raise ValueError(f"Expected HWC or CHW array, got shape={array.shape}")
+
+
+def normalize_optical(array: np.ndarray) -> np.ndarray:
+    array = array.astype(np.float32, copy=False)
+    if float(np.nanmax(array)) > 2.0:
+        array = array / 10000.0
+    return np.clip(array, 0.0, 1.0)
+
+
+def normalize_sar(array: np.ndarray) -> np.ndarray:
+    array = array.astype(np.float32, copy=False)
+    if float(np.nanmin(array)) < -1.0 or float(np.nanmax(array)) > 2.0:
+        array = np.clip(array, -25.0, 0.0)
+        array = (array + 25.0) / 25.0
+    return np.clip(array, 0.0, 1.0)
+
+
+def crop_chw(array: np.ndarray, crop_size: int, rng: random.Random) -> np.ndarray:
+    _, height, width = array.shape
+    if height < crop_size or width < crop_size:
+        tensor = torch.from_numpy(array).unsqueeze(0)
+        tensor = torch.nn.functional.interpolate(
+            tensor,
+            size=(crop_size, crop_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return tensor.squeeze(0).numpy()
+    top = rng.randint(0, height - crop_size) if height > crop_size else 0
+    left = rng.randint(0, width - crop_size) if width > crop_size else 0
+    return array[:, top : top + crop_size, left : left + crop_size]
+
+
+def decode_hf_sen12mscr_sample(sample: dict, crop_size: int, rng: random.Random) -> dict:
+    sar = np.frombuffer(sample["sar"], dtype=np.float32).reshape(sample["sar_shape"])
+    cloudy = np.frombuffer(sample["cloudy"], dtype=np.int16).reshape(sample["opt_shape"])
+    target = np.frombuffer(sample["target"], dtype=np.int16).reshape(sample["opt_shape"])
+
+    sar = crop_chw(normalize_sar(chw_array(sar)), crop_size, rng)
+    cloudy = crop_chw(normalize_optical(chw_array(cloudy)), crop_size, rng)
+    target = crop_chw(normalize_optical(chw_array(target)), crop_size, rng)
+
+    return {
+        "input": {
+            "S2": torch.from_numpy(np.ascontiguousarray(cloudy)),
+            "S1": torch.from_numpy(np.ascontiguousarray(sar)),
+            "masks": torch.ones(crop_size, crop_size, dtype=torch.float32),
+        },
+        "target": {
+            "S2": torch.from_numpy(np.ascontiguousarray(target)),
+        },
+    }
+
+
+def collate_dgmr_batches(samples: list[dict], device: torch.device) -> dict:
+    return {
+        "input": {
+            "S2": torch.stack([s["input"]["S2"] for s in samples], dim=0).to(device),
+            "S1": torch.stack([s["input"]["S1"] for s in samples], dim=0).to(device),
+            "masks": torch.stack([s["input"]["masks"] for s in samples], dim=0).to(device),
+        },
+        "target": {
+            "S2": torch.stack([s["target"]["S2"] for s in samples], dim=0).to(device),
+        },
+    }
+
+
+def hf_sen12mscr_iter(args: argparse.Namespace, device: torch.device):
+    from datasets import load_dataset
+
+    ds = load_dataset(args.hf_dataset, split=args.hf_split, streaming=True)
+    rng = random.Random(args.seed)
+    batch = []
+    seen = 0
+    while True:
+        for sample in ds:
+            batch.append(decode_hf_sen12mscr_sample(sample, args.crop_size, rng))
+            seen += 1
+            if len(batch) == args.batch_size:
+                yield collate_dgmr_batches(batch, device)
+                batch = []
+            if args.hf_max_samples > 0 and seen >= args.hf_max_samples:
+                seen = 0
+                break
+
+
 def load_data_iter(args: argparse.Namespace, sen12_dir: Path, device: torch.device):
+    if args.hf_dataset:
+        yield from hf_sen12mscr_iter(args, device)
+
     if args.synthetic:
         while True:
             yield make_synthetic_batch(args.batch_size, args.crop_size, device)
@@ -391,6 +487,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data_root", default="", help="SEN12MS-CR root directory")
     parser.add_argument("--data_list_filepath", default="")
+    parser.add_argument("--hf_dataset", default="", help="Streaming Hugging Face dataset id, e.g. Hermanni/sen12mscr")
+    parser.add_argument("--hf_split", default="train")
+    parser.add_argument("--hf_max_samples", type=int, default=0, help="Restart stream after this many samples; 0 means no limit")
     parser.add_argument("--ckpt_path", default="")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--target", default="all_linear", choices=["qkv", "attention_linear", "all_linear", "all_conv_linear"])
@@ -413,7 +512,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    profile(build_parser().parse_args())
+    args = build_parser().parse_args()
+    profile(args)
+    if args.hf_dataset:
+        # pyarrow/aiohttp streaming can crash during interpreter finalization on
+        # some Jetson Python builds. The profiling outputs are already flushed.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":
