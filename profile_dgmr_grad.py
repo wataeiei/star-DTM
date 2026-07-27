@@ -237,6 +237,7 @@ def make_synthetic_batch(batch_size: int, crop_size: int, device: torch.device) 
         "input": {
             "S2": torch.rand(batch_size, 13, crop_size, crop_size, device=device),
             "S1": torch.rand(batch_size, 2, crop_size, crop_size, device=device),
+            "masks": torch.ones(batch_size, 1, crop_size, crop_size, device=device),
         },
         "target": {
             "S2": torch.rand(batch_size, 13, crop_size, crop_size, device=device),
