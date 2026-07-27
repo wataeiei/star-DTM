@@ -685,6 +685,49 @@ def linear_weight_grad_norm(module: nn.Linear) -> float:
     return math.sqrt(total)
 
 
+def param_grad_norm(param: torch.Tensor) -> float:
+    if param.grad is None:
+        return 0.0
+    return math.sqrt(float(param.grad.detach().float().pow(2).sum().cpu()))
+
+
+def enable_block_parameter_grads(root: nn.Module, block_regex: str) -> list[tuple[str, nn.Parameter]]:
+    params = []
+    for name, param in root.named_parameters():
+        if block_key(name, block_regex):
+            param.requires_grad_(True)
+            params.append((name, param))
+    if not params:
+        raise SystemExit("No block parameters found for --importance_mode param. Run --inspect_only or set --block_regex.")
+    return params
+
+
+def collect_parameter_grad_rows(named_params: list[tuple[str, nn.Parameter]], block_regex: str) -> tuple[dict[str, dict], list[dict]]:
+    by_block: dict[str, dict] = {}
+    param_rows = []
+    for name, param in named_params:
+        bkey = block_key(name, block_regex)
+        if not bkey:
+            continue
+        grad_norm = param_grad_norm(param)
+        row = by_block.setdefault(bkey, {"grad_norm": 0.0, "weight_param_count": 0, "module_count": 0})
+        row["grad_norm"] += grad_norm
+        row["weight_param_count"] += param.numel()
+        row["module_count"] += 1
+        param_rows.append(
+            {
+                "name": name,
+                "block": bkey,
+                "grad_norm": grad_norm,
+                "param_count": param.numel(),
+                "normalized_grad_score": grad_norm / math.sqrt(max(param.numel(), 1)),
+                "requires_grad": bool(param.requires_grad),
+                "has_grad": param.grad is not None,
+            }
+        )
+    return by_block, param_rows
+
+
 class LinearForwardUsageRecorder:
     def __init__(self, named_modules: list[tuple[str, nn.Linear]], block_regex: str = "") -> None:
         self.records: dict[str, dict] = {}
@@ -1092,6 +1135,7 @@ def profile(args: argparse.Namespace) -> None:
     injected = []
     recorder = None
     weight_targets: list[tuple[str, nn.Linear]] = []
+    param_targets: list[tuple[str, nn.Parameter]] = []
     weight_usage_recorder = None
     if args.importance_mode == "lora":
         injected = inject_lora(model, args.target, args.rank, args.alpha, args.block_regex, args.lora_up_init_scale)
@@ -1099,6 +1143,8 @@ def profile(args: argparse.Namespace) -> None:
         recorder = ActivationGradRecorder(model, args.block_regex)
         if not recorder.records:
             raise SystemExit("No EMRDM transformer layers found for activation-gradient profiling.")
+    elif args.importance_mode == "param":
+        param_targets = enable_block_parameter_grads(model, args.block_regex)
     else:
         weight_targets = enable_target_weight_grads(model, args.target, args.block_regex)
         weight_usage_recorder = LinearForwardUsageRecorder(weight_targets, args.block_regex)
@@ -1193,7 +1239,7 @@ def profile(args: argparse.Namespace) -> None:
             assert recorder is not None
             by_block = recorder.records
             recorder.close()
-        else:
+        elif args.importance_mode == "weight":
             for name, module in weight_targets:
                 bkey = block_key(name, args.block_regex)
                 if not bkey:
@@ -1210,6 +1256,8 @@ def profile(args: argparse.Namespace) -> None:
                 row["output_requires_grad_forwards"] = usage.get("output_requires_grad_forwards", 0)
                 row["output_grad_norm"] = usage.get("output_grad_norm", 0.0)
             weight_usage_recorder.close()
+        else:
+            by_block, param_rows = collect_parameter_grad_rows(param_targets, args.block_regex)
 
     blocks = sorted(by_block, key=natural_key)
     total_blocks = max(len(blocks), 1)
@@ -1252,6 +1300,9 @@ def profile(args: argparse.Namespace) -> None:
 
     out_dir = ensure_dir(args.output_dir)
     write_csv(out_dir / "emrdm_grad_scores.csv", rows)
+    if args.importance_mode == "param":
+        param_rows = sorted(param_rows, key=lambda row: row["normalized_grad_score"], reverse=True)
+        write_csv(out_dir / "emrdm_param_grad_debug.csv", param_rows[: args.debug_top_params])
     metadata = {
         "config_path": args.config_path,
         "ckpt_path": args.ckpt_path,
@@ -1276,6 +1327,7 @@ def profile(args: argparse.Namespace) -> None:
         "selected_blocks": sorted(selected, key=natural_key),
         "injected_module_count": len(injected),
         "weight_target_module_count": len(weight_targets),
+        "param_target_count": len(param_targets),
     }
     (out_dir / "emrdm_grad_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(f"Wrote {out_dir / 'emrdm_grad_scores.csv'}")
@@ -1312,8 +1364,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--importance_mode",
         default="weight",
-        choices=["weight", "activation", "lora"],
-        help="weight records original target Linear weight gradients; activation records block output gradients; lora records probe LoRA parameter gradients.",
+        choices=["weight", "param", "activation", "lora"],
+        help="weight records target Linear gradients; param records all block parameter gradients; activation records block output gradients; lora records probe LoRA gradients.",
     )
     parser.add_argument(
         "--loss_mode",
@@ -1338,6 +1390,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input_noise_std", type=float, default=0.0)
     parser.add_argument("--compute_lambda", type=float, default=0.0)
     parser.add_argument("--block_regex", default="")
+    parser.add_argument("--debug_top_params", type=int, default=200)
     parser.add_argument("--neighborhood_backend", default="auto", choices=["auto", "native", "torch"])
     parser.add_argument("--inspect_only", action="store_true")
     parser.add_argument("--cpu", action="store_true")
