@@ -65,6 +65,14 @@ def normalize_scores(values: list[float], mode: str) -> list[float]:
     raise SystemExit(f"Unknown normalize mode: {mode}")
 
 
+def positive_floor(values: list[float]) -> list[float]:
+    positives = [v for v in values if v > 0.0]
+    if not positives:
+        return [1e-12 for _ in values]
+    floor = min(positives) * 0.5
+    return [v if v > 0.0 else floor for v in values]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--score_csv", action="append", required=True)
@@ -75,6 +83,7 @@ def main() -> None:
     parser.add_argument("--title", default="Cross-model Gradient Score Patterns")
     parser.add_argument("--dpi", type=int, default=180)
     parser.add_argument("--annotate_topk", type=int, default=5)
+    parser.add_argument("--yscale", default="linear", choices=["linear", "log"])
     args = parser.parse_args()
 
     labels = args.label or [Path(path).parent.name for path in args.score_csv]
@@ -88,6 +97,8 @@ def main() -> None:
     for idx, (path, label) in enumerate(zip(args.score_csv, labels)):
         rows = read_score_csv(path, args.score_key)
         scores = normalize_scores([row["score"] for row in rows], args.normalize_y)
+        if args.yscale == "log":
+            scores = positive_floor(scores)
         denom = max(len(rows) - 1, 1)
         xs = [i / denom for i in range(len(rows))]
         color = colors[idx % len(colors)]
@@ -114,6 +125,7 @@ def main() -> None:
     ylabel = args.score_key if args.normalize_y == "none" else f"{args.score_key} ({args.normalize_y}-normalized per curve)"
     ax.set_ylabel(ylabel)
     ax.set_title(args.title)
+    ax.set_yscale(args.yscale)
     ax.set_xlim(-0.02, 1.02)
     ax.grid(axis="both", alpha=0.25)
     ax.legend(loc="upper left")
