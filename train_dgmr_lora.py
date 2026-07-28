@@ -130,6 +130,7 @@ def inject_lora(model, args: argparse.Namespace) -> list[tuple[str, LoRALinear]]
             continue
         parent, leaf = parent_and_leaf(model, name)
         lora = LoRALinear(module, args.rank, args.alpha)
+        lora.to(device=module.weight.device, dtype=module.weight.dtype)
         setattr(parent, leaf, lora)
         injected.append((name, lora))
 
