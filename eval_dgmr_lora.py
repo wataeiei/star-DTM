@@ -93,6 +93,14 @@ def load_lora_adapter(model, adapter_path: str | Path) -> list[str]:
     return injected
 
 
+def load_full_state(model, state_path: str | Path) -> None:
+    state = torch.load(state_path, map_location="cpu")
+    if state.get("net_G") is not None:
+        model.net_G.load_state_dict(state["net_G"], strict=True)
+    if state.get("diffusion") is not None:
+        model.diffusion.load_state_dict(state["diffusion"], strict=True)
+
+
 def file_size_mb(path: str | Path) -> float:
     return Path(path).stat().st_size / (1024.0 * 1024.0)
 
@@ -147,6 +155,11 @@ def evaluate(args: argparse.Namespace) -> None:
 
     injected = []
     adapter_mb = 0.0
+    if args.full_state_path:
+        load_full_state(model, args.full_state_path)
+        adapter_mb = file_size_mb(args.full_state_path)
+        print(f"Loaded full DGMR state from {args.full_state_path}")
+
     if args.adapter_path:
         injected = load_lora_adapter(model, args.adapter_path)
         adapter_mb = file_size_mb(args.adapter_path)
@@ -236,6 +249,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cached_sample_dir", default="")
     parser.add_argument("--ckpt_path", default="")
     parser.add_argument("--adapter_path", default="")
+    parser.add_argument("--full_state_path", default="")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--method", default="DGMR")
     parser.add_argument("--eval_samples", type=int, default=8)
