@@ -408,11 +408,29 @@ def load_data_iter(args: argparse.Namespace, sen12_dir: Path, device: torch.devi
             yield move_to_device(batch, device)
 
 
-def disable_optimizer_steps(model) -> None:
-    for opt_name in ("optimizer_G", "optimizer_G1"):
-        opt = getattr(model, opt_name, None)
-        if opt is not None:
-            opt.step = lambda *args, **kwargs: None
+class OptimizerStepController:
+    def __init__(self, model) -> None:
+        self.steps = {}
+        for opt_name in ("optimizer_G", "optimizer_G1"):
+            opt = getattr(model, opt_name, None)
+            if opt is not None:
+                self.steps[opt_name] = opt.step
+        self.model = model
+
+    def disable(self) -> None:
+        for opt_name in self.steps:
+            opt = getattr(self.model, opt_name, None)
+            if opt is not None:
+                opt.step = lambda *args, **kwargs: None
+
+    def enable(self) -> None:
+        for opt_name, step_fn in self.steps.items():
+            opt = getattr(self.model, opt_name, None)
+            if opt is not None:
+                opt.step = step_fn
+
+
+def disable_checkpoint_saves(model) -> None:
     model.save_checkpoint = lambda *args, **kwargs: None
 
 
@@ -432,29 +450,28 @@ def inspect_model(model, args: argparse.Namespace) -> None:
             print(f"{mark} {name} [{module.__class__.__name__} {shape}] block={block_key(name, args.block_regex)}")
 
 
-def profile(args: argparse.Namespace) -> None:
-    set_seed(args.seed)
-    install_runtime_stubs()
-    sen12_dir = locate_sen12_dir(Path.cwd())
-    sys.path.insert(0, str(sen12_dir))
-    os.chdir(sen12_dir)
+def parse_track_steps(text: str) -> list[int]:
+    if not text:
+        return []
+    steps = sorted({int(part.strip()) for part in text.split(",") if part.strip()})
+    if not steps:
+        return []
+    if steps[0] != 0:
+        steps.insert(0, 0)
+    return steps
 
-    from dgmr import DGMR
 
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    opts = make_opts(args)
-    model = DGMR(opts)
-    disable_optimizer_steps(model)
-
-    if args.inspect_only:
-        inspect_model(model, args)
-        return
-
-    for param in iter_dgmr_parameters(model):
-        param.requires_grad_(False)
-    targets = enable_target_grads(model, args.target, args.block_regex)
-
-    data_iter = load_data_iter(args, sen12_dir, device)
+def profile_once(
+    args: argparse.Namespace,
+    model,
+    targets: list[tuple[str, nn.Module]],
+    data_iter,
+    out_dir: str | Path,
+    step_controller: OptimizerStepController,
+    restore_optimizer_after: bool,
+    stage_name: str = "",
+) -> list[dict]:
+    step_controller.disable()
     total_loss = 0.0
     valid = 0
     accum: dict[str, dict] = {}
@@ -462,18 +479,19 @@ def profile(args: argparse.Namespace) -> None:
     for step in range(1, args.probe_batches + 1):
         batch = next(data_iter)
         model.set_input(batch)
-        loss_value = model.optimize_parameters(epoch=0)
+        model.optimize_parameters(epoch=0)
         loss_tensor = getattr(model, "loss_G", None)
         if not torch.is_tensor(loss_tensor):
-            print(f"probe batch {step}/{args.probe_batches} skipped: no tensor loss_G")
+            print(f"{stage_name} probe batch {step}/{args.probe_batches} skipped: no tensor loss_G")
             continue
         if not torch.isfinite(loss_tensor.detach()):
-            print(f"probe batch {step}/{args.probe_batches} skipped: non-finite loss")
+            print(f"{stage_name} probe batch {step}/{args.probe_batches} skipped: non-finite loss")
             continue
 
         valid += 1
         total_loss += float(loss_tensor.detach().cpu())
-        print(f"probe batch {step:03d}/{args.probe_batches} loss={float(loss_tensor.detach().cpu()):.6f}")
+        prefix = f"{stage_name} " if stage_name else ""
+        print(f"{prefix}probe batch {step:03d}/{args.probe_batches} loss={float(loss_tensor.detach().cpu()):.6f}")
 
         for name, module in targets:
             bkey = block_key(name, args.block_regex)
@@ -482,6 +500,9 @@ def profile(args: argparse.Namespace) -> None:
             row["grad_norm"] += grad_norm
             row["param_count"] += param_count
             row["module_count"] += 1
+
+    if restore_optimizer_after:
+        step_controller.enable()
 
     if valid == 0:
         raise SystemExit("No valid probe batches.")
@@ -513,9 +534,112 @@ def profile(args: argparse.Namespace) -> None:
     for row in rows:
         row["selected"] = row["block"] in selected
 
-    out_dir = ensure_dir(args.output_dir)
+    out_dir = ensure_dir(out_dir)
     write_csv(out_dir / "dgmr_grad_scores.csv", rows)
     print(f"Wrote {out_dir / 'dgmr_grad_scores.csv'}")
+    return rows
+
+
+def train_for_steps(model, data_iter, step_controller: OptimizerStepController, num_steps: int, start_step: int) -> int:
+    step_controller.enable()
+    current = start_step
+    for _ in range(num_steps):
+        current += 1
+        batch = next(data_iter)
+        model.set_input(batch)
+        model.optimize_parameters(epoch=0)
+        loss_tensor = getattr(model, "loss_G", None)
+        if torch.is_tensor(loss_tensor):
+            print(f"train step {current:04d} loss={float(loss_tensor.detach().cpu()):.6f}")
+        else:
+            print(f"train step {current:04d}")
+    return current
+
+
+def write_topk_overlap(path: str | Path, stage_rows: dict[int, list[dict]], topk: int) -> None:
+    stages = sorted(stage_rows)
+    if not stages:
+        return
+    base_top = {
+        row["block"]
+        for row in sorted(stage_rows[stages[0]], key=lambda r: r["selection_score"], reverse=True)[:topk]
+    }
+    rows = []
+    for stage in stages:
+        top = {
+            row["block"]
+            for row in sorted(stage_rows[stage], key=lambda r: r["selection_score"], reverse=True)[:topk]
+        }
+        overlap = len(base_top & top)
+        rows.append(
+            {
+                "step": stage,
+                "topk": topk,
+                "overlap_with_step0": overlap,
+                "overlap_ratio_with_step0": overlap / max(topk, 1),
+                "top_blocks": ";".join(sorted(top)),
+            }
+        )
+    write_csv(path, rows)
+    print(f"Wrote {path}")
+
+
+def profile(args: argparse.Namespace) -> None:
+    set_seed(args.seed)
+    install_runtime_stubs()
+    sen12_dir = locate_sen12_dir(Path.cwd())
+    sys.path.insert(0, str(sen12_dir))
+    os.chdir(sen12_dir)
+
+    from dgmr import DGMR
+
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    opts = make_opts(args)
+    model = DGMR(opts)
+    disable_checkpoint_saves(model)
+    step_controller = OptimizerStepController(model)
+
+    if args.inspect_only:
+        inspect_model(model, args)
+        return
+
+    for param in iter_dgmr_parameters(model):
+        param.requires_grad_(False)
+    targets = enable_target_grads(model, args.target, args.block_regex)
+
+    data_iter = load_data_iter(args, sen12_dir, device)
+    track_steps = parse_track_steps(args.track_importance_steps)
+    if not track_steps:
+        profile_once(args, model, targets, data_iter, args.output_dir, step_controller, restore_optimizer_after=False)
+        return
+
+    current_train_step = 0
+    stage_rows = {}
+    for target_step in track_steps:
+        if target_step < current_train_step:
+            continue
+        if target_step > current_train_step:
+            current_train_step = train_for_steps(
+                model,
+                data_iter,
+                step_controller,
+                target_step - current_train_step,
+                current_train_step,
+            )
+        stage_dir = Path(args.output_dir) / f"step_{target_step:04d}"
+        rows = profile_once(
+            args,
+            model,
+            targets,
+            data_iter,
+            stage_dir,
+            step_controller,
+            restore_optimizer_after=True,
+            stage_name=f"[step {target_step:04d}]",
+        )
+        stage_rows[target_step] = rows
+
+    write_topk_overlap(Path(args.output_dir) / "topk_overlap.csv", stage_rows, args.topk_blocks)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -537,6 +661,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--probe_batches", type=int, default=2)
     parser.add_argument("--topk_blocks", type=int, default=8)
+    parser.add_argument(
+        "--track_importance_steps",
+        default="",
+        help="Comma-separated fine-tuning steps to profile, e.g. 0,20,50,100",
+    )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--gpu_ids", default="0")
     parser.add_argument("--block_regex", default="")
