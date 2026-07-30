@@ -25,6 +25,7 @@ def mean(values):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("train_log")
+    parser.add_argument("--baseline_log", default="")
     parser.add_argument("--top_blocks", type=int, default=12)
     args = parser.parse_args()
 
@@ -45,8 +46,12 @@ def main():
     cache_mb = numeric(rows, "residual_cache_mb")
 
     frequency = Counter()
+    fallback_frequency = Counter()
     for row in rows:
         frequency.update(block for block in row.get("skipped_blocks", "").split(";") if block)
+        fallback_frequency.update(
+            block for block in row.get("fallback_block_names", "").split(";") if block
+        )
 
     print(f"steps: {len(rows)}")
     print(f"mean skipped blocks: {mean(skipped):.2f}")
@@ -62,6 +67,31 @@ def main():
     print("most frequently skipped blocks:")
     for block, count in frequency.most_common(args.top_blocks):
         print(f"  {block}: {count}/{len(rows)} steps")
+    if fallback_frequency:
+        print("fallback blocks:")
+        for block, count in fallback_frequency.most_common():
+            print(f"  {block}: {count}")
+
+    if args.baseline_log:
+        with Path(args.baseline_log).open(newline="", encoding="utf-8") as handle:
+            baseline = list(csv.DictReader(handle))
+        baseline_time = mean(numeric(baseline, "train_step_time_s"))
+        baseline_peak = max(numeric(baseline, "train_peak_cuda_mem_mb"), default=0.0)
+        current_time = mean(train_time)
+        current_peak = max(train_peak, default=0.0)
+        online_total = current_time + mean(cache_time)
+
+        def reduction(current, reference):
+            return 100.0 * (reference - current) / reference if reference else 0.0
+
+        print("comparison with baseline:")
+        print(f"  baseline train step s: {baseline_time:.4f}")
+        print(f"  residual-skip train step s: {current_time:.4f}")
+        print(f"  online cache + train s: {online_total:.4f}")
+        print(f"  train-step speed change: {reduction(current_time, baseline_time):+.2f}% reduction")
+        print(f"  baseline peak CUDA MB: {baseline_peak:.1f}")
+        print(f"  residual-skip peak CUDA MB: {current_peak:.1f}")
+        print(f"  peak CUDA reduction: {reduction(current_peak, baseline_peak):+.2f}%")
 
 
 if __name__ == "__main__":

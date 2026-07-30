@@ -252,7 +252,12 @@ def _encode_residual(
             raise ValueError("Block output has no shape-compatible residual input.")
         index = matches[0]
         used_refs.add(index)
-        delta = _cache_tensor(output - refs[index], cache_device, cache_dtype)
+        # Subtract in FP32 so BF16/FP16 round-off does not accumulate across skips.
+        delta = _cache_tensor(
+            output.detach().float() - refs[index].detach().float(),
+            cache_device,
+            cache_dtype,
+        )
         return ("residual", index, delta)
     if isinstance(output, tuple):
         return ("tuple", tuple(
@@ -264,6 +269,8 @@ def _encode_residual(
             _encode_residual(item, refs, used_refs, cache_device, cache_dtype)
             for item in output
         ])
+    if output is None or isinstance(output, (bool, int, float, str)):
+        return ("constant", output)
     raise ValueError(f"Unsupported block output type for residual replay: {type(output)}")
 
 
@@ -271,12 +278,14 @@ def _decode_residual(encoded: Any, refs: list[torch.Tensor]) -> Any:
     kind = encoded[0]
     if kind == "residual":
         ref = refs[encoded[1]]
-        delta = encoded[2].to(device=ref.device, dtype=ref.dtype, non_blocking=True)
-        return ref + delta
+        delta = encoded[2].to(device=ref.device, dtype=torch.float32, non_blocking=True)
+        return (ref.float() + delta).to(dtype=ref.dtype)
     if kind == "tuple":
         return tuple(_decode_residual(item, refs) for item in encoded[1])
     if kind == "list":
         return [_decode_residual(item, refs) for item in encoded[1]]
+    if kind == "constant":
+        return encoded[1]
     raise RuntimeError(f"Unknown residual encoding: {kind}")
 
 
@@ -321,6 +330,8 @@ def _encoded_nbytes(encoded: Any) -> int:
     if encoded[0] == "residual":
         tensor = encoded[2]
         return tensor.numel() * tensor.element_size()
+    if encoded[0] == "constant":
+        return 0
     return sum(_encoded_nbytes(item) for item in encoded[1])
 
 
@@ -332,6 +343,7 @@ class CacheStats:
     fallback_blocks: int
     teacher_loss: float = 0.0
     peak_cuda_mem_mb: float = 0.0
+    fallback_names: str = ""
 
 
 class ResidualBlockController:
@@ -386,6 +398,7 @@ class ResidualBlockController:
             fallback_blocks=sum(not wrapper.replayable for wrapper in selected),
             teacher_loss=teacher_loss,
             peak_cuda_mem_mb=peak_cuda_mem_mb,
+            fallback_names=";".join(sorted(self.fallbacks)),
         )
 
 

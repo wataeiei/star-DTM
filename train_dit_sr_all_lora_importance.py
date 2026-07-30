@@ -340,6 +340,7 @@ def main():
                 if controller is not None else 0.0,
                 "replayable_blocks": cache_stats.replayable_blocks,
                 "fallback_blocks": cache_stats.fallback_blocks,
+                "fallback_block_names": cache_stats.fallback_names,
                 "cache_peak_cuda_mem_mb": cache_stats.peak_cuda_mem_mb,
                 "train_step_time_s": train_step_time_s,
                 "train_peak_cuda_mem_mb": train_peak_cuda_mem_mb,
