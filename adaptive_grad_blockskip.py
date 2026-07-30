@@ -6,11 +6,87 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def canonical_lora_name(name: str) -> str:
+    """Remove wrapper-only path components from a LoRA module name."""
+    return name.replace(".block.", ".")
+
+
+def save_lora_adapter(root: nn.Module, path: str | Path) -> dict:
+    """Save LoRALinear weights in a model-independent checkpoint."""
+    modules = {}
+    trainable_params = 0
+    nonzero_modules = 0
+    for name, module in root.named_modules():
+        if not hasattr(module, "lora_down") or not hasattr(module, "lora_up"):
+            continue
+        canonical_name = canonical_lora_name(name)
+        down = module.lora_down.weight.detach().cpu()
+        up = module.lora_up.weight.detach().cpu()
+        modules[canonical_name] = {
+            "lora_down": down,
+            "lora_up": up,
+            "rank": int(getattr(module, "rank", down.shape[0])),
+            "alpha": float(getattr(module, "alpha", down.shape[0])),
+        }
+        trainable_params += down.numel() + up.numel()
+        if bool(torch.count_nonzero(up).item()):
+            nonzero_modules += 1
+    if not modules:
+        raise RuntimeError("No LoRA modules found while saving the adapter.")
+    payload = {
+        "format": "custom_lora_linear_v1",
+        "modules": modules,
+    }
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
+    return {
+        "adapter_path": str(path),
+        "adapter_size_mb": path.stat().st_size / (1024.0 ** 2),
+        "lora_module_count": len(modules),
+        "nonzero_lora_module_count": nonzero_modules,
+        "trainable_lora_params": trainable_params,
+    }
+
+
+def load_lora_adapter(root: nn.Module, path: str | Path) -> dict:
+    """Load an adapter after the same LoRA targets have been injected."""
+    payload = torch.load(path, map_location="cpu")
+    if payload.get("format") != "custom_lora_linear_v1":
+        raise ValueError(f"Unsupported LoRA adapter format in {path}")
+    current = {
+        canonical_lora_name(name): module
+        for name, module in root.named_modules()
+        if hasattr(module, "lora_down") and hasattr(module, "lora_up")
+    }
+    missing = []
+    for name, weights in payload["modules"].items():
+        module = current.get(name)
+        if module is None:
+            missing.append(name)
+            continue
+        module.lora_down.weight.data.copy_(
+            weights["lora_down"].to(
+                device=module.lora_down.weight.device,
+                dtype=module.lora_down.weight.dtype,
+            )
+        )
+        module.lora_up.weight.data.copy_(
+            weights["lora_up"].to(
+                device=module.lora_up.weight.device,
+                dtype=module.lora_up.weight.dtype,
+            )
+        )
+    unexpected = sorted(set(current) - set(payload["modules"]))
+    return {"missing": missing, "unexpected": unexpected, "loaded": len(payload["modules"]) - len(missing)}
 
 
 def dynamic_patch_batch(

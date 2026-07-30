@@ -194,6 +194,10 @@ def main():
     parser.add_argument("--blockskip_min_run", type=int, default=2)
     parser.add_argument("--blockskip_max_run", type=int, default=4)
     parser.add_argument("--blockskip_max_runs", type=int, default=2)
+    parser.add_argument(
+        "--fixed_skip_blocks", nargs="*", default=[],
+        help="Explicit logical block names to skip on every step; overrides gradient selection.",
+    )
     parser.add_argument("--residual_cache_device", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--residual_cache_dtype", choices=["fp16", "bf16", "fp32"], default="fp16")
     parser.add_argument("--patch_min_fraction", type=float, default=1.0)
@@ -248,7 +252,10 @@ def main():
         "fp32": torch.float32,
     }[args.residual_cache_dtype]
     controller = None
-    if args.blockskip_count > 0:
+    if args.blockskip_count > 0 or args.fixed_skip_blocks:
+        unknown = sorted(set(args.fixed_skip_blocks) - set(block_names))
+        if unknown:
+            raise SystemExit("Unknown --fixed_skip_blocks: " + ", ".join(unknown))
         block_paths = adaptive.infer_block_module_paths(
             (name for name, _module in core.iter_lora_modules(model)),
             block_names,
@@ -286,14 +293,16 @@ def main():
         skip_blocks = []
         cache_stats = adaptive.CacheStats(0.0, 0.0, 0, 0)
         if controller is not None:
-            skip_blocks = adaptive.select_low_score_runs(
-                importance_rows,
-                step,
-                noise_ratio,
-                args.blockskip_count,
-                args.blockskip_min_run,
-                args.blockskip_max_run,
-                args.blockskip_max_runs,
+            skip_blocks = list(args.fixed_skip_blocks) if args.fixed_skip_blocks else (
+                adaptive.select_low_score_runs(
+                    importance_rows,
+                    step,
+                    noise_ratio,
+                    args.blockskip_count,
+                    args.blockskip_min_run,
+                    args.blockskip_max_run,
+                    args.blockskip_max_runs,
+                )
             )
             controller.configure(skip_blocks)
             cache_stats = adaptive.populate_online_cache(
@@ -369,11 +378,14 @@ def main():
             )
 
     write_csv(output_dir / "train_log.csv", train_rows)
+    adapter_summary = adaptive.save_lora_adapter(
+        model, output_dir / "lora_adapter.pt"
+    )
     metadata = vars(args) | {
         "profile_steps": sorted(profile_steps),
         "injected_module_count": len(injected),
         "model": "DiT-SR",
-    }
+    } | adapter_summary
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(f"Wrote results to {output_dir}")
 
