@@ -191,6 +191,11 @@ def main():
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--blockskip_count", type=int, default=0)
+    parser.add_argument(
+        "--blockskip_schedule", nargs="*", default=[],
+        metavar="SIGMA:COUNT",
+        help="Noise-aware skip counts, for example 0.05:8 0.4:4 0.95:8.",
+    )
     parser.add_argument("--blockskip_min_run", type=int, default=2)
     parser.add_argument("--blockskip_max_run", type=int, default=4)
     parser.add_argument("--blockskip_max_runs", type=int, default=2)
@@ -210,6 +215,12 @@ def main():
 
     if args.loss_mode != "official":
         raise SystemExit("Noise-ratio profiling requires --loss_mode official.")
+    try:
+        blockskip_schedule = adaptive.parse_noise_int_schedule(
+            args.blockskip_schedule
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if not 0.0 < args.patch_min_fraction <= args.patch_max_fraction <= 1.0:
         raise SystemExit("Require 0 < --patch_min_fraction <= --patch_max_fraction <= 1.")
     core.set_seed(args.seed)
@@ -252,7 +263,7 @@ def main():
         "fp32": torch.float32,
     }[args.residual_cache_dtype]
     controller = None
-    if args.blockskip_count > 0 or args.fixed_skip_blocks:
+    if args.blockskip_count > 0 or blockskip_schedule or args.fixed_skip_blocks:
         unknown = sorted(set(args.fixed_skip_blocks) - set(block_names))
         if unknown:
             raise SystemExit("Unknown --fixed_skip_blocks: " + ", ".join(unknown))
@@ -291,14 +302,24 @@ def main():
             args.patch_max_fraction,
         )
         skip_blocks = []
+        requested_skip_count = 0
         cache_stats = adaptive.CacheStats(0.0, 0.0, 0, 0)
         if controller is not None:
-            skip_blocks = list(args.fixed_skip_blocks) if args.fixed_skip_blocks else (
-                adaptive.select_low_score_runs(
+            requested_skip_count = (
+                len(args.fixed_skip_blocks)
+                if args.fixed_skip_blocks
+                else adaptive.noise_scheduled_int(
+                    noise_ratio, blockskip_schedule, args.blockskip_count
+                )
+            )
+            skip_blocks = (
+                list(args.fixed_skip_blocks)
+                if args.fixed_skip_blocks
+                else adaptive.select_low_score_runs(
                     importance_rows,
                     step,
                     noise_ratio,
-                    args.blockskip_count,
+                    requested_skip_count,
                     args.blockskip_min_run,
                     args.blockskip_max_run,
                     args.blockskip_max_runs,
@@ -341,6 +362,7 @@ def main():
                 "noise_ratio": noise_ratio,
                 "patch_size": patch_size,
                 "skipped_blocks": ";".join(skip_blocks),
+                "requested_skip_count": requested_skip_count,
                 "skipped_block_count": len(skip_blocks),
                 "residual_cache_time_s": cache_stats.elapsed_s,
                 "residual_cache_mb": cache_stats.cache_mb,
@@ -382,6 +404,7 @@ def main():
         model, output_dir / "lora_adapter.pt"
     )
     metadata = vars(args) | {
+        "parsed_blockskip_schedule": blockskip_schedule,
         "profile_steps": sorted(profile_steps),
         "injected_module_count": len(injected),
         "model": "DiT-SR",

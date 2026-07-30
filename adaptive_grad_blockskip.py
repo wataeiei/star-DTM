@@ -118,6 +118,38 @@ def dynamic_patch_batch(
     return output, crop_size
 
 
+def parse_noise_int_schedule(values: Iterable[str]) -> list[tuple[float, int]]:
+    """Parse ``NOISE:VALUE`` entries and return them ordered by noise level."""
+    schedule: dict[float, int] = {}
+    for entry in values:
+        try:
+            noise_text, value_text = entry.split(":", 1)
+            noise = float(noise_text)
+            value = int(value_text)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid schedule entry {entry!r}; expected NOISE:INTEGER."
+            ) from exc
+        if not 0.0 <= noise <= 1.0:
+            raise ValueError(f"Schedule noise ratio must be in [0, 1], got {noise}.")
+        if value < 0:
+            raise ValueError(f"Scheduled value must be non-negative, got {value}.")
+        schedule[noise] = value
+    return sorted(schedule.items())
+
+
+def noise_scheduled_int(
+    noise_ratio: float,
+    schedule: Iterable[tuple[float, int]],
+    default: int,
+) -> int:
+    """Return the value at the nearest configured noise anchor."""
+    entries = list(schedule)
+    if not entries:
+        return int(default)
+    return int(min(entries, key=lambda item: abs(item[0] - noise_ratio))[1])
+
+
 def _score_rows(
     rows: Iterable[dict],
     train_step: int,
