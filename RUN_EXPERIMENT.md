@@ -650,3 +650,102 @@ Low Spearman correlation or low Top-K Jaccard at large noise-ratio separation
 indicates that the important-layer ordering changes with noise level. Compare
 the same metric across training steps to see whether this dependence emerges,
 weakens, or strengthens during LoRA fine-tuning.
+
+## Stage/noise-aware Grad-BlockSkip LoRA
+
+The All-LoRA evolution trainers also provide an experimental online residual
+cache. At each training step they:
+
+1. select a few contiguous low-gradient block runs using the latest profile;
+2. run one deterministic no-grad teacher forward and cache block residuals;
+3. restore the RNG state and replace those blocks by `input + residual`;
+4. backpropagate only through the residual-skip forward.
+
+This online mode is intended to validate quality and peak-memory behavior. It
+adds one no-grad forward per step. Only move to an offline cache after the
+teacher and residual-skip losses agree in a short run.
+
+DiT4SR 20-step validation:
+
+```bash
+python3 train_hf_dit4sr_all_lora_importance.py \
+  --model_id acceptee/DiT4SR \
+  --base_model_id stabilityai/stable-diffusion-3.5-medium \
+  --variant dit4sr_q \
+  --data_dir data/ucmerced/train_hr \
+  --output_dir outputs/dit4sr_grad_blockskip_test \
+  --loss_mode official_flow \
+  --image_size 256 \
+  --dtype bf16 \
+  --target qv \
+  --rank 8 \
+  --alpha 16 \
+  --train_steps 20 \
+  --profile_steps 0 5 10 20 \
+  --profile_batches 5 \
+  --profile_noise_ratios 0.05 0.2 0.4 0.6 0.8 0.95 \
+  --train_noise_ratios 0.05 0.2 0.4 0.6 0.8 0.95 \
+  --blockskip_count 6 \
+  --blockskip_min_run 2 \
+  --blockskip_max_run 4 \
+  --blockskip_max_runs 2 \
+  --residual_cache_device cpu \
+  --residual_cache_dtype fp32 \
+  --patch_min_fraction 0.5 \
+  --patch_max_fraction 1.0 \
+  --batch_size 1 \
+  --lr 1e-5 \
+  --seed 42 \
+  --profile_seed 42
+```
+
+DiT-SR 20-step validation:
+
+```bash
+python3 train_dit_sr_all_lora_importance.py \
+  --config_path configs/realsr_DiT.yaml \
+  --ckpt_path weights/realsr.pth \
+  --autoencoder_ckpt weights/autoencoder_vq_f4.pth \
+  --data_dir /mnt/disk1T/liyijuan/star-DTM/data/ucmerced/train_hr \
+  --output_dir outputs/dit_sr_grad_blockskip_test \
+  --loss_mode official \
+  --image_size 256 \
+  --lq_size 64 \
+  --target qv \
+  --rank 8 \
+  --alpha 16 \
+  --train_steps 20 \
+  --profile_steps 0 5 10 20 \
+  --profile_batches 5 \
+  --profile_noise_ratios 0.05 0.2 0.4 0.6 0.8 0.95 \
+  --train_noise_ratios 0.05 0.2 0.4 0.6 0.8 0.95 \
+  --blockskip_count 6 \
+  --blockskip_min_run 2 \
+  --blockskip_max_run 4 \
+  --blockskip_max_runs 2 \
+  --residual_cache_device cpu \
+  --residual_cache_dtype fp32 \
+  --patch_min_fraction 0.5 \
+  --patch_max_fraction 1.0 \
+  --batch_size 1 \
+  --lr 1e-5 \
+  --seed 42 \
+  --profile_seed 42
+```
+
+Inspect `train_log.csv`. A usable first run should have:
+
+- `fallback_blocks == 0`;
+- `replayable_blocks == skipped_block_count`;
+- a small `residual_loss_abs_diff`;
+- lower `train_peak_cuda_mem_mb` than the All-LoRA baseline.
+
+Use `--patch_min_fraction 1 --patch_max_fraction 1` to isolate block skipping,
+or `--blockskip_count 0` to isolate dynamic patch sampling.
+
+Summarize the short run:
+
+```bash
+python3 summarize_grad_blockskip.py \
+  outputs/dit4sr_grad_blockskip_test/train_log.csv
+```

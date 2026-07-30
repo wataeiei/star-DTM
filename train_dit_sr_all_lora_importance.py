@@ -8,6 +8,7 @@ import csv
 import json
 import math
 import random
+import time
 from pathlib import Path
 
 import torch
@@ -15,6 +16,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 import profile_dit_sr_grad as core
+import adaptive_grad_blockskip as adaptive
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
@@ -50,6 +52,12 @@ def profile_importance(model, diffusion, autoencoder, loader, args, device, trai
             except StopIteration:
                 iterator = iter(loader)
                 batch = next(iterator)
+            batch, _patch_size = adaptive.dynamic_patch_batch(
+                batch,
+                noise_ratio,
+                args.patch_min_fraction,
+                args.patch_max_fraction,
+            )
             loss = batch_loss(model, diffusion, autoencoder, batch, args, device)
             if not torch.isfinite(loss):
                 model.zero_grad(set_to_none=True)
@@ -182,10 +190,24 @@ def main():
     parser.add_argument("--block_regex", default="")
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--blockskip_count", type=int, default=0)
+    parser.add_argument("--blockskip_min_run", type=int, default=2)
+    parser.add_argument("--blockskip_max_run", type=int, default=4)
+    parser.add_argument("--blockskip_max_runs", type=int, default=2)
+    parser.add_argument("--residual_cache_device", choices=["cpu", "cuda"], default="cpu")
+    parser.add_argument("--residual_cache_dtype", choices=["fp16", "bf16", "fp32"], default="fp16")
+    parser.add_argument("--patch_min_fraction", type=float, default=1.0)
+    parser.add_argument("--patch_max_fraction", type=float, default=1.0)
+    parser.add_argument(
+        "--train_noise_ratios", type=float, nargs="+", default=[],
+        help="Discrete normalized timesteps sampled during training. Defaults to profile ratios.",
+    )
     args = parser.parse_args()
 
     if args.loss_mode != "official":
         raise SystemExit("Noise-ratio profiling requires --loss_mode official.")
+    if not 0.0 < args.patch_min_fraction <= args.patch_max_fraction <= 1.0:
+        raise SystemExit("Require 0 < --patch_min_fraction <= --patch_max_fraction <= 1.")
     core.set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     model = core.load_model(args, device)
@@ -215,6 +237,33 @@ def main():
         importance_rows.extend(profile_importance(
             model, diffusion, autoencoder, profile_loader, args, device, 0, ratio
         ))
+    block_names = [
+        row["block"]
+        for row in sorted(importance_rows, key=lambda row: int(row["block_index"]))
+        if float(row["noise_ratio"]) == float(args.profile_noise_ratios[0])
+    ]
+    cache_dtype = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }[args.residual_cache_dtype]
+    controller = None
+    if args.blockskip_count > 0:
+        block_paths = adaptive.infer_block_module_paths(
+            (name for name, _module in core.iter_lora_modules(model)),
+            block_names,
+            core.block_key,
+            args.block_regex,
+        )
+        controller = adaptive.ResidualBlockController(
+            model,
+            block_paths,
+            cache_device=args.residual_cache_device,
+            cache_dtype=cache_dtype,
+        )
+    train_noise_ratios = args.train_noise_ratios or args.profile_noise_ratios
+    if any(not 0.0 <= ratio <= 1.0 for ratio in train_noise_ratios):
+        raise SystemExit("--train_noise_ratios values must be in [0, 1].")
     train_rows = []
     iterator = iter(train_loader)
     write_csv(output_dir / "lora_importance_evolution.csv", importance_rows)
@@ -226,6 +275,35 @@ def main():
         except StopIteration:
             iterator = iter(train_loader)
             batch = next(iterator)
+        noise_ratio = float(random.choice(train_noise_ratios))
+        args._profile_noise_ratio = noise_ratio
+        batch, patch_size = adaptive.dynamic_patch_batch(
+            batch,
+            noise_ratio,
+            args.patch_min_fraction,
+            args.patch_max_fraction,
+        )
+        skip_blocks = []
+        cache_stats = adaptive.CacheStats(0.0, 0.0, 0, 0)
+        if controller is not None:
+            skip_blocks = adaptive.select_low_score_runs(
+                importance_rows,
+                step,
+                noise_ratio,
+                args.blockskip_count,
+                args.blockskip_min_run,
+                args.blockskip_max_run,
+                args.blockskip_max_runs,
+            )
+            controller.configure(skip_blocks)
+            cache_stats = adaptive.populate_online_cache(
+                controller,
+                lambda: batch_loss(model, diffusion, autoencoder, batch, args, device),
+                device,
+            )
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+        train_start = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         loss = batch_loss(model, diffusion, autoencoder, batch, args, device)
         if not torch.isfinite(loss):
@@ -235,12 +313,43 @@ def main():
             [param for param in model.parameters() if param.requires_grad], args.grad_clip
         )
         optimizer.step()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        train_step_time_s = time.perf_counter() - train_start
+        train_peak_cuda_mem_mb = (
+            torch.cuda.max_memory_allocated() / (1024.0 ** 2)
+            if device.type == "cuda"
+            else 0.0
+        )
+        if controller is not None:
+            controller.set_mode("full")
+        del args._profile_noise_ratio
         train_rows.append(
-            {"step": step, "loss": float(loss.detach().cpu()), "grad_norm": float(grad_norm)}
+            {
+                "step": step,
+                "loss": float(loss.detach().cpu()),
+                "grad_norm": float(grad_norm),
+                "noise_ratio": noise_ratio,
+                "patch_size": patch_size,
+                "skipped_blocks": ";".join(skip_blocks),
+                "skipped_block_count": len(skip_blocks),
+                "residual_cache_time_s": cache_stats.elapsed_s,
+                "residual_cache_mb": cache_stats.cache_mb,
+                "cache_teacher_loss": cache_stats.teacher_loss,
+                "residual_loss_abs_diff": abs(float(loss.detach().cpu()) - cache_stats.teacher_loss)
+                if controller is not None else 0.0,
+                "replayable_blocks": cache_stats.replayable_blocks,
+                "fallback_blocks": cache_stats.fallback_blocks,
+                "cache_peak_cuda_mem_mb": cache_stats.peak_cuda_mem_mb,
+                "train_step_time_s": train_step_time_s,
+                "train_peak_cuda_mem_mb": train_peak_cuda_mem_mb,
+            }
         )
         if step % args.log_every == 0 or step == 1:
             print(f"step {step:05d}/{args.train_steps} loss={float(loss):.6f}")
         if step in profile_steps:
+            if controller is not None:
+                controller.set_mode("full")
             current = []
             for ratio in args.profile_noise_ratios:
                 current.extend(profile_importance(
