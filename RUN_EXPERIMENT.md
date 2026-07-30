@@ -603,3 +603,50 @@ python3 profile_hf_dit4sr_grad.py \
 The profiling loss is an internal transformer sensitivity loss, not a final SR
 PSNR/SSIM evaluation. Use it to compare which blocks are consistently important
 under different datasets, seeds, calibration subsets, or noise levels.
+## LoRA layer importance versus noise ratio
+
+The two All-LoRA trainers can scan the same calibration mini-batches and
+random-noise stream at several normalized noise ratios at every profile step.
+DiT-SR maps the ratio to `round(ratio * (num_timesteps - 1))`; DiT4SR selects
+the scheduler entry whose sigma is closest to the requested ratio.
+
+DiT-SR:
+
+```bash
+python3 train_dit_sr_all_lora_importance.py \
+  --config_path configs/realsr_DiT.yaml \
+  --ckpt_path weights/realsr.pth \
+  --autoencoder_ckpt weights/autoencoder.pth \
+  --data_dir /path/to/train_hr \
+  --output_dir outputs/dit_sr_lora_t_scan \
+  --loss_mode official \
+  --train_steps 1000 \
+  --profile_steps 0 100 250 500 750 1000 \
+  --profile_noise_ratios 0.05 0.2 0.4 0.6 0.8 0.95
+```
+
+DiT4SR:
+
+```bash
+python3 train_hf_dit4sr_all_lora_importance.py \
+  --data_dir /path/to/train_hr \
+  --output_dir outputs/dit4sr_lora_t_scan \
+  --loss_mode official_flow \
+  --train_steps 1000 \
+  --profile_steps 0 100 250 500 750 1000 \
+  --profile_noise_ratios 0.05 0.2 0.4 0.6 0.8 0.95
+```
+
+Summarize each result:
+
+```bash
+python3 analyze_timestep_importance.py \
+  outputs/dit_sr_lora_t_scan/lora_importance_evolution.csv
+python3 analyze_timestep_importance.py \
+  outputs/dit4sr_lora_t_scan/lora_importance_evolution.csv
+```
+
+Low Spearman correlation or low Top-K Jaccard at large noise-ratio separation
+indicates that the important-layer ordering changes with noise level. Compare
+the same metric across training steps to see whether this dependence emerges,
+weakens, or strengthens during LoRA fine-tuning.

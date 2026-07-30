@@ -375,9 +375,16 @@ def diffusion_batch_loss(
             else output.float().pow(2).mean()
         )
 
-    timesteps = torch.randint(
-        0, diffusion.num_timesteps, (image.shape[0],), device=device, dtype=torch.long
-    )
+    profile_noise_ratio = getattr(args, "_profile_noise_ratio", None)
+    if profile_noise_ratio is None:
+        timesteps = torch.randint(
+            0, diffusion.num_timesteps, (image.shape[0],), device=device, dtype=torch.long
+        )
+    else:
+        timestep = round(float(profile_noise_ratio) * (diffusion.num_timesteps - 1))
+        timesteps = torch.full(
+            (image.shape[0],), timestep, device=device, dtype=torch.long
+        )
     model_kwargs = {"lq": lq}
     result = diffusion.training_losses(
         model,

@@ -585,7 +585,17 @@ def flow_matching_batch_loss(pipe, transformer, batch, args, device):
         raise RuntimeError("official_flow requires both the SD3 VAE and FlowMatch scheduler.")
     scheduler = pipe.scheduler
     count = len(scheduler.timesteps)
-    indices = torch.randint(0, count, (clean.shape[0],), device=device)
+    profile_noise_ratio = getattr(args, "_profile_noise_ratio", None)
+    if profile_noise_ratio is None:
+        indices = torch.randint(0, count, (clean.shape[0],), device=device)
+    else:
+        scheduler_sigmas = scheduler.sigmas[:count].float()
+        nearest = int(
+            (scheduler_sigmas - float(profile_noise_ratio)).abs().argmin().item()
+        )
+        indices = torch.full(
+            (clean.shape[0],), nearest, device=device, dtype=torch.long
+        )
     timesteps = scheduler.timesteps.to(device=device)[indices]
     sigmas = scheduler.sigmas.to(device=device, dtype=clean.dtype)[indices]
     sigmas = sigmas.view(-1, *([1] * (clean.ndim - 1)))

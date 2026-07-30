@@ -32,11 +32,12 @@ def batch_loss(pipe, transformer, batch, args, device):
     return core.flow_matching_batch_loss(pipe, transformer, batch, args, device)
 
 
-def profile_importance(pipe, transformer, loader, args, device, train_step):
+def profile_importance(pipe, transformer, loader, args, device, train_step, noise_ratio):
     cpu_state = torch.random.get_rng_state()
     cuda_state = torch.cuda.get_rng_state_all() if device.type == "cuda" else None
     python_state = random.getstate()
     core.set_seed(args.profile_seed)
+    args._profile_noise_ratio = noise_ratio
     transformer.zero_grad(set_to_none=True)
     iterator = iter(loader)
     valid = 0
@@ -58,6 +59,13 @@ def profile_importance(pipe, transformer, loader, args, device, train_step):
         if valid == 0:
             raise SystemExit(f"No valid profile batches at step {train_step}.")
 
+        scheduler = pipe.scheduler
+        count = len(scheduler.timesteps)
+        sigma_index = int(
+            (scheduler.sigmas[:count].float() - noise_ratio).abs().argmin().item()
+        )
+        actual_sigma = float(scheduler.sigmas[sigma_index])
+        actual_timestep = float(scheduler.timesteps[sigma_index])
         grouped = {}
         for name, module in core.iter_lora_modules(transformer):
             block = core.block_key(name, args.block_regex)
@@ -81,6 +89,10 @@ def profile_importance(pipe, transformer, loader, args, device, train_step):
             rows.append(
                 {
                     "train_step": train_step,
+                    "noise_ratio": noise_ratio,
+                    "scheduler_index": sigma_index,
+                    "timestep": actual_timestep,
+                    "sigma": actual_sigma,
                     "block": block,
                     "block_index": index,
                     "grad_norm": grad_norm,
@@ -101,6 +113,7 @@ def profile_importance(pipe, transformer, loader, args, device, train_step):
             row["selected_topk"] = ranks[row["block"]] <= args.topk_blocks
         return rows
     finally:
+        del args._profile_noise_ratio
         transformer.zero_grad(set_to_none=True)
         random.setstate(python_state)
         torch.random.set_rng_state(cpu_state)
@@ -111,25 +124,30 @@ def profile_importance(pipe, transformer, loader, args, device, train_step):
 def topk_summary(rows):
     grouped = {}
     for row in rows:
-        grouped.setdefault(int(row["train_step"]), []).append(row)
-    baseline = {
-        row["block"] for row in grouped[min(grouped)] if bool(row["selected_topk"])
-    }
+        key = (int(row["train_step"]), float(row["noise_ratio"]))
+        grouped.setdefault(key, []).append(row)
     output = []
-    for step in sorted(grouped):
-        selected = {row["block"] for row in grouped[step] if bool(row["selected_topk"])}
+    for step, ratio in sorted(grouped):
+        baseline_key = (step, min(r for s, r in grouped if s == step))
+        baseline = {
+            row["block"] for row in grouped[baseline_key] if bool(row["selected_topk"])
+        }
+        selected = {
+            row["block"] for row in grouped[(step, ratio)] if bool(row["selected_topk"])
+        }
         overlap = len(baseline & selected)
         output.append(
             {
                 "train_step": step,
+                "noise_ratio": ratio,
                 "topk_blocks": ";".join(
                     row["block"]
-                    for row in sorted(grouped[step], key=lambda row: row["importance_rank"])
+                    for row in sorted(grouped[(step, ratio)], key=lambda row: row["importance_rank"])
                     if row["selected_topk"]
                 ),
-                "topk_overlap_count_vs_step0": overlap,
-                "topk_overlap_ratio_vs_step0": overlap / max(len(baseline), 1),
-                "topk_jaccard_vs_step0": overlap / max(len(baseline | selected), 1),
+                "topk_overlap_count_vs_lowest_t": overlap,
+                "topk_overlap_ratio_vs_lowest_t": overlap / max(len(baseline), 1),
+                "topk_jaccard_vs_lowest_t": overlap / max(len(baseline | selected), 1),
             }
         )
     return output
@@ -158,6 +176,11 @@ def main():
     parser.add_argument("--train_steps", type=int, default=1000)
     parser.add_argument("--profile_steps", type=int, nargs="+", default=[0, 100, 250, 500, 750, 1000])
     parser.add_argument("--profile_batches", type=int, default=5)
+    parser.add_argument(
+        "--profile_noise_ratios", type=float, nargs="+",
+        default=[0.05, 0.2, 0.4, 0.6, 0.8, 0.95],
+        help="Target flow sigmas to scan at every profile step.",
+    )
     parser.add_argument("--topk_blocks", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-5)
@@ -179,6 +202,8 @@ def main():
     parser.add_argument("--log_every", type=int, default=10)
     args = parser.parse_args()
 
+    if args.loss_mode != "official_flow":
+        raise SystemExit("Noise-ratio profiling requires --loss_mode official_flow.")
     core.set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     pipe = core.load_pipe(args, device)
@@ -195,7 +220,13 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     profile_steps = {step for step in args.profile_steps if 0 <= step <= args.train_steps}
     profile_steps.update({0, args.train_steps})
-    importance_rows = profile_importance(pipe, transformer, profile_loader, args, device, 0)
+    if any(not 0.0 <= ratio <= 1.0 for ratio in args.profile_noise_ratios):
+        raise SystemExit("--profile_noise_ratios values must be in [0, 1].")
+    importance_rows = []
+    for ratio in args.profile_noise_ratios:
+        importance_rows.extend(
+            profile_importance(pipe, transformer, profile_loader, args, device, 0, ratio)
+        )
     train_rows = []
     iterator = iter(train_loader)
     write_csv(output_dir / "lora_importance_evolution.csv", importance_rows)
@@ -221,7 +252,11 @@ def main():
                 f"loss={float(loss.detach().cpu()):.6f}"
             )
         if step in profile_steps:
-            current = profile_importance(pipe, transformer, profile_loader, args, device, step)
+            current = []
+            for ratio in args.profile_noise_ratios:
+                current.extend(
+                    profile_importance(pipe, transformer, profile_loader, args, device, step, ratio)
+                )
             importance_rows.extend(current)
             write_csv(output_dir / "lora_importance_evolution.csv", importance_rows)
             write_csv(output_dir / "lora_importance_topk.csv", topk_summary(importance_rows))
