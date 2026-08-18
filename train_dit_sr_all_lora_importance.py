@@ -205,6 +205,12 @@ def main():
     )
     parser.add_argument("--residual_cache_device", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--residual_cache_dtype", choices=["fp16", "bf16", "fp32"], default="fp16")
+    parser.add_argument(
+        "--residual_execution",
+        choices=["two_pass", "single_pass"],
+        default="two_pass",
+        help="Separate teacher-cache forward or in-forward no-grad residual bypass.",
+    )
     parser.add_argument("--patch_min_fraction", type=float, default=1.0)
     parser.add_argument("--patch_max_fraction", type=float, default=1.0)
     parser.add_argument(
@@ -326,11 +332,14 @@ def main():
                 )
             )
             controller.configure(skip_blocks)
-            cache_stats = adaptive.populate_online_cache(
-                controller,
-                lambda: batch_loss(model, diffusion, autoencoder, batch, args, device),
-                device,
-            )
+            if args.residual_execution == "two_pass":
+                cache_stats = adaptive.populate_online_cache(
+                    controller,
+                    lambda: batch_loss(model, diffusion, autoencoder, batch, args, device),
+                    device,
+                )
+            else:
+                controller.set_mode("single_skip")
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats()
         train_start = time.perf_counter()
@@ -352,6 +361,8 @@ def main():
             else 0.0
         )
         if controller is not None:
+            if args.residual_execution == "single_pass":
+                cache_stats = controller.stats(0.0)
             controller.set_mode("full")
         del args._profile_noise_ratio
         train_rows.append(
@@ -367,11 +378,15 @@ def main():
                 "residual_cache_time_s": cache_stats.elapsed_s,
                 "residual_cache_mb": cache_stats.cache_mb,
                 "cache_teacher_loss": cache_stats.teacher_loss,
-                "residual_loss_abs_diff": abs(float(loss.detach().cpu()) - cache_stats.teacher_loss)
-                if controller is not None else 0.0,
+                "residual_loss_abs_diff": (
+                    abs(float(loss.detach().cpu()) - cache_stats.teacher_loss)
+                    if controller is not None and args.residual_execution == "two_pass"
+                    else ""
+                ),
                 "replayable_blocks": cache_stats.replayable_blocks,
                 "fallback_blocks": cache_stats.fallback_blocks,
                 "fallback_block_names": cache_stats.fallback_names,
+                "residual_forward_max_abs_diff": cache_stats.max_reconstruction_abs_diff,
                 "cache_peak_cuda_mem_mb": cache_stats.peak_cuda_mem_mb,
                 "train_step_time_s": train_step_time_s,
                 "train_peak_cuda_mem_mb": train_peak_cuda_mem_mb,

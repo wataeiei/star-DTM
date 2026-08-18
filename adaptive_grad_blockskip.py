@@ -397,6 +397,57 @@ def _decode_residual(encoded: Any, refs: list[torch.Tensor]) -> Any:
     raise RuntimeError(f"Unknown residual encoding: {kind}")
 
 
+def _reconnect_residual(
+    output: Any,
+    refs: list[torch.Tensor],
+    used_refs: set[int],
+    residual_dtype: torch.dtype,
+) -> tuple[Any, int, float]:
+    """Reconnect a no-grad block output through an identity Jacobian."""
+    if torch.is_tensor(output):
+        matches = [
+            index
+            for index, ref in enumerate(refs)
+            if index not in used_refs and ref.shape == output.shape
+        ]
+        if not matches:
+            raise ValueError("Block output has no shape-compatible residual input.")
+        index = matches[0]
+        used_refs.add(index)
+        ref = refs[index]
+        delta = (
+            output.detach().float() - ref.detach().float()
+        ).to(dtype=residual_dtype)
+        rebuilt = (ref.float() + delta.float()).to(dtype=ref.dtype)
+        max_abs_diff = float(
+            (rebuilt.detach().float() - output.detach().float()).abs().max().cpu()
+        )
+        return rebuilt, delta.numel() * delta.element_size(), max_abs_diff
+    if isinstance(output, tuple):
+        values = [
+            _reconnect_residual(item, refs, used_refs, residual_dtype)
+            for item in output
+        ]
+        return (
+            tuple(item for item, _size, _diff in values),
+            sum(size for _item, size, _diff in values),
+            max((diff for _item, _size, diff in values), default=0.0),
+        )
+    if isinstance(output, list):
+        values = [
+            _reconnect_residual(item, refs, used_refs, residual_dtype)
+            for item in output
+        ]
+        return (
+            [item for item, _size, _diff in values],
+            sum(size for _item, size, _diff in values),
+            max((diff for _item, _size, diff in values), default=0.0),
+        )
+    if output is None or isinstance(output, (bool, int, float, str)):
+        return output, 0, 0.0
+    raise ValueError(f"Unsupported block output type for residual bypass: {type(output)}")
+
+
 class ResidualBlockWrapper(nn.Module):
     def __init__(self, name: str, block: nn.Module, controller: "ResidualBlockController"):
         super().__init__()
@@ -406,12 +457,38 @@ class ResidualBlockWrapper(nn.Module):
         self.cached = None
         self.cached_bytes = 0
         self.replayable = True
+        self.single_pass_used = False
+        self.single_pass_max_abs_diff = 0.0
 
     def forward(self, *args, **kwargs):
         selected = self.name in self.controller.skip_blocks
         if self.controller.mode == "skip" and selected and self.cached is not None and self.replayable:
             refs = _tensor_inputs(args, kwargs)
             return _decode_residual(self.cached, refs)
+
+        if self.controller.mode == "single_skip" and selected:
+            refs = _tensor_inputs(args, kwargs)
+            try:
+                with torch.no_grad():
+                    output = self.block(*args, **kwargs)
+                rebuilt, residual_bytes, max_abs_diff = _reconnect_residual(
+                    output,
+                    refs,
+                    set(),
+                    self.controller.cache_dtype,
+                )
+                self.cached_bytes = residual_bytes
+                self.replayable = True
+                self.single_pass_used = True
+                self.single_pass_max_abs_diff = max_abs_diff
+                return rebuilt
+            except ValueError as exc:
+                self.cached_bytes = 0
+                self.replayable = False
+                self.single_pass_used = False
+                self.single_pass_max_abs_diff = 0.0
+                self.controller.fallbacks[self.name] = str(exc)
+                return self.block(*args, **kwargs)
 
         output = self.block(*args, **kwargs)
         if self.controller.mode == "cache" and selected:
@@ -452,6 +529,7 @@ class CacheStats:
     teacher_loss: float = 0.0
     peak_cuda_mem_mb: float = 0.0
     fallback_names: str = ""
+    max_reconstruction_abs_diff: float = 0.0
 
 
 class ResidualBlockController:
@@ -486,9 +564,11 @@ class ResidualBlockController:
             wrapper.cached = None
             wrapper.cached_bytes = 0
             wrapper.replayable = True
+            wrapper.single_pass_used = False
+            wrapper.single_pass_max_abs_diff = 0.0
 
     def set_mode(self, mode: str) -> None:
-        if mode not in {"full", "cache", "skip"}:
+        if mode not in {"full", "cache", "skip", "single_skip"}:
             raise ValueError(f"Unknown block controller mode: {mode}")
         self.mode = mode
 
@@ -502,11 +582,23 @@ class ResidualBlockController:
         return CacheStats(
             elapsed_s=elapsed_s,
             cache_mb=sum(wrapper.cached_bytes for wrapper in selected) / (1024.0 ** 2),
-            replayable_blocks=sum(wrapper.replayable and wrapper.cached is not None for wrapper in selected),
+            replayable_blocks=sum(
+                wrapper.replayable
+                and (wrapper.cached is not None or wrapper.single_pass_used)
+                for wrapper in selected
+            ),
             fallback_blocks=sum(not wrapper.replayable for wrapper in selected),
             teacher_loss=teacher_loss,
             peak_cuda_mem_mb=peak_cuda_mem_mb,
             fallback_names=";".join(sorted(self.fallbacks)),
+            max_reconstruction_abs_diff=max(
+                (
+                    wrapper.single_pass_max_abs_diff
+                    for wrapper in selected
+                    if wrapper.single_pass_used
+                ),
+                default=0.0,
+            ),
         )
 
 

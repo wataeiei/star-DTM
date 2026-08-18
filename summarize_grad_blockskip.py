@@ -39,6 +39,7 @@ def main():
     replayable = numeric(rows, "replayable_blocks")
     skipped = numeric(rows, "skipped_block_count")
     loss_diff = numeric(rows, "residual_loss_abs_diff")
+    forward_diff = numeric(rows, "residual_forward_max_abs_diff")
     cache_time = numeric(rows, "residual_cache_time_s")
     train_time = numeric(rows, "train_step_time_s")
     train_peak = numeric(rows, "train_peak_cuda_mem_mb")
@@ -59,6 +60,8 @@ def main():
     print(f"total fallback block-events: {sum(fallbacks):.0f}")
     print(f"mean residual loss abs diff: {mean(loss_diff):.8g}")
     print(f"max residual loss abs diff: {max(loss_diff, default=0.0):.8g}")
+    if forward_diff:
+        print(f"max residual forward abs diff: {max(forward_diff):.8g}")
     print(f"mean cache time s: {mean(cache_time):.4f}")
     print(f"mean train step time s: {mean(train_time):.4f}")
     print(f"mean residual cache MB: {mean(cache_mb):.2f}")
