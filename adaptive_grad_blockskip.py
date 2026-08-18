@@ -187,9 +187,15 @@ def select_low_score_runs(
     max_run: int,
     max_runs: int,
     score_key: str = "normalized_grad_score",
+    excluded_blocks: Iterable[str] = (),
 ) -> list[str]:
     """Select exactly ``skip_count`` low-score blocks in a few contiguous runs."""
-    ordered = _score_rows(rows, train_step, noise_ratio)
+    excluded = set(excluded_blocks)
+    ordered = [
+        row
+        for row in _score_rows(rows, train_step, noise_ratio)
+        if str(row["block"]) not in excluded
+    ]
     count = min(max(int(skip_count), 0), len(ordered))
     if count == 0:
         return []
@@ -213,7 +219,12 @@ def select_low_score_runs(
         score = float(row[score_key])
         group_changed = (
             index > 0
-            and group_name(str(row["block"])) != group_name(str(ordered[index - 1]["block"]))
+            and (
+                group_name(str(row["block"]))
+                != group_name(str(ordered[index - 1]["block"]))
+                or int(row["block_index"])
+                != int(ordered[index - 1]["block_index"]) + 1
+            )
         )
         next_states: dict[tuple[int, int, int], tuple[float, tuple[int, ...]]] = {}
 

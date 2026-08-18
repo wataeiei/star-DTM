@@ -203,6 +203,10 @@ def main():
         "--fixed_skip_blocks", nargs="*", default=[],
         help="Explicit logical block names to skip on every step; overrides gradient selection.",
     )
+    parser.add_argument(
+        "--always_skip_blocks", nargs="*", default=[],
+        help="Mandatory blocks included in every dynamic skip set.",
+    )
     parser.add_argument("--residual_cache_device", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--residual_cache_dtype", choices=["fp16", "bf16", "fp32"], default="fp16")
     parser.add_argument(
@@ -227,6 +231,8 @@ def main():
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+    if args.fixed_skip_blocks and args.always_skip_blocks:
+        raise SystemExit("Use either --fixed_skip_blocks or --always_skip_blocks, not both.")
     if not 0.0 < args.patch_min_fraction <= args.patch_max_fraction <= 1.0:
         raise SystemExit("Require 0 < --patch_min_fraction <= --patch_max_fraction <= 1.")
     core.set_seed(args.seed)
@@ -269,10 +275,16 @@ def main():
         "fp32": torch.float32,
     }[args.residual_cache_dtype]
     controller = None
-    if args.blockskip_count > 0 or blockskip_schedule or args.fixed_skip_blocks:
-        unknown = sorted(set(args.fixed_skip_blocks) - set(block_names))
+    if (
+        args.blockskip_count > 0
+        or blockskip_schedule
+        or args.fixed_skip_blocks
+        or args.always_skip_blocks
+    ):
+        configured_blocks = set(args.fixed_skip_blocks) | set(args.always_skip_blocks)
+        unknown = sorted(configured_blocks - set(block_names))
         if unknown:
-            raise SystemExit("Unknown --fixed_skip_blocks: " + ", ".join(unknown))
+            raise SystemExit("Unknown explicitly configured blocks: " + ", ".join(unknown))
         block_paths = adaptive.infer_block_module_paths(
             (name for name, _module in core.iter_lora_modules(model)),
             block_names,
@@ -311,26 +323,34 @@ def main():
         requested_skip_count = 0
         cache_stats = adaptive.CacheStats(0.0, 0.0, 0, 0)
         if controller is not None:
-            requested_skip_count = (
-                len(args.fixed_skip_blocks)
-                if args.fixed_skip_blocks
-                else adaptive.noise_scheduled_int(
-                    noise_ratio, blockskip_schedule, args.blockskip_count
+            if args.fixed_skip_blocks:
+                requested_skip_count = len(args.fixed_skip_blocks)
+                skip_blocks = list(args.fixed_skip_blocks)
+            else:
+                mandatory = list(dict.fromkeys(args.always_skip_blocks))
+                requested_skip_count = max(
+                    len(mandatory),
+                    adaptive.noise_scheduled_int(
+                        noise_ratio, blockskip_schedule, args.blockskip_count
+                    ),
                 )
-            )
-            skip_blocks = (
-                list(args.fixed_skip_blocks)
-                if args.fixed_skip_blocks
-                else adaptive.select_low_score_runs(
-                    importance_rows,
-                    step,
-                    noise_ratio,
-                    requested_skip_count,
-                    args.blockskip_min_run,
-                    args.blockskip_max_run,
-                    args.blockskip_max_runs,
+                extra_count = requested_skip_count - len(mandatory)
+                extras = (
+                    adaptive.select_low_score_runs(
+                        importance_rows,
+                        step,
+                        noise_ratio,
+                        extra_count,
+                        args.blockskip_min_run,
+                        args.blockskip_max_run,
+                        max(1, args.blockskip_max_runs - 1),
+                        excluded_blocks=mandatory,
+                    )
+                    if extra_count > 0
+                    else []
                 )
-            )
+                selected = set(mandatory) | set(extras)
+                skip_blocks = [block for block in block_names if block in selected]
             controller.configure(skip_blocks)
             if args.residual_execution == "two_pass":
                 cache_stats = adaptive.populate_online_cache(
