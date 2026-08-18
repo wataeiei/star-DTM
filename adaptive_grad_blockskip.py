@@ -403,7 +403,7 @@ def _reconnect_residual(
     used_refs: set[int],
     residual_dtype: torch.dtype,
 ) -> tuple[Any, int, float]:
-    """Reconnect a no-grad block output through an identity Jacobian."""
+    """Return the exact no-grad value with an identity straight-through Jacobian."""
     if torch.is_tensor(output):
         matches = [
             index
@@ -415,14 +415,13 @@ def _reconnect_residual(
         index = matches[0]
         used_refs.add(index)
         ref = refs[index]
-        delta = (
-            output.detach().float() - ref.detach().float()
-        ).to(dtype=residual_dtype)
-        rebuilt = (ref.float() + delta.float()).to(dtype=ref.dtype)
+        # ref - ref.detach() is exactly zero in the forward pass but contributes
+        # an identity derivative. This avoids quantizing and storing a residual.
+        rebuilt = output.detach() + (ref - ref.detach())
         max_abs_diff = float(
             (rebuilt.detach().float() - output.detach().float()).abs().max().cpu()
         )
-        return rebuilt, delta.numel() * delta.element_size(), max_abs_diff
+        return rebuilt, 0, max_abs_diff
     if isinstance(output, tuple):
         values = [
             _reconnect_residual(item, refs, used_refs, residual_dtype)

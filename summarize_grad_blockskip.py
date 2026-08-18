@@ -58,8 +58,11 @@ def main():
     print(f"mean skipped blocks: {mean(skipped):.2f}")
     print(f"mean replayable blocks: {mean(replayable):.2f}")
     print(f"total fallback block-events: {sum(fallbacks):.0f}")
-    print(f"mean residual loss abs diff: {mean(loss_diff):.8g}")
-    print(f"max residual loss abs diff: {max(loss_diff, default=0.0):.8g}")
+    if loss_diff:
+        print(f"mean residual loss abs diff: {mean(loss_diff):.8g}")
+        print(f"max residual loss abs diff: {max(loss_diff):.8g}")
+    else:
+        print("residual loss abs diff: n/a (single-pass; no teacher loss)")
     if forward_diff:
         print(f"max residual forward abs diff: {max(forward_diff):.8g}")
     print(f"mean cache time s: {mean(cache_time):.4f}")
