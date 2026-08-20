@@ -750,13 +750,13 @@ python3 summarize_grad_blockskip.py \
   outputs/dit4sr_grad_blockskip_test/train_log.csv
 ```
 
-## Paper-grade held-out SR evaluation
+## Paper-grade held-out validation SR evaluation
 
 First confirm that the held-out directory exists and contains the expected 420 images:
 
 ```bash
 find data/ucmerced -maxdepth 2 -type d -print
-find data/ucmerced/test_hr -type f | wc -l
+find data/ucmerced/val_hr -type f | wc -l
 ```
 
 Evaluate every image in the held-out split. The SHA-256 audit stops the run before
@@ -767,9 +767,9 @@ python3 eval_hf_dit4sr_sr_metrics.py \
   --model_id acceptee/DiT4SR \
   --base_model_id stabilityai/stable-diffusion-3.5-medium \
   --variant dit4sr_q \
-  --data_dir data/ucmerced/test_hr \
+  --data_dir data/ucmerced/val_hr \
   --train_dir_for_overlap_check data/ucmerced/train_hr \
-  --output_dir outputs/dit4sr_sr_metrics_100_test420 \
+  --output_dir outputs/dit4sr_sr_metrics_100_val420 \
   --adapter All-LoRA=outputs/dit4sr_all_lora_100/lora_adapter.pt \
   --adapter Static-Tail-4-SinglePass=outputs/dit4sr_static_tail4_singlepass_100/lora_adapter.pt \
   --adapter Hybrid-SinglePass=outputs/dit4sr_hybrid_singlepass_100/lora_adapter.pt \
@@ -792,9 +792,9 @@ Generate paired confidence intervals and the paper-ready table:
 
 ```bash
 python3 analyze_sr_paper_results.py \
-  outputs/dit4sr_sr_metrics_100_test420/sr_metrics_per_image.csv \
-  --summary_csv outputs/dit4sr_sr_metrics_100_test420/sr_metrics_summary.csv \
-  --output_dir outputs/dit4sr_sr_metrics_100_test420/paper_analysis \
+  outputs/dit4sr_sr_metrics_100_val420/sr_metrics_per_image.csv \
+  --summary_csv outputs/dit4sr_sr_metrics_100_val420/sr_metrics_summary.csv \
+  --output_dir outputs/dit4sr_sr_metrics_100_val420/paper_analysis \
   --training_log All-LoRA=outputs/dit4sr_all_lora_100/train_log.csv \
   --training_log Static-Tail-4-SinglePass=outputs/dit4sr_static_tail4_singlepass_100/train_log.csv \
   --training_log Hybrid-SinglePass=outputs/dit4sr_hybrid_singlepass_100/train_log.csv \
