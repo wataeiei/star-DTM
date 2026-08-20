@@ -749,3 +749,66 @@ Summarize the short run:
 python3 summarize_grad_blockskip.py \
   outputs/dit4sr_grad_blockskip_test/train_log.csv
 ```
+
+## Paper-grade held-out SR evaluation
+
+First confirm that the held-out directory exists and contains the expected 420 images:
+
+```bash
+find data/ucmerced -maxdepth 2 -type d -print
+find data/ucmerced/test_hr -type f | wc -l
+```
+
+Evaluate every image in the held-out split. The SHA-256 audit stops the run before
+sampling if an evaluation image is duplicated in `train_hr`.
+
+```bash
+python3 eval_hf_dit4sr_sr_metrics.py \
+  --model_id acceptee/DiT4SR \
+  --base_model_id stabilityai/stable-diffusion-3.5-medium \
+  --variant dit4sr_q \
+  --data_dir data/ucmerced/test_hr \
+  --train_dir_for_overlap_check data/ucmerced/train_hr \
+  --output_dir outputs/dit4sr_sr_metrics_100_test420 \
+  --adapter All-LoRA=outputs/dit4sr_all_lora_100/lora_adapter.pt \
+  --adapter Static-Tail-4-SinglePass=outputs/dit4sr_static_tail4_singlepass_100/lora_adapter.pt \
+  --adapter Hybrid-SinglePass=outputs/dit4sr_hybrid_singlepass_100/lora_adapter.pt \
+  --adapter Noise-Aware-SinglePass=outputs/dit4sr_noiseaware_singlepass_100/lora_adapter.pt \
+  --image_size 256 \
+  --max_images 0 \
+  --sr_scale 4 \
+  --num_inference_steps 20 \
+  --eval_seed 4242 \
+  --crop_border 4 \
+  --color_fix adain \
+  --dtype bf16 \
+  --target qv \
+  --rank 8 \
+  --alpha 16 \
+  --no-save_images
+```
+
+Generate paired confidence intervals and the paper-ready table:
+
+```bash
+python3 analyze_sr_paper_results.py \
+  outputs/dit4sr_sr_metrics_100_test420/sr_metrics_per_image.csv \
+  --summary_csv outputs/dit4sr_sr_metrics_100_test420/sr_metrics_summary.csv \
+  --output_dir outputs/dit4sr_sr_metrics_100_test420/paper_analysis \
+  --training_log All-LoRA=outputs/dit4sr_all_lora_100/train_log.csv \
+  --training_log Static-Tail-4-SinglePass=outputs/dit4sr_static_tail4_singlepass_100/train_log.csv \
+  --training_log Hybrid-SinglePass=outputs/dit4sr_hybrid_singlepass_100/train_log.csv \
+  --training_log Noise-Aware-SinglePass=outputs/dit4sr_noiseaware_singlepass_100/train_log.csv \
+  --training_baseline_method All-LoRA \
+  --bootstrap_samples 10000 \
+  --confidence 0.95 \
+  --seed 2026 \
+  --min_images 420
+```
+
+The main outputs are:
+
+- `paper_ready_table.csv`: quality, gain retention, timing, memory, and adapter size;
+- `paper_ready_table.md`: a compact table for the manuscript draft;
+- `paired_comparisons.csv`: paired deltas, confidence intervals, win rates, and p-values;
+- `analysis_metadata.json`: statistical settings and image-set consistency checks.

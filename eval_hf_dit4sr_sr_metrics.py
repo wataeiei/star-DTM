@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import inspect
 import json
 import math
@@ -48,6 +49,53 @@ def reset_lora_to_base(transformer: torch.nn.Module) -> None:
 
 def safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "method"
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def audit_train_eval_overlap(
+    train_dir: str, eval_paths: list[Path], allow_overlap: bool
+) -> dict:
+    if not train_dir:
+        return {"enabled": False}
+    train_paths = [Path(path) for path in core.list_images(train_dir)]
+    train_hashes: dict[str, list[str]] = {}
+    for path in train_paths:
+        train_hashes.setdefault(file_sha256(path), []).append(str(path))
+
+    overlaps = []
+    for path in eval_paths:
+        digest = file_sha256(Path(path))
+        if digest in train_hashes:
+            overlaps.append(
+                {
+                    "eval_image": str(path),
+                    "train_images": train_hashes[digest],
+                    "sha256": digest,
+                }
+            )
+    report = {
+        "enabled": True,
+        "train_dir": train_dir,
+        "num_train_images": len(train_paths),
+        "num_eval_images": len(eval_paths),
+        "num_overlapping_eval_images": len(overlaps),
+        "overlaps": overlaps,
+    }
+    if overlaps and not allow_overlap:
+        examples = ", ".join(item["eval_image"] for item in overlaps[:3])
+        raise SystemExit(
+            f"Found {len(overlaps)} evaluation images duplicated in the training set "
+            f"(examples: {examples}). Use a disjoint test set, or pass --allow_overlap "
+            f"only for an explicitly labeled training-set diagnostic."
+        )
+    return report
 
 
 def pil_to_tensor(image: Image.Image, size: int) -> torch.Tensor:
@@ -237,6 +285,9 @@ def summarize(
     for method in methods:
         selected = [row for row in rows if row["method"] == method]
         numeric_lpips = [float(row["lpips"]) for row in selected if row["lpips"] != ""]
+        total_inference_time = sum(
+            float(row["inference_time_s"]) for row in selected
+        )
         summaries.append(
             {
                 "method": method,
@@ -244,9 +295,11 @@ def summarize(
                 "mean_psnr": sum(float(row["psnr"]) for row in selected) / len(selected),
                 "mean_ssim": sum(float(row["ssim"]) for row in selected) / len(selected),
                 "mean_lpips": sum(numeric_lpips) / len(numeric_lpips) if numeric_lpips else "",
-                "mean_inference_time_s": sum(float(row["inference_time_s"]) for row in selected) / len(selected),
-                "images_per_hour": 3600.0 * len(selected) / max(
-                    sum(float(row["inference_time_s"]) for row in selected), 1e-9
+                "mean_inference_time_s": total_inference_time / len(selected),
+                "images_per_hour": (
+                    3600.0 * len(selected) / total_inference_time
+                    if total_inference_time > 0
+                    else ""
                 ),
                 "peak_cuda_mem_mb": max(float(row["peak_cuda_mem_mb"]) for row in selected),
                 "adapter_size_mb": adapter_sizes_mb.get(method, 0.0),
@@ -274,6 +327,16 @@ def main() -> None:
     parser.add_argument("--transformer_subfolder", default="")
     parser.add_argument("--component_name", default="")
     parser.add_argument("--data_dir", required=True)
+    parser.add_argument(
+        "--train_dir_for_overlap_check",
+        default="",
+        help="Optional training directory used for a SHA-256 leakage check.",
+    )
+    parser.add_argument(
+        "--allow_overlap",
+        action="store_true",
+        help="Allow train/eval duplicates for explicitly labeled diagnostics.",
+    )
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--adapter", action="append", type=parse_adapter, default=[])
     parser.add_argument("--image_size", type=int, default=256)
@@ -330,6 +393,16 @@ def main() -> None:
         paths = paths[: args.max_images]
     if not paths:
         raise SystemExit(f"No images found in {args.data_dir}")
+    overlap_audit = audit_train_eval_overlap(
+        args.train_dir_for_overlap_check, [Path(path) for path in paths], args.allow_overlap
+    )
+    if overlap_audit.get("enabled"):
+        print(
+            "Dataset overlap audit: "
+            f"train={overlap_audit['num_train_images']} "
+            f"eval={overlap_audit['num_eval_images']} "
+            f"overlap={overlap_audit['num_overlapping_eval_images']}"
+        )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -440,6 +513,7 @@ def main() -> None:
         "base_model_id": args.base_model_id,
         "variant": args.variant,
         "data_dir": args.data_dir,
+        "dataset_overlap_audit": overlap_audit,
         "image_size": args.image_size,
         "sr_scale": args.sr_scale,
         "num_inference_steps": args.num_inference_steps,
