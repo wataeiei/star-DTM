@@ -759,6 +759,11 @@ find data/ucmerced -maxdepth 2 -type d -print
 find data/ucmerced/val_hr -type f | wc -l
 ```
 
+The exported split contains 420 files, but `val_0418.png` is byte-identical to
+one training image. Exclude it from results produced with the existing checkpoints,
+leaving 419 independent validation images. Before final retraining, deduplicate the
+dataset export (and inspect the source indices) before regenerating the split.
+
 Evaluate every image in the held-out split. The SHA-256 audit stops the run before
 sampling if an evaluation image is duplicated in `train_hr`.
 
@@ -769,7 +774,8 @@ python3 eval_hf_dit4sr_sr_metrics.py \
   --variant dit4sr_q \
   --data_dir data/ucmerced/val_hr \
   --train_dir_for_overlap_check data/ucmerced/train_hr \
-  --output_dir outputs/dit4sr_sr_metrics_100_val420 \
+  --exclude_image val_0418.png \
+  --output_dir outputs/dit4sr_sr_metrics_100_val419 \
   --adapter All-LoRA=outputs/dit4sr_all_lora_100/lora_adapter.pt \
   --adapter Static-Tail-4-SinglePass=outputs/dit4sr_static_tail4_singlepass_100/lora_adapter.pt \
   --adapter Hybrid-SinglePass=outputs/dit4sr_hybrid_singlepass_100/lora_adapter.pt \
@@ -792,9 +798,9 @@ Generate paired confidence intervals and the paper-ready table:
 
 ```bash
 python3 analyze_sr_paper_results.py \
-  outputs/dit4sr_sr_metrics_100_val420/sr_metrics_per_image.csv \
-  --summary_csv outputs/dit4sr_sr_metrics_100_val420/sr_metrics_summary.csv \
-  --output_dir outputs/dit4sr_sr_metrics_100_val420/paper_analysis \
+  outputs/dit4sr_sr_metrics_100_val419/sr_metrics_per_image.csv \
+  --summary_csv outputs/dit4sr_sr_metrics_100_val419/sr_metrics_summary.csv \
+  --output_dir outputs/dit4sr_sr_metrics_100_val419/paper_analysis \
   --training_log All-LoRA=outputs/dit4sr_all_lora_100/train_log.csv \
   --training_log Static-Tail-4-SinglePass=outputs/dit4sr_static_tail4_singlepass_100/train_log.csv \
   --training_log Hybrid-SinglePass=outputs/dit4sr_hybrid_singlepass_100/train_log.csv \
@@ -803,7 +809,7 @@ python3 analyze_sr_paper_results.py \
   --bootstrap_samples 10000 \
   --confidence 0.95 \
   --seed 2026 \
-  --min_images 420
+  --min_images 419
 ```
 
 The main outputs are:

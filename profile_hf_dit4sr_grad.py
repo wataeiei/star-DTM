@@ -225,6 +225,7 @@ class LoRALinear(nn.Module):
         self.rank = rank
         self.alpha = alpha
         self.scale = alpha / rank
+        self.lora_enabled = True
         self.lora_down = nn.Linear(base.in_features, rank, bias=False)
         self.lora_up = nn.Linear(rank, base.out_features, bias=False)
         device = base.weight.device
@@ -237,6 +238,8 @@ class LoRALinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base_out = self.base(x)
+        if not self.lora_enabled:
+            return base_out
         lora_out = self.lora_up(self.lora_down(x.float())) * self.scale
         return base_out + lora_out.to(dtype=base_out.dtype)
 

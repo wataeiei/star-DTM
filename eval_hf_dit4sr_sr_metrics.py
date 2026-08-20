@@ -45,6 +45,16 @@ def reset_lora_to_base(transformer: torch.nn.Module) -> None:
     for _name, module in core.iter_lora_modules(transformer):
         module.lora_down.weight.data.zero_()
         module.lora_up.weight.data.zero_()
+        module.lora_enabled = False
+
+
+def enable_nonzero_lora(transformer: torch.nn.Module) -> int:
+    active = 0
+    for _name, module in core.iter_lora_modules(transformer):
+        enabled = bool(torch.count_nonzero(module.lora_up.weight).item())
+        module.lora_enabled = enabled
+        active += int(enabled)
+    return active
 
 
 def safe_name(value: str) -> str:
@@ -328,6 +338,12 @@ def main() -> None:
     parser.add_argument("--component_name", default="")
     parser.add_argument("--data_dir", required=True)
     parser.add_argument(
+        "--exclude_image",
+        action="append",
+        default=[],
+        help="Exclude an evaluation image by basename or full path; repeat as needed.",
+    )
+    parser.add_argument(
         "--train_dir_for_overlap_check",
         default="",
         help="Optional training directory used for a SHA-256 leakage check.",
@@ -388,7 +404,25 @@ def main() -> None:
     injected = core.inject_lora(transformer, args.target, args.rank, args.alpha, args.block_regex)
     transformer.eval()
 
-    paths = core.list_images(args.data_dir)
+    all_paths = [Path(path) for path in core.list_images(args.data_dir)]
+    excluded_tokens = set(args.exclude_image)
+    excluded_paths = [
+        path for path in all_paths
+        if str(path) in excluded_tokens or path.name in excluded_tokens
+    ]
+    matched_tokens = {
+        token for token in excluded_tokens
+        if any(str(path) == token or path.name == token for path in excluded_paths)
+    }
+    unmatched_tokens = sorted(excluded_tokens - matched_tokens)
+    if unmatched_tokens:
+        raise SystemExit(f"--exclude_image did not match: {unmatched_tokens}")
+    paths = [path for path in all_paths if path not in set(excluded_paths)]
+    if excluded_paths:
+        print(
+            "Excluded evaluation images: "
+            + ", ".join(str(path) for path in excluded_paths)
+        )
     if args.max_images > 0:
         paths = paths[: args.max_images]
     if not paths:
@@ -438,7 +472,12 @@ def main() -> None:
                     f"{method}: adapter mismatch: missing={report['missing'][:5]} "
                     f"unexpected={report['unexpected'][:5]}"
                 )
+            report["active_lora_modules"] = enable_nonzero_lora(transformer)
             load_reports[method] = report
+            print(
+                f"{method}: active LoRA modules="
+                f"{report['active_lora_modules']}/{len(injected)}"
+            )
 
         if args.warmup_images > 0:
             warm_hr = pil_to_tensor(Image.open(paths[0]), args.image_size)
@@ -513,6 +552,7 @@ def main() -> None:
         "base_model_id": args.base_model_id,
         "variant": args.variant,
         "data_dir": args.data_dir,
+        "excluded_images": [str(path) for path in excluded_paths],
         "dataset_overlap_audit": overlap_audit,
         "image_size": args.image_size,
         "sr_scale": args.sr_scale,
