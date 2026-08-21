@@ -275,15 +275,32 @@ def main():
     optimizer = torch.optim.AdamW(params, lr=args.lr)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    experiment_start = time.perf_counter()
+    profiling_time_s = 0.0
+    checkpoint_time_s = 0.0
+    max_cuda_mem_mb = 0.0
+    max_cuda_reserved_mb = 0.0
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
     profile_steps = {step for step in args.profile_steps if 0 <= step <= args.train_steps}
     profile_steps.update({0, args.train_steps})
     if any(not 0.0 <= ratio <= 1.0 for ratio in args.profile_noise_ratios):
         raise SystemExit("--profile_noise_ratios values must be in [0, 1].")
     importance_rows = []
     for ratio in args.profile_noise_ratios:
+        profile_start = time.perf_counter()
         importance_rows.extend(
             profile_importance(pipe, transformer, profile_loader, args, device, 0, ratio)
         )
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+            max_cuda_mem_mb = max(
+                max_cuda_mem_mb, torch.cuda.max_memory_allocated() / (1024.0 ** 2)
+            )
+            max_cuda_reserved_mb = max(
+                max_cuda_reserved_mb, torch.cuda.max_memory_reserved() / (1024.0 ** 2)
+            )
+        profiling_time_s += time.perf_counter() - profile_start
     block_names = [
         row["block"]
         for row in sorted(importance_rows, key=lambda row: int(row["block_index"]))
@@ -398,6 +415,15 @@ def main():
             if device.type == "cuda"
             else 0.0
         )
+        train_peak_cuda_reserved_mb = (
+            torch.cuda.max_memory_reserved() / (1024.0 ** 2)
+            if device.type == "cuda"
+            else 0.0
+        )
+        max_cuda_mem_mb = max(max_cuda_mem_mb, train_peak_cuda_mem_mb)
+        max_cuda_reserved_mb = max(
+            max_cuda_reserved_mb, train_peak_cuda_reserved_mb
+        )
         if controller is not None:
             if args.residual_execution == "single_pass":
                 cache_stats = controller.stats(0.0)
@@ -427,6 +453,7 @@ def main():
             "cache_peak_cuda_mem_mb": cache_stats.peak_cuda_mem_mb,
             "train_step_time_s": train_step_time_s,
             "train_peak_cuda_mem_mb": train_peak_cuda_mem_mb,
+            "train_peak_cuda_reserved_mb": train_peak_cuda_reserved_mb,
         })
         if step % args.log_every == 0 or step == 1:
             print(
@@ -438,9 +465,21 @@ def main():
                 controller.set_mode("full")
             current = []
             for ratio in args.profile_noise_ratios:
+                profile_start = time.perf_counter()
                 current.extend(
                     profile_importance(pipe, transformer, profile_loader, args, device, step, ratio)
                 )
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                    max_cuda_mem_mb = max(
+                        max_cuda_mem_mb,
+                        torch.cuda.max_memory_allocated() / (1024.0 ** 2),
+                    )
+                    max_cuda_reserved_mb = max(
+                        max_cuda_reserved_mb,
+                        torch.cuda.max_memory_reserved() / (1024.0 ** 2),
+                    )
+                profiling_time_s += time.perf_counter() - profile_start
             importance_rows.extend(current)
             write_csv(output_dir / "lora_importance_evolution.csv", importance_rows)
             write_csv(output_dir / "lora_importance_topk.csv", topk_summary(importance_rows))
@@ -457,20 +496,40 @@ def main():
         ):
             write_csv(output_dir / "train_log.csv", train_rows)
             checkpoint_path = output_dir / f"lora_adapter_step_{step:05d}.pt"
+            checkpoint_start = time.perf_counter()
             adaptive.save_lora_adapter(transformer, checkpoint_path)
+            checkpoint_time_s += time.perf_counter() - checkpoint_start
             print(f"Saved checkpoint to {checkpoint_path}")
 
     write_csv(output_dir / "train_log.csv", train_rows)
+    checkpoint_start = time.perf_counter()
     adapter_summary = adaptive.save_lora_adapter(
         transformer, output_dir / "lora_adapter.pt"
     )
+    checkpoint_time_s += time.perf_counter() - checkpoint_start
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    experiment_time_s = time.perf_counter() - experiment_start
+    train_step_time_s = sum(float(row["train_step_time_s"]) for row in train_rows)
+    summary = {
+        "train_steps": args.train_steps,
+        "train_step_time_s": train_step_time_s,
+        "mean_train_step_time_s": train_step_time_s / max(len(train_rows), 1),
+        "experiment_time_s": experiment_time_s,
+        "profiling_time_s": profiling_time_s,
+        "checkpoint_time_s": checkpoint_time_s,
+        "non_train_overhead_s": max(0.0, experiment_time_s - train_step_time_s),
+        "peak_cuda_mem_mb": max_cuda_mem_mb,
+        "peak_cuda_reserved_mb": max_cuda_reserved_mb,
+    } | adapter_summary
+    write_csv(output_dir / "summary.csv", [summary])
     metadata = vars(args) | {
         "parsed_blockskip_schedule": blockskip_schedule,
         "profile_steps": sorted(profile_steps),
         "injected_module_count": len(injected),
         "model": "DiT4SR-HF",
         "objective": args.loss_mode,
-    } | adapter_summary
+    } | summary
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(f"Wrote results to {output_dir}")
 
