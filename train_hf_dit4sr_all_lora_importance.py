@@ -34,6 +34,61 @@ def batch_loss(pipe, transformer, batch, args, device):
     return core.flow_matching_batch_loss(pipe, transformer, batch, args, device)
 
 
+def candidate_lora_blocks(transformer, target, block_regex):
+    blocks = set()
+    for name, module in transformer.named_modules():
+        block = core.block_key(name, block_regex)
+        if isinstance(module, torch.nn.Linear) and block and core.target_match(name, target):
+            blocks.add(block)
+    return sorted(blocks, key=core.natural_key)
+
+
+def evenly_spaced_blocks(blocks, count):
+    if count >= len(blocks):
+        return list(blocks)
+    if count == 1:
+        return [blocks[len(blocks) // 2]]
+    indices = [round(index * (len(blocks) - 1) / (count - 1)) for index in range(count)]
+    return [blocks[index] for index in indices]
+
+
+def select_lora_blocks(args, candidates):
+    if args.lora_selection == "all":
+        return list(candidates)
+    count = args.lora_block_budget or args.topk_blocks
+    if not 0 < count <= len(candidates):
+        raise SystemExit(
+            f"LoRA block budget must be in [1, {len(candidates)}], got {count}."
+        )
+    if args.lora_selection == "random":
+        return sorted(
+            random.Random(args.lora_selection_seed).sample(candidates, count),
+            key=core.natural_key,
+        )
+    if args.lora_selection == "uniform":
+        return evenly_spaced_blocks(candidates, count)
+    if args.lora_selection == "sandwich":
+        shallow = (count + 1) // 2
+        deep = count - shallow
+        return candidates[:shallow] + (candidates[-deep:] if deep else [])
+    if not args.lora_selection_file:
+        raise SystemExit("--lora_selection metadata requires --lora_selection_file.")
+    payload = json.loads(Path(args.lora_selection_file).read_text(encoding="utf-8"))
+    selected = payload.get("selected_blocks")
+    if not isinstance(selected, list) or not selected:
+        raise SystemExit(
+            f"{args.lora_selection_file} does not contain a non-empty selected_blocks list."
+        )
+    unknown = sorted(set(selected) - set(candidates), key=core.natural_key)
+    if unknown:
+        raise SystemExit("Unknown blocks in selection metadata: " + ", ".join(unknown))
+    if len(selected) != count:
+        raise SystemExit(
+            f"Selection metadata contains {len(selected)} blocks but budget is {count}."
+        )
+    return sorted(set(selected), key=core.natural_key)
+
+
 def profile_importance(pipe, transformer, loader, args, device, train_step, noise_ratio):
     cpu_state = torch.random.get_rng_state()
     cuda_state = torch.cuda.get_rng_state_all() if device.type == "cuda" else None
@@ -185,11 +240,34 @@ def main():
     parser.add_argument("--profile_steps", type=int, nargs="+", default=[0, 100, 250, 500, 750, 1000])
     parser.add_argument("--profile_batches", type=int, default=5)
     parser.add_argument(
+        "--disable_profiling",
+        action="store_true",
+        help="Skip in-training importance scans; use for fair selection-only timing.",
+    )
+    parser.add_argument(
         "--profile_noise_ratios", type=float, nargs="+",
         default=[0.05, 0.2, 0.4, 0.6, 0.8, 0.95],
         help="Target flow sigmas to scan at every profile step.",
     )
     parser.add_argument("--topk_blocks", type=int, default=8)
+    parser.add_argument(
+        "--lora_selection",
+        choices=["all", "random", "uniform", "sandwich", "metadata"],
+        default="all",
+        help="Choose which logical blocks receive trainable LoRA modules.",
+    )
+    parser.add_argument(
+        "--lora_block_budget",
+        type=int,
+        default=0,
+        help="Number of selected blocks; 0 uses --topk_blocks.",
+    )
+    parser.add_argument(
+        "--lora_selection_file",
+        default="",
+        help="Profiler metadata JSON containing selected_blocks for metadata selection.",
+    )
+    parser.add_argument("--lora_selection_seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--grad_clip", type=float, default=1.0)
@@ -266,7 +344,24 @@ def main():
     pipe = core.load_pipe(args, device)
     transformer = core.get_transformer(pipe, args.component_name)
     transformer.requires_grad_(False)
-    injected = core.inject_lora(transformer, args.target, args.rank, args.alpha, args.block_regex)
+    candidate_blocks = candidate_lora_blocks(transformer, args.target, args.block_regex)
+    if not candidate_blocks:
+        raise SystemExit("No candidate LoRA blocks found.")
+    selected_lora_blocks = select_lora_blocks(args, candidate_blocks)
+    injected = core.inject_lora(
+        transformer,
+        args.target,
+        args.rank,
+        args.alpha,
+        args.block_regex,
+        selected_blocks=set(selected_lora_blocks),
+    )
+    print(
+        f"LoRA selection={args.lora_selection} "
+        f"blocks={len(selected_lora_blocks)}/{len(candidate_blocks)} "
+        f"modules={len(injected)}"
+    )
+    print("Selected LoRA blocks: " + ", ".join(selected_lora_blocks))
     transformer.train()
     dataset = core.ImageFolderDataset(args.data_dir, args.image_size, args.max_images)
     train_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
@@ -284,28 +379,33 @@ def main():
         torch.cuda.reset_peak_memory_stats()
     profile_steps = {step for step in args.profile_steps if 0 <= step <= args.train_steps}
     profile_steps.update({0, args.train_steps})
+    if args.disable_profiling:
+        profile_steps.clear()
     if any(not 0.0 <= ratio <= 1.0 for ratio in args.profile_noise_ratios):
         raise SystemExit("--profile_noise_ratios values must be in [0, 1].")
     importance_rows = []
-    for ratio in args.profile_noise_ratios:
-        profile_start = time.perf_counter()
-        importance_rows.extend(
-            profile_importance(pipe, transformer, profile_loader, args, device, 0, ratio)
-        )
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-            max_cuda_mem_mb = max(
-                max_cuda_mem_mb, torch.cuda.max_memory_allocated() / (1024.0 ** 2)
+    if not args.disable_profiling:
+        for ratio in args.profile_noise_ratios:
+            profile_start = time.perf_counter()
+            importance_rows.extend(
+                profile_importance(pipe, transformer, profile_loader, args, device, 0, ratio)
             )
-            max_cuda_reserved_mb = max(
-                max_cuda_reserved_mb, torch.cuda.max_memory_reserved() / (1024.0 ** 2)
-            )
-        profiling_time_s += time.perf_counter() - profile_start
-    block_names = [
-        row["block"]
-        for row in sorted(importance_rows, key=lambda row: int(row["block_index"]))
-        if float(row["noise_ratio"]) == float(args.profile_noise_ratios[0])
-    ]
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+                max_cuda_mem_mb = max(
+                    max_cuda_mem_mb, torch.cuda.max_memory_allocated() / (1024.0 ** 2)
+                )
+                max_cuda_reserved_mb = max(
+                    max_cuda_reserved_mb, torch.cuda.max_memory_reserved() / (1024.0 ** 2)
+                )
+            profiling_time_s += time.perf_counter() - profile_start
+        block_names = [
+            row["block"]
+            for row in sorted(importance_rows, key=lambda row: int(row["block_index"]))
+            if float(row["noise_ratio"]) == float(args.profile_noise_ratios[0])
+        ]
+    else:
+        block_names = list(selected_lora_blocks)
     cache_dtype = {
         "fp16": torch.float16,
         "bf16": torch.bfloat16,
@@ -318,6 +418,11 @@ def main():
         or args.fixed_skip_blocks
         or args.always_skip_blocks
     ):
+        if args.disable_profiling and not args.fixed_skip_blocks:
+            raise SystemExit(
+                "Dynamic block skipping requires profiling; remove --disable_profiling "
+                "or use --fixed_skip_blocks."
+            )
         configured_blocks = set(args.fixed_skip_blocks) | set(args.always_skip_blocks)
         unknown = sorted(configured_blocks - set(block_names))
         if unknown:
@@ -527,6 +632,8 @@ def main():
         "parsed_blockskip_schedule": blockskip_schedule,
         "profile_steps": sorted(profile_steps),
         "injected_module_count": len(injected),
+        "candidate_lora_blocks": candidate_blocks,
+        "selected_lora_blocks": selected_lora_blocks,
         "model": "DiT4SR-HF",
         "objective": args.loss_mode,
     } | summary

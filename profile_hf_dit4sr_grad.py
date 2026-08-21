@@ -332,10 +332,23 @@ def iter_lora_modules(root: nn.Module) -> Iterable[tuple[str, LoRALinear]]:
             yield name, module
 
 
-def inject_lora(root: nn.Module, target: str, rank: int, alpha: int, block_regex: str) -> list[str]:
+def inject_lora(
+    root: nn.Module,
+    target: str,
+    rank: int,
+    alpha: int,
+    block_regex: str,
+    selected_blocks: set[str] | None = None,
+) -> list[str]:
     replacements = []
     for name, module in root.named_modules():
-        if isinstance(module, nn.Linear) and block_key(name, block_regex) and target_match(name, target):
+        block = block_key(name, block_regex)
+        if (
+            isinstance(module, nn.Linear)
+            and block
+            and target_match(name, target)
+            and (selected_blocks is None or block in selected_blocks)
+        ):
             replacements.append((name, module))
     if not replacements:
         raise SystemExit("No target Linear modules found. Run --inspect_only to check module names.")

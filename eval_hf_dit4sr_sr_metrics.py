@@ -380,6 +380,11 @@ def main() -> None:
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--adapter", action="append", type=parse_adapter, default=[])
     parser.add_argument(
+        "--allow_sparse_adapter",
+        action="store_true",
+        help="Allow an adapter to omit injected LoRA modules; omitted modules remain disabled.",
+    )
+    parser.add_argument(
         "--parallel_adapter",
         action="append",
         type=parse_adapter,
@@ -515,7 +520,9 @@ def main() -> None:
         parallel_controller = None
         if method_type == "lora" and adapter_path is not None:
             report = adaptive.load_lora_adapter(transformer, adapter_path)
-            if report["missing"] or report["unexpected"]:
+            if report["missing"] or (
+                report["unexpected"] and not args.allow_sparse_adapter
+            ):
                 raise RuntimeError(
                     f"{method}: adapter mismatch: missing={report['missing'][:5]} "
                     f"unexpected={report['unexpected'][:5]}"
@@ -526,6 +533,11 @@ def main() -> None:
                 f"{method}: active LoRA modules="
                 f"{report['active_lora_modules']}/{len(injected)}"
             )
+            if report["unexpected"]:
+                print(
+                    f"{method}: sparse adapter leaves "
+                    f"{len(report['unexpected'])} injected modules disabled"
+                )
         elif method_type == "parallel" and adapter_path is not None:
             parallel_controller, report = parallel.load_parallel_adapter(
                 transformer, adapter_path, device
