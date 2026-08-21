@@ -484,10 +484,18 @@ def main() -> None:
     load_reports = {}
 
     bicubic_rows = []
+    bicubic_dir = output_dir / "images" / safe_name("Bicubic")
+    if args.save_images:
+        bicubic_dir.mkdir(parents=True, exist_ok=True)
     for image_index, path in enumerate(paths):
         hr = pil_to_tensor(Image.open(path), args.image_size)
         _lr, bicubic = make_lr_condition(hr, args.sr_scale)
         metric_hr, metric_bicubic = crop(hr, args.crop_border), crop(bicubic, args.crop_border)
+        bicubic_output_path = ""
+        if args.save_images:
+            bicubic_output_path_obj = bicubic_dir / f"{image_index:04d}_{path.stem}.png"
+            tensor_to_pil(bicubic).save(bicubic_output_path_obj)
+            bicubic_output_path = str(bicubic_output_path_obj)
         bicubic_rows.append(
             {
                 "method": "Bicubic",
@@ -497,7 +505,7 @@ def main() -> None:
                 "lpips": lpips_score(lpips_model, bicubic, hr, args.lpips_device),
                 "inference_time_s": 0.0,
                 "peak_cuda_mem_mb": 0.0,
-                "output_path": "",
+                "output_path": bicubic_output_path,
             }
         )
     image_rows.extend(bicubic_rows)
