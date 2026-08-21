@@ -818,3 +818,81 @@ The main outputs are:
 - `paper_ready_table.md`: a compact table for the manuscript draft;
 - `paired_comparisons.csv`: paired deltas, confidence intervals, win rates, and p-values;
 - `analysis_metadata.json`: statistical settings and image-set consistency checks.
+
+## Noise-conditioned Grad-TopK Parallel Adapter
+
+This PAC-inspired variant keeps the official DiT4SR backbone frozen and runs it
+under `torch.no_grad()`. Detached image tokens from every transformer block feed
+a narrow parallel side network. Two high-importance anchor blocks are always
+active, while the remaining active adapters are selected from the nearest
+official-flow noise bucket. The side head is zero-initialized, so step zero is
+exactly the base DiT4SR prediction.
+
+The importance input must come from the official FlowMatch All-LoRA evolution
+experiment, not from the older proxy-loss profiler. Start with a 20-step smoke
+test:
+
+```bash
+python3 train_hf_dit4sr_parallel_adapter.py \
+  --model_id acceptee/DiT4SR \
+  --base_model_id stabilityai/stable-diffusion-3.5-medium \
+  --variant dit4sr_q \
+  --data_dir data/ucmerced/train_hr \
+  --importance_csv outputs/dit4sr_official_all_lora_evolution_1000/lora_importance_evolution.csv \
+  --importance_train_step 0 \
+  --output_dir outputs/dit4sr_noise_parallel_top8_20 \
+  --image_size 256 \
+  --active_topk 8 \
+  --anchor_count 2 \
+  --side_dim 104 \
+  --side_mlp_ratio 2 \
+  --side_conv \
+  --train_noise_ratios 0.05 0.2 0.4 0.6 0.8 0.95 \
+  --train_steps 20 \
+  --batch_size 1 \
+  --lr 1e-4 \
+  --grad_clip 1.0 \
+  --dtype bf16 \
+  --seed 42 \
+  --power_w 30
+```
+
+Inspect training integrity and resource use:
+
+```bash
+head outputs/dit4sr_noise_parallel_top8_20/train_log.csv
+tail outputs/dit4sr_noise_parallel_top8_20/train_log.csv
+cat outputs/dit4sr_noise_parallel_top8_20/summary.csv
+cat outputs/dit4sr_noise_parallel_top8_20/metadata.json
+```
+
+Run a quick 20-image SR comparison against the matching All-LoRA checkpoint:
+
+```bash
+python3 eval_hf_dit4sr_sr_metrics.py \
+  --model_id acceptee/DiT4SR \
+  --base_model_id stabilityai/stable-diffusion-3.5-medium \
+  --variant dit4sr_q \
+  --data_dir data/ucmerced/val_hr \
+  --train_dir_for_overlap_check data/ucmerced/train_hr \
+  --exclude_image val_0418.png \
+  --output_dir outputs/dit4sr_noise_parallel_top8_20_eval \
+  --adapter All-LoRA=outputs/dit4sr_all_lora_baseline_20/lora_adapter.pt \
+  --parallel_adapter Noise-Parallel-Top8=outputs/dit4sr_noise_parallel_top8_20/parallel_adapter.pt \
+  --image_size 256 \
+  --max_images 20 \
+  --sr_scale 4 \
+  --num_inference_steps 20 \
+  --eval_seed 4242 \
+  --crop_border 4 \
+  --color_fix adain \
+  --dtype bf16 \
+  --target qv \
+  --rank 8 \
+  --alpha 16 \
+  --no-save_images
+```
+
+For a first run, verify that every row has `active_block_count=8`, the loss and
+gradient norm are finite, and `parallel_adapter.pt` is close to the intended
+parameter budget. Only then increase `--train_steps` to 100 or 1000.

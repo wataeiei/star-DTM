@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate DiT4SR LoRA adapters with deterministic end-to-end SR sampling."""
+"""Evaluate DiT4SR LoRA or Parallel Adapters with deterministic SR sampling."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 
 import adaptive_grad_blockskip as adaptive
+import dit4sr_parallel_adapter as parallel
 import profile_hf_dit4sr_grad as core
 
 
@@ -157,6 +158,8 @@ def inference_forward(
     timestep: torch.Tensor,
     prompt_embeds: torch.Tensor,
     pooled_prompt_embeds: torch.Tensor,
+    parallel_adapter=None,
+    noise_ratio: float = 0.0,
 ):
     kwargs = {}
     for name, param in inspect.signature(transformer.forward).parameters.items():
@@ -178,7 +181,18 @@ def inference_forward(
             kwargs[name] = param.default
         else:
             raise RuntimeError(f"Unsupported required transformer argument: {name}")
-    return core.output_tensor(transformer(**kwargs))
+    if parallel_adapter is None:
+        return core.output_tensor(transformer(**kwargs))
+
+    def base_forward():
+        return core.output_tensor(transformer(**kwargs))
+
+    prediction, _active = parallel_adapter.forward_prediction(
+        base_forward,
+        noise_ratio=noise_ratio,
+        enable_grad=False,
+    )
+    return prediction
 
 
 def adain_color_fix(output: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
@@ -199,6 +213,7 @@ def sample_sr(
     args: argparse.Namespace,
     device: torch.device,
     seed: int,
+    parallel_adapter=None,
 ) -> torch.Tensor:
     control = encode_control(pipe.vae, bicubic, device)
     dtype = next(transformer.parameters()).dtype
@@ -214,9 +229,18 @@ def sample_sr(
     )
     pooled = torch.zeros(latent.shape[0], pooled_dim, device=device, dtype=dtype)
 
-    for timestep in pipe.scheduler.timesteps:
+    scheduler_sigmas = pipe.scheduler.sigmas
+    for step_index, timestep in enumerate(pipe.scheduler.timesteps):
+        noise_ratio = float(scheduler_sigmas[step_index].float().cpu())
         prediction = inference_forward(
-            transformer, latent, control, timestep, prompt, pooled
+            transformer,
+            latent,
+            control,
+            timestep,
+            prompt,
+            pooled,
+            parallel_adapter=parallel_adapter,
+            noise_ratio=noise_ratio,
         )
         latent = pipe.scheduler.step(
             prediction, timestep, latent, return_dict=False
@@ -355,6 +379,13 @@ def main() -> None:
     )
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--adapter", action="append", type=parse_adapter, default=[])
+    parser.add_argument(
+        "--parallel_adapter",
+        action="append",
+        type=parse_adapter,
+        default=[],
+        help="Noise-conditioned Parallel Adapter as LABEL=PATH; repeat as needed.",
+    )
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--max_images", type=int, default=20)
     parser.add_argument("--sr_scale", type=int, default=4)
@@ -384,7 +415,11 @@ def main() -> None:
 
     if args.image_size % args.sr_scale:
         raise SystemExit("--image_size must be divisible by --sr_scale.")
-    missing = [str(path) for _label, path in args.adapter if not path.is_file()]
+    missing = [
+        str(path)
+        for _label, path in [*args.adapter, *args.parallel_adapter]
+        if not path.is_file()
+    ]
     if missing:
         raise SystemExit("Missing adapter checkpoint(s): " + ", ".join(missing))
 
@@ -440,7 +475,11 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    methods: list[tuple[str, Path | None]] = [("Base-DiT4SR", None), *args.adapter]
+    methods: list[tuple[str, str, Path | None]] = [
+        ("Base-DiT4SR", "base", None),
+        *((label, "lora", path) for label, path in args.adapter),
+        *((label, "parallel", path) for label, path in args.parallel_adapter),
+    ]
     image_rows = []
     load_reports = {}
 
@@ -463,9 +502,10 @@ def main() -> None:
         )
     image_rows.extend(bicubic_rows)
 
-    for method, adapter_path in methods:
+    for method, method_type, adapter_path in methods:
         reset_lora_to_base(transformer)
-        if adapter_path is not None:
+        parallel_controller = None
+        if method_type == "lora" and adapter_path is not None:
             report = adaptive.load_lora_adapter(transformer, adapter_path)
             if report["missing"] or report["unexpected"]:
                 raise RuntimeError(
@@ -478,6 +518,15 @@ def main() -> None:
                 f"{method}: active LoRA modules="
                 f"{report['active_lora_modules']}/{len(injected)}"
             )
+        elif method_type == "parallel" and adapter_path is not None:
+            parallel_controller, report = parallel.load_parallel_adapter(
+                transformer, adapter_path, device
+            )
+            load_reports[method] = report
+            print(
+                f"{method}: Parallel Adapter noise buckets="
+                f"{len(report['active_schedule'])} anchors={len(report['anchors'])}"
+            )
 
         if args.warmup_images > 0:
             warm_hr = pil_to_tensor(Image.open(paths[0]), args.image_size)
@@ -486,6 +535,7 @@ def main() -> None:
                 sample_sr(
                     pipe, transformer, warm_bicubic, args, device,
                     args.eval_seed + 100000 + warm_index,
+                    parallel_adapter=parallel_controller,
                 )
 
         if device.type == "cuda":
@@ -503,7 +553,13 @@ def main() -> None:
                 torch.cuda.synchronize(device)
             started = time.perf_counter()
             output = sample_sr(
-                pipe, transformer, bicubic, args, device, args.eval_seed + image_index
+                pipe,
+                transformer,
+                bicubic,
+                args,
+                device,
+                args.eval_seed + image_index,
+                parallel_adapter=parallel_controller,
             )
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
@@ -535,13 +591,15 @@ def main() -> None:
                 f"{method:28s} [{image_index + 1:03d}/{len(paths):03d}] "
                 f"PSNR={row['psnr']:.3f} SSIM={row['ssim']:.4f} time={elapsed:.2f}s"
             )
+        if parallel_controller is not None:
+            parallel_controller.close()
 
     adapter_sizes_mb = {
         "Bicubic": 0.0,
         "Base-DiT4SR": 0.0,
         **{
             label: path.stat().st_size / (1024**2)
-            for label, path in args.adapter
+            for label, path in [*args.adapter, *args.parallel_adapter]
         },
     }
     summaries = summarize(image_rows, "Base-DiT4SR", adapter_sizes_mb)
@@ -563,6 +621,7 @@ def main() -> None:
         "prompt_condition": f"zeros[{args.prompt_seq_len},{args.caption_dim}]",
         "lpips_status": lpips_status,
         "injected_module_count": len(injected),
+        "parallel_adapter_count": len(args.parallel_adapter),
         "load_reports": load_reports,
     }
     (output_dir / "metadata.json").write_text(

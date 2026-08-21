@@ -208,6 +208,12 @@ def main():
     parser.add_argument("--input_noise_std", type=float, default=0.0)
     parser.add_argument("--sr_scale", type=float, default=4.0)
     parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument(
+        "--checkpoint_every",
+        type=int,
+        default=0,
+        help="Save lora_adapter_step_XXXXX.pt and flush train_log.csv every N steps; 0 disables it.",
+    )
     parser.add_argument("--blockskip_count", type=int, default=0)
     parser.add_argument(
         "--blockskip_schedule", nargs="*", default=[],
@@ -253,6 +259,8 @@ def main():
         raise SystemExit("Use either --fixed_skip_blocks or --always_skip_blocks, not both.")
     if not 0.0 < args.patch_min_fraction <= args.patch_max_fraction <= 1.0:
         raise SystemExit("Require 0 < --patch_min_fraction <= --patch_max_fraction <= 1.")
+    if args.checkpoint_every < 0:
+        raise SystemExit("--checkpoint_every must be non-negative.")
     core.set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     pipe = core.load_pipe(args, device)
@@ -444,6 +452,13 @@ def main():
                     if row["selected_topk"]
                 )
             )
+        if args.checkpoint_every > 0 and (
+            step % args.checkpoint_every == 0 or step == args.train_steps
+        ):
+            write_csv(output_dir / "train_log.csv", train_rows)
+            checkpoint_path = output_dir / f"lora_adapter_step_{step:05d}.pt"
+            adaptive.save_lora_adapter(transformer, checkpoint_path)
+            print(f"Saved checkpoint to {checkpoint_path}")
 
     write_csv(output_dir / "train_log.csv", train_rows)
     adapter_summary = adaptive.save_lora_adapter(
