@@ -74,6 +74,27 @@ def select_lora_blocks(args, candidates):
     if not args.lora_selection_file:
         raise SystemExit("--lora_selection metadata requires --lora_selection_file.")
     payload = json.loads(Path(args.lora_selection_file).read_text(encoding="utf-8"))
+    expected_metadata = {
+        "model_id": args.model_id,
+        "base_model_id": args.base_model_id,
+        "loss_mode": args.loss_mode,
+        "target": args.target,
+        "rank": args.rank,
+        "alpha": args.alpha,
+        "topk_blocks": count,
+    }
+    metadata_mismatches = []
+    for field, expected in expected_metadata.items():
+        actual = payload.get(field, "<missing>")
+        if actual != expected:
+            metadata_mismatches.append(
+                f"{field}: expected {expected!r}, found {actual!r}"
+            )
+    if metadata_mismatches:
+        raise SystemExit(
+            "LoRA selection metadata is incompatible with this training run:\n  "
+            + "\n  ".join(metadata_mismatches)
+        )
     selected = payload.get("selected_blocks")
     if not isinstance(selected, list) or not selected:
         raise SystemExit(
