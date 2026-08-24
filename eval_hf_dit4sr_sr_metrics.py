@@ -42,6 +42,29 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
+def read_csv(path: Path) -> list[dict]:
+    with path.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def load_reused_baselines(path: Path, eval_paths: list[Path]) -> list[dict]:
+    rows = [
+        row
+        for row in read_csv(path)
+        if row.get("method") in {"Bicubic", "Base-DiT4SR"}
+    ]
+    expected_names = {item.name for item in eval_paths}
+    for method in ("Bicubic", "Base-DiT4SR"):
+        selected = [row for row in rows if row.get("method") == method]
+        selected_names = {Path(row["image"]).name for row in selected}
+        if len(selected) != len(eval_paths) or selected_names != expected_names:
+            raise SystemExit(
+                f"Cannot reuse {method} from {path}: expected {len(eval_paths)} "
+                f"matching images, found {len(selected)}."
+            )
+    return rows
+
+
 def reset_lora_to_base(transformer: torch.nn.Module) -> None:
     for _name, module in core.iter_lora_modules(transformer):
         module.lora_down.weight.data.zero_()
@@ -380,6 +403,14 @@ def main() -> None:
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--adapter", action="append", type=parse_adapter, default=[])
     parser.add_argument(
+        "--baseline_results_csv",
+        default="",
+        help=(
+            "Reuse Bicubic and Base-DiT4SR rows from an existing "
+            "sr_metrics_per_image.csv instead of evaluating them again."
+        ),
+    )
+    parser.add_argument(
         "--allow_sparse_adapter",
         action="store_true",
         help="Allow an adapter to omit injected LoRA modules; omitted modules remain disabled.",
@@ -480,40 +511,51 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    reused_baseline_rows = (
+        load_reused_baselines(Path(args.baseline_results_csv), paths)
+        if args.baseline_results_csv
+        else []
+    )
     methods: list[tuple[str, str, Path | None]] = [
-        ("Base-DiT4SR", "base", None),
+        *(([("Base-DiT4SR", "base", None)]) if not reused_baseline_rows else []),
         *((label, "lora", path) for label, path in args.adapter),
         *((label, "parallel", path) for label, path in args.parallel_adapter),
     ]
-    image_rows = []
+    image_rows = list(reused_baseline_rows)
     load_reports = {}
 
-    bicubic_rows = []
-    bicubic_dir = output_dir / "images" / safe_name("Bicubic")
-    if args.save_images:
-        bicubic_dir.mkdir(parents=True, exist_ok=True)
-    for image_index, path in enumerate(paths):
-        hr = pil_to_tensor(Image.open(path), args.image_size)
-        _lr, bicubic = make_lr_condition(hr, args.sr_scale)
-        metric_hr, metric_bicubic = crop(hr, args.crop_border), crop(bicubic, args.crop_border)
-        bicubic_output_path = ""
-        if args.save_images:
-            bicubic_output_path_obj = bicubic_dir / f"{image_index:04d}_{path.stem}.png"
-            tensor_to_pil(bicubic).save(bicubic_output_path_obj)
-            bicubic_output_path = str(bicubic_output_path_obj)
-        bicubic_rows.append(
-            {
-                "method": "Bicubic",
-                "image": str(path),
-                "psnr": psnr(metric_bicubic, metric_hr),
-                "ssim": ssim(metric_bicubic, metric_hr),
-                "lpips": lpips_score(lpips_model, bicubic, hr, args.lpips_device),
-                "inference_time_s": 0.0,
-                "peak_cuda_mem_mb": 0.0,
-                "output_path": bicubic_output_path,
-            }
+    if reused_baseline_rows:
+        print(
+            f"Reusing Bicubic and Base-DiT4SR results from "
+            f"{args.baseline_results_csv}"
         )
-    image_rows.extend(bicubic_rows)
+    else:
+        bicubic_rows = []
+        bicubic_dir = output_dir / "images" / safe_name("Bicubic")
+        if args.save_images:
+            bicubic_dir.mkdir(parents=True, exist_ok=True)
+        for image_index, path in enumerate(paths):
+            hr = pil_to_tensor(Image.open(path), args.image_size)
+            _lr, bicubic = make_lr_condition(hr, args.sr_scale)
+            metric_hr, metric_bicubic = crop(hr, args.crop_border), crop(bicubic, args.crop_border)
+            bicubic_output_path = ""
+            if args.save_images:
+                bicubic_output_path_obj = bicubic_dir / f"{image_index:04d}_{path.stem}.png"
+                tensor_to_pil(bicubic).save(bicubic_output_path_obj)
+                bicubic_output_path = str(bicubic_output_path_obj)
+            bicubic_rows.append(
+                {
+                    "method": "Bicubic",
+                    "image": str(path),
+                    "psnr": psnr(metric_bicubic, metric_hr),
+                    "ssim": ssim(metric_bicubic, metric_hr),
+                    "lpips": lpips_score(lpips_model, bicubic, hr, args.lpips_device),
+                    "inference_time_s": 0.0,
+                    "peak_cuda_mem_mb": 0.0,
+                    "output_path": bicubic_output_path,
+                }
+            )
+        image_rows.extend(bicubic_rows)
 
     for method, method_type, adapter_path in methods:
         reset_lora_to_base(transformer)
@@ -630,6 +672,8 @@ def main() -> None:
         "base_model_id": args.base_model_id,
         "variant": args.variant,
         "data_dir": args.data_dir,
+        "baseline_results_csv": args.baseline_results_csv,
+        "reused_baseline_rows": len(reused_baseline_rows),
         "excluded_images": [str(path) for path in excluded_paths],
         "dataset_overlap_audit": overlap_audit,
         "image_size": args.image_size,
