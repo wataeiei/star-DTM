@@ -48,12 +48,13 @@ def read_csv(path: Path) -> list[dict]:
 
 
 def load_reused_baselines(path: Path, eval_paths: list[Path]) -> list[dict]:
+    expected_names = {item.name for item in eval_paths}
     rows = [
         row
         for row in read_csv(path)
         if row.get("method") in {"Bicubic", "Base-DiT4SR"}
+        and Path(row.get("image", "")).name in expected_names
     ]
-    expected_names = {item.name for item in eval_paths}
     for method in ("Bicubic", "Base-DiT4SR"):
         selected = [row for row in rows if row.get("method") == method]
         selected_names = {Path(row["image"]).name for row in selected}
