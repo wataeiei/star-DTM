@@ -30,6 +30,38 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
+def read_blockskip_importance(path, train_step):
+    path = Path(path)
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows:
+        raise SystemExit(f"Block-skip importance CSV is empty: {path}")
+    required = {"block", "block_index", "noise_ratio", "normalized_grad_score"}
+    missing = sorted(required - set(rows[0]))
+    if missing:
+        raise SystemExit(
+            f"Block-skip importance CSV is missing columns: {', '.join(missing)}"
+        )
+    available_steps = sorted({int(row.get("train_step", 0)) for row in rows})
+    if train_step not in available_steps:
+        raise SystemExit(
+            f"Block-skip importance step {train_step} is unavailable; "
+            f"available steps: {available_steps}"
+        )
+    selected = [
+        dict(row, train_step=0)
+        for row in rows
+        if int(row.get("train_step", 0)) == train_step
+    ]
+    keys = [(row["block"], float(row["noise_ratio"])) for row in selected]
+    if len(keys) != len(set(keys)):
+        raise SystemExit(
+            "Block-skip importance CSV contains duplicate block/noise rows "
+            f"at train step {train_step}."
+        )
+    return selected
+
+
 def batch_loss(pipe, transformer, batch, args, device):
     return core.flow_matching_batch_loss(pipe, transformer, batch, args, device)
 
@@ -323,6 +355,25 @@ def main():
     parser.add_argument("--blockskip_max_run", type=int, default=4)
     parser.add_argument("--blockskip_max_runs", type=int, default=2)
     parser.add_argument(
+        "--blockskip_importance_csv",
+        default="",
+        help=(
+            "Optional precomputed full-model importance CSV. This lets sparse-LoRA "
+            "runs select frozen blocks for skipping without injecting LoRA into them."
+        ),
+    )
+    parser.add_argument(
+        "--blockskip_importance_step",
+        type=int,
+        default=0,
+        help="Training step to read from --blockskip_importance_csv.",
+    )
+    parser.add_argument(
+        "--protect_selected_lora_blocks",
+        action="store_true",
+        help="Exclude every selected trainable LoRA block from dynamic block skipping.",
+    )
+    parser.add_argument(
         "--fixed_skip_blocks", nargs="*", default=[],
         help="Explicit logical block names to skip on every step; overrides gradient selection.",
     )
@@ -365,6 +416,13 @@ def main():
     pipe = core.load_pipe(args, device)
     transformer = core.get_transformer(pipe, args.component_name)
     transformer.requires_grad_(False)
+    target_module_names = [
+        name
+        for name, module in transformer.named_modules()
+        if isinstance(module, torch.nn.Linear)
+        and core.block_key(name, args.block_regex)
+        and core.target_match(name, args.target)
+    ]
     candidate_blocks = candidate_lora_blocks(transformer, args.target, args.block_regex)
     if not candidate_blocks:
         raise SystemExit("No candidate LoRA blocks found.")
@@ -420,13 +478,37 @@ def main():
                     max_cuda_reserved_mb, torch.cuda.max_memory_reserved() / (1024.0 ** 2)
                 )
             profiling_time_s += time.perf_counter() - profile_start
+    blockskip_importance_rows = importance_rows
+    if args.blockskip_importance_csv:
+        blockskip_importance_rows = read_blockskip_importance(
+            args.blockskip_importance_csv,
+            args.blockskip_importance_step,
+        )
+    if blockskip_importance_rows:
+        first_ratio = min(float(row["noise_ratio"]) for row in blockskip_importance_rows)
         block_names = [
             row["block"]
-            for row in sorted(importance_rows, key=lambda row: int(row["block_index"]))
-            if float(row["noise_ratio"]) == float(args.profile_noise_ratios[0])
+            for row in sorted(
+                blockskip_importance_rows,
+                key=lambda row: int(row["block_index"]),
+            )
+            if math.isclose(float(row["noise_ratio"]), first_ratio, abs_tol=1e-8)
         ]
     else:
         block_names = list(selected_lora_blocks)
+    unknown_importance_blocks = sorted(
+        set(block_names) - set(candidate_blocks), key=core.natural_key
+    )
+    if unknown_importance_blocks:
+        raise SystemExit(
+            "Block-skip importance contains unknown candidate blocks: "
+            + ", ".join(unknown_importance_blocks)
+        )
+    if args.protect_selected_lora_blocks and not args.blockskip_importance_csv:
+        raise SystemExit(
+            "--protect_selected_lora_blocks requires --blockskip_importance_csv "
+            "so that non-LoRA blocks have scores."
+        )
     cache_dtype = {
         "fp16": torch.float16,
         "bf16": torch.bfloat16,
@@ -449,7 +531,7 @@ def main():
         if unknown:
             raise SystemExit("Unknown explicitly configured blocks: " + ", ".join(unknown))
         block_paths = adaptive.infer_block_module_paths(
-            (name for name, _module in core.iter_lora_modules(transformer)),
+            target_module_names,
             block_names,
             core.block_key,
             args.block_regex,
@@ -491,6 +573,11 @@ def main():
                 skip_blocks = list(args.fixed_skip_blocks)
             else:
                 mandatory = list(dict.fromkeys(args.always_skip_blocks))
+                protected = (
+                    set(selected_lora_blocks)
+                    if args.protect_selected_lora_blocks
+                    else set()
+                )
                 requested_skip_count = max(
                     len(mandatory),
                     adaptive.noise_scheduled_int(
@@ -500,14 +587,14 @@ def main():
                 extra_count = requested_skip_count - len(mandatory)
                 extras = (
                     adaptive.select_low_score_runs(
-                        importance_rows,
+                        blockskip_importance_rows,
                         step,
                         noise_ratio,
                         extra_count,
                         args.blockskip_min_run,
                         args.blockskip_max_run,
                         max(1, args.blockskip_max_runs - 1),
-                        excluded_blocks=mandatory,
+                        excluded_blocks=set(mandatory) | protected,
                     )
                     if extra_count > 0
                     else []
