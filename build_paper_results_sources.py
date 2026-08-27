@@ -103,13 +103,41 @@ def numeric_or_blank(value: str):
     return number if math.isfinite(number) else ""
 
 
+IMAGE_ID_COLUMNS = (
+    "filename",
+    "file_name",
+    "image_name",
+    "image_id",
+    "relative_path",
+    "image_path",
+    "path",
+)
+
+
 def count_method_images(path: Path, method: str) -> int:
+    """Count unique images, including long-form metric tables.
+
+    IQA detail files contain one row per (image, metric), so counting rows
+    would report N images times M metrics. Prefer a stable image identifier
+    whenever one is available and fall back to row count for wide tables.
+    """
     rows = read_csv(path)
     if not rows:
         return 0
-    if "method" not in rows[0]:
-        return len(rows)
-    return sum(row.get("method", "").strip() == method for row in rows)
+    if "method" in rows[0]:
+        rows = [row for row in rows if row.get("method", "").strip() == method]
+
+    for column in IMAGE_ID_COLUMNS:
+        if column not in rows[0]:
+            continue
+        identifiers = {
+            row.get(column, "").strip()
+            for row in rows
+            if row.get(column, "").strip()
+        }
+        if identifiers:
+            return len(identifiers)
+    return len(rows)
 
 
 def add_values(output: dict, source: dict[str, str], mapping: dict[str, tuple[str, ...]]) -> None:
@@ -214,9 +242,9 @@ def build_row(entry: dict[str, str], root: Path, expected_images: int) -> tuple[
         count = count_method_images(path, source_method)
         per_image_counts.append((column, count))
         if expected_images > 0 and count != expected_images:
-            warnings.append(f"{column} has {count} rows, expected {expected_images}")
+            warnings.append(f"{column} has {count} unique images, expected {expected_images}")
     if per_image_counts and len({count for _, count in per_image_counts}) > 1:
-        warnings.append(f"per-image row counts disagree: {per_image_counts}")
+        warnings.append(f"per-image image counts disagree: {per_image_counts}")
 
     return output, warnings
 
