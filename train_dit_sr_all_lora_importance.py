@@ -573,7 +573,7 @@ def main():
                         extra_count,
                         args.blockskip_min_run,
                         args.blockskip_max_run,
-                        max(1, args.blockskip_max_runs - 1),
+                        args.blockskip_max_runs,
                         excluded_blocks=set(mandatory) | protected,
                     )
                     if extra_count > 0
