@@ -236,11 +236,13 @@ def write_latex(path: Path, merged: pd.DataFrame) -> None:
         "    All-LoRA & "
         + " & ".join(
             [
-                latex_value(all_lora, "psnr", 3),
-                latex_value(all_lora, "ssim", 4),
-                latex_value(all_lora, "lpips", 4),
+                "\\textbf{" + latex_value(all_lora, "psnr", 3) + "}",
+                "\\textbf{" + latex_value(all_lora, "ssim", 4) + "}",
+                "\\textbf{" + latex_value(all_lora, "lpips", 4) + "}",
                 latex_value(all_lora, "clipiqa", 4),
-                latex_value(all_lora, "top1_accuracy", 2, 100.0),
+                "\\textbf{"
+                + latex_value(all_lora, "top1_accuracy", 2, 100.0)
+                + "}",
                 latex_value(all_lora, "train_step_time_s", 1),
                 latex_value(all_lora, "peak_cuda_mem_mb", 0),
                 latex_value(all_lora, "adapter_size_mb", 2),
