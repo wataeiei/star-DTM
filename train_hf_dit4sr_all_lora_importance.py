@@ -351,6 +351,13 @@ def main():
         metavar="SIGMA:COUNT",
         help="Noise-aware skip counts, for example 0.05:8 0.4:4 0.95:8.",
     )
+    parser.add_argument(
+        "--blockskip_fraction_schedule",
+        nargs="*",
+        default=[],
+        metavar="SIGMA:FRACTION",
+        help="Noise-aware skipped-block fractions, scaled to model depth.",
+    )
     parser.add_argument("--blockskip_min_run", type=int, default=2)
     parser.add_argument("--blockskip_max_run", type=int, default=4)
     parser.add_argument("--blockskip_max_runs", type=int, default=2)
@@ -403,8 +410,15 @@ def main():
         blockskip_schedule = adaptive.parse_noise_int_schedule(
             args.blockskip_schedule
         )
+        blockskip_fraction_schedule = adaptive.parse_noise_float_schedule(
+            args.blockskip_fraction_schedule
+        )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+    if blockskip_schedule and blockskip_fraction_schedule:
+        raise SystemExit(
+            "Use either --blockskip_schedule or --blockskip_fraction_schedule, not both."
+        )
     if args.fixed_skip_blocks and args.always_skip_blocks:
         raise SystemExit("Use either --fixed_skip_blocks or --always_skip_blocks, not both.")
     if not 0.0 < args.patch_min_fraction <= args.patch_max_fraction <= 1.0:
@@ -518,6 +532,7 @@ def main():
     if (
         args.blockskip_count > 0
         or blockskip_schedule
+        or blockskip_fraction_schedule
         or args.fixed_skip_blocks
         or args.always_skip_blocks
     ):
@@ -578,12 +593,16 @@ def main():
                     if args.protect_selected_lora_blocks
                     else set()
                 )
-                requested_skip_count = max(
-                    len(mandatory),
-                    adaptive.noise_scheduled_int(
+                if blockskip_fraction_schedule:
+                    fraction = adaptive.noise_scheduled_float(
+                        noise_ratio, blockskip_fraction_schedule, 0.0
+                    )
+                    scheduled_count = round(fraction * len(block_names))
+                else:
+                    scheduled_count = adaptive.noise_scheduled_int(
                         noise_ratio, blockskip_schedule, args.blockskip_count
-                    ),
-                )
+                    )
+                requested_skip_count = max(len(mandatory), scheduled_count)
                 extra_count = requested_skip_count - len(mandatory)
                 extras = (
                     adaptive.select_low_score_runs(
@@ -738,6 +757,7 @@ def main():
     write_csv(output_dir / "summary.csv", [summary])
     metadata = vars(args) | {
         "parsed_blockskip_schedule": blockskip_schedule,
+        "parsed_blockskip_fraction_schedule": blockskip_fraction_schedule,
         "profile_steps": sorted(profile_steps),
         "injected_module_count": len(injected),
         "candidate_lora_blocks": candidate_blocks,

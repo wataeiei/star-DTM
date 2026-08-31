@@ -138,6 +138,26 @@ def parse_noise_int_schedule(values: Iterable[str]) -> list[tuple[float, int]]:
     return sorted(schedule.items())
 
 
+def parse_noise_float_schedule(values: Iterable[str]) -> list[tuple[float, float]]:
+    """Parse ``NOISE:FRACTION`` entries with both values constrained to [0, 1]."""
+    schedule: dict[float, float] = {}
+    for entry in values:
+        try:
+            noise_text, value_text = entry.split(":", 1)
+            noise = float(noise_text)
+            value = float(value_text)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid schedule entry {entry!r}; expected NOISE:FRACTION."
+            ) from exc
+        if not 0.0 <= noise <= 1.0:
+            raise ValueError(f"Schedule noise ratio must be in [0, 1], got {noise}.")
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"Scheduled fraction must be in [0, 1], got {value}.")
+        schedule[noise] = value
+    return sorted(schedule.items())
+
+
 def noise_scheduled_int(
     noise_ratio: float,
     schedule: Iterable[tuple[float, int]],
@@ -148,6 +168,18 @@ def noise_scheduled_int(
     if not entries:
         return int(default)
     return int(min(entries, key=lambda item: abs(item[0] - noise_ratio))[1])
+
+
+def noise_scheduled_float(
+    noise_ratio: float,
+    schedule: Iterable[tuple[float, float]],
+    default: float,
+) -> float:
+    """Return the float value at the nearest configured noise anchor."""
+    entries = list(schedule)
+    if not entries:
+        return float(default)
+    return float(min(entries, key=lambda item: abs(item[0] - noise_ratio))[1])
 
 
 def _score_rows(

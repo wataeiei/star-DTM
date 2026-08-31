@@ -19,6 +19,120 @@ import profile_dit_sr_grad as core
 import adaptive_grad_blockskip as adaptive
 
 
+def read_blockskip_importance(path, train_step):
+    path = Path(path)
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows:
+        raise SystemExit(f"Block-skip importance CSV is empty: {path}")
+    required = {"block", "block_index", "normalized_grad_score"}
+    missing = sorted(required - set(rows[0]))
+    if missing:
+        raise SystemExit(
+            "Block-skip importance CSV is missing columns: " + ", ".join(missing)
+        )
+    available_steps = sorted({int(row.get("train_step", 0)) for row in rows})
+    if train_step not in available_steps:
+        raise SystemExit(
+            f"Block-skip importance step {train_step} is unavailable; "
+            f"available steps: {available_steps}"
+        )
+    selected = [
+        dict(row, train_step=0)
+        for row in rows
+        if int(row.get("train_step", 0)) == train_step
+    ]
+    for row in selected:
+        row.setdefault("noise_ratio", 0.5)
+    keys = [(row["block"], float(row["noise_ratio"])) for row in selected]
+    if len(keys) != len(set(keys)):
+        raise SystemExit(
+            "Block-skip importance CSV contains duplicate block/noise rows "
+            f"at train step {train_step}."
+        )
+    return selected
+
+
+def candidate_lora_blocks(model, target, block_regex):
+    blocks = set()
+    for name, module in model.named_modules():
+        block = core.block_key(name, block_regex)
+        if (
+            isinstance(module, torch.nn.Linear)
+            and block
+            and core.target_match(name, target)
+        ):
+            blocks.add(block)
+    return sorted(blocks, key=core.natural_key)
+
+
+def evenly_spaced_blocks(blocks, count):
+    if count >= len(blocks):
+        return list(blocks)
+    if count == 1:
+        return [blocks[len(blocks) // 2]]
+    indices = [
+        round(index * (len(blocks) - 1) / (count - 1))
+        for index in range(count)
+    ]
+    return [blocks[index] for index in indices]
+
+
+def select_lora_blocks(args, candidates):
+    if args.lora_selection == "all":
+        return list(candidates)
+    count = args.lora_block_budget or args.topk_blocks
+    if not 0 < count <= len(candidates):
+        raise SystemExit(
+            f"LoRA block budget must be in [1, {len(candidates)}], got {count}."
+        )
+    if args.lora_selection == "random":
+        return sorted(
+            random.Random(args.lora_selection_seed).sample(candidates, count),
+            key=core.natural_key,
+        )
+    if args.lora_selection == "uniform":
+        return evenly_spaced_blocks(candidates, count)
+    if args.lora_selection == "sandwich":
+        shallow = (count + 1) // 2
+        deep = count - shallow
+        return candidates[:shallow] + (candidates[-deep:] if deep else [])
+    if not args.lora_selection_file:
+        raise SystemExit("--lora_selection metadata requires --lora_selection_file.")
+    payload = json.loads(Path(args.lora_selection_file).read_text(encoding="utf-8"))
+    expected_metadata = {
+        "loss_mode": args.loss_mode,
+        "target": args.target,
+        "rank": args.rank,
+        "alpha": args.alpha,
+        "topk_blocks": count,
+    }
+    mismatches = []
+    for field, expected in expected_metadata.items():
+        actual = payload.get(field, "<missing>")
+        if actual != expected:
+            mismatches.append(f"{field}: expected {expected!r}, found {actual!r}")
+    if mismatches:
+        raise SystemExit(
+            "LoRA selection metadata is incompatible with this training run:\n  "
+            + "\n  ".join(mismatches)
+        )
+    selected = payload.get("selected_blocks")
+    if not isinstance(selected, list) or not selected:
+        raise SystemExit(
+            f"{args.lora_selection_file} does not contain selected_blocks."
+        )
+    selected = sorted(set(selected), key=core.natural_key)
+    unknown = sorted(set(selected) - set(candidates), key=core.natural_key)
+    if unknown:
+        raise SystemExit("Unknown blocks in selection metadata: " + ", ".join(unknown))
+    if len(selected) != count:
+        raise SystemExit(
+            f"Selection metadata contains {len(selected)} blocks but budget is {count}."
+        )
+    return selected
+
+
 def write_csv(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -178,6 +292,24 @@ def main():
         help="Normalized noise ratios to scan at every profile step.",
     )
     parser.add_argument("--topk_blocks", type=int, default=8)
+    parser.add_argument(
+        "--lora_selection",
+        choices=["all", "random", "uniform", "sandwich", "metadata"],
+        default="all",
+        help="Choose which logical blocks receive trainable LoRA modules.",
+    )
+    parser.add_argument(
+        "--lora_block_budget",
+        type=int,
+        default=0,
+        help="Number of selected blocks; 0 uses --topk_blocks.",
+    )
+    parser.add_argument(
+        "--lora_selection_file",
+        default="",
+        help="DiT-SR profiler metadata JSON containing selected_blocks.",
+    )
+    parser.add_argument("--lora_selection_seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--grad_clip", type=float, default=1.0)
@@ -189,6 +321,12 @@ def main():
     parser.add_argument("--profile_seed", type=int, default=2026)
     parser.add_argument("--block_regex", default="")
     parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument(
+        "--checkpoint_every",
+        type=int,
+        default=0,
+        help="Save adapter and current train log every N steps; 0 disables it.",
+    )
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--blockskip_count", type=int, default=0)
     parser.add_argument(
@@ -196,9 +334,32 @@ def main():
         metavar="SIGMA:COUNT",
         help="Noise-aware skip counts, for example 0.05:8 0.4:4 0.95:8.",
     )
+    parser.add_argument(
+        "--blockskip_fraction_schedule",
+        nargs="*",
+        default=[],
+        metavar="SIGMA:FRACTION",
+        help="Noise-aware skipped-block fractions, scaled to this model's depth.",
+    )
     parser.add_argument("--blockskip_min_run", type=int, default=2)
     parser.add_argument("--blockskip_max_run", type=int, default=4)
     parser.add_argument("--blockskip_max_runs", type=int, default=2)
+    parser.add_argument(
+        "--blockskip_importance_csv",
+        default="",
+        help="Full-model importance CSV used to select frozen blocks for skipping.",
+    )
+    parser.add_argument(
+        "--blockskip_importance_step",
+        type=int,
+        default=0,
+        help="Training step to read from --blockskip_importance_csv.",
+    )
+    parser.add_argument(
+        "--protect_selected_lora_blocks",
+        action="store_true",
+        help="Never skip a block that contains a selected trainable LoRA module.",
+    )
     parser.add_argument(
         "--fixed_skip_blocks", nargs="*", default=[],
         help="Explicit logical block names to skip on every step; overrides gradient selection.",
@@ -229,18 +390,51 @@ def main():
         blockskip_schedule = adaptive.parse_noise_int_schedule(
             args.blockskip_schedule
         )
+        blockskip_fraction_schedule = adaptive.parse_noise_float_schedule(
+            args.blockskip_fraction_schedule
+        )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+    if blockskip_schedule and blockskip_fraction_schedule:
+        raise SystemExit(
+            "Use either --blockskip_schedule or --blockskip_fraction_schedule, not both."
+        )
     if args.fixed_skip_blocks and args.always_skip_blocks:
         raise SystemExit("Use either --fixed_skip_blocks or --always_skip_blocks, not both.")
     if not 0.0 < args.patch_min_fraction <= args.patch_max_fraction <= 1.0:
         raise SystemExit("Require 0 < --patch_min_fraction <= --patch_max_fraction <= 1.")
+    if args.checkpoint_every < 0:
+        raise SystemExit("--checkpoint_every must be non-negative.")
     core.set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     model = core.load_model(args, device)
     diffusion, autoencoder = core.load_official_objective(args, device)
     model.requires_grad_(False)
-    injected = core.inject_lora(model, args.target, args.rank, args.alpha, args.block_regex)
+    target_module_names = [
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, torch.nn.Linear)
+        and core.block_key(name, args.block_regex)
+        and core.target_match(name, args.target)
+    ]
+    candidate_blocks = candidate_lora_blocks(model, args.target, args.block_regex)
+    if not candidate_blocks:
+        raise SystemExit("No candidate LoRA blocks found.")
+    selected_lora_blocks = select_lora_blocks(args, candidate_blocks)
+    injected = core.inject_lora(
+        model,
+        args.target,
+        args.rank,
+        args.alpha,
+        args.block_regex,
+        selected_blocks=set(selected_lora_blocks),
+    )
+    print(
+        f"LoRA selection={args.lora_selection} "
+        f"blocks={len(selected_lora_blocks)}/{len(candidate_blocks)} "
+        f"modules={len(injected)}"
+    )
+    print("Selected LoRA blocks: " + ", ".join(selected_lora_blocks))
     model.train()
 
     dataset = core.ImageFolderDataset(args.data_dir, args.image_size, args.max_images)
@@ -255,20 +449,46 @@ def main():
     )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    experiment_start = time.perf_counter()
+    profiling_time_s = 0.0
+    checkpoint_time_s = 0.0
+    max_cuda_mem_mb = 0.0
+    max_cuda_reserved_mb = 0.0
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
     profile_steps = {step for step in args.profile_steps if 0 <= step <= args.train_steps}
     profile_steps.update({0, args.train_steps})
     if any(not 0.0 <= ratio <= 1.0 for ratio in args.profile_noise_ratios):
         raise SystemExit("--profile_noise_ratios values must be in [0, 1].")
     importance_rows = []
     for ratio in args.profile_noise_ratios:
-        importance_rows.extend(profile_importance(
-            model, diffusion, autoencoder, profile_loader, args, device, 0, ratio
-        ))
-    block_names = [
-        row["block"]
-        for row in sorted(importance_rows, key=lambda row: int(row["block_index"]))
-        if float(row["noise_ratio"]) == float(args.profile_noise_ratios[0])
-    ]
+        profile_start = time.perf_counter()
+        importance_rows.extend(
+            profile_importance(
+                model, diffusion, autoencoder, profile_loader, args, device, 0, ratio
+            )
+        )
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+            max_cuda_mem_mb = max(
+                max_cuda_mem_mb, torch.cuda.max_memory_allocated() / (1024.0 ** 2)
+            )
+            max_cuda_reserved_mb = max(
+                max_cuda_reserved_mb, torch.cuda.max_memory_reserved() / (1024.0 ** 2)
+            )
+        profiling_time_s += time.perf_counter() - profile_start
+    block_names = list(candidate_blocks)
+    blockskip_importance_rows = importance_rows
+    if args.blockskip_importance_csv:
+        blockskip_importance_rows = read_blockskip_importance(
+            args.blockskip_importance_csv,
+            args.blockskip_importance_step,
+        )
+    if args.protect_selected_lora_blocks and not args.blockskip_importance_csv:
+        raise SystemExit(
+            "--protect_selected_lora_blocks requires --blockskip_importance_csv "
+            "from a full-model probe."
+        )
     cache_dtype = {
         "fp16": torch.float16,
         "bf16": torch.bfloat16,
@@ -278,6 +498,7 @@ def main():
     if (
         args.blockskip_count > 0
         or blockskip_schedule
+        or blockskip_fraction_schedule
         or args.fixed_skip_blocks
         or args.always_skip_blocks
     ):
@@ -286,7 +507,7 @@ def main():
         if unknown:
             raise SystemExit("Unknown explicitly configured blocks: " + ", ".join(unknown))
         block_paths = adaptive.infer_block_module_paths(
-            (name for name, _module in core.iter_lora_modules(model)),
+            target_module_names,
             block_names,
             core.block_key,
             args.block_regex,
@@ -328,23 +549,32 @@ def main():
                 skip_blocks = list(args.fixed_skip_blocks)
             else:
                 mandatory = list(dict.fromkeys(args.always_skip_blocks))
-                requested_skip_count = max(
-                    len(mandatory),
-                    adaptive.noise_scheduled_int(
-                        noise_ratio, blockskip_schedule, args.blockskip_count
-                    ),
+                protected = (
+                    set(selected_lora_blocks)
+                    if args.protect_selected_lora_blocks
+                    else set()
                 )
+                if blockskip_fraction_schedule:
+                    fraction = adaptive.noise_scheduled_float(
+                        noise_ratio, blockskip_fraction_schedule, 0.0
+                    )
+                    scheduled_count = round(fraction * len(block_names))
+                else:
+                    scheduled_count = adaptive.noise_scheduled_int(
+                        noise_ratio, blockskip_schedule, args.blockskip_count
+                    )
+                requested_skip_count = max(len(mandatory), scheduled_count)
                 extra_count = requested_skip_count - len(mandatory)
                 extras = (
                     adaptive.select_low_score_runs(
-                        importance_rows,
+                        blockskip_importance_rows,
                         step,
                         noise_ratio,
                         extra_count,
                         args.blockskip_min_run,
                         args.blockskip_max_run,
                         max(1, args.blockskip_max_runs - 1),
-                        excluded_blocks=mandatory,
+                        excluded_blocks=set(mandatory) | protected,
                     )
                     if extra_count > 0
                     else []
@@ -380,6 +610,15 @@ def main():
             if device.type == "cuda"
             else 0.0
         )
+        train_peak_cuda_reserved_mb = (
+            torch.cuda.max_memory_reserved() / (1024.0 ** 2)
+            if device.type == "cuda"
+            else 0.0
+        )
+        max_cuda_mem_mb = max(max_cuda_mem_mb, train_peak_cuda_mem_mb)
+        max_cuda_reserved_mb = max(
+            max_cuda_reserved_mb, train_peak_cuda_reserved_mb
+        )
         if controller is not None:
             if args.residual_execution == "single_pass":
                 cache_stats = controller.stats(0.0)
@@ -410,6 +649,7 @@ def main():
                 "cache_peak_cuda_mem_mb": cache_stats.peak_cuda_mem_mb,
                 "train_step_time_s": train_step_time_s,
                 "train_peak_cuda_mem_mb": train_peak_cuda_mem_mb,
+                "train_peak_cuda_reserved_mb": train_peak_cuda_reserved_mb,
             }
         )
         if step % args.log_every == 0 or step == 1:
@@ -419,9 +659,30 @@ def main():
                 controller.set_mode("full")
             current = []
             for ratio in args.profile_noise_ratios:
-                current.extend(profile_importance(
-                    model, diffusion, autoencoder, profile_loader, args, device, step, ratio
-                ))
+                profile_start = time.perf_counter()
+                current.extend(
+                    profile_importance(
+                        model,
+                        diffusion,
+                        autoencoder,
+                        profile_loader,
+                        args,
+                        device,
+                        step,
+                        ratio,
+                    )
+                )
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                    max_cuda_mem_mb = max(
+                        max_cuda_mem_mb,
+                        torch.cuda.max_memory_allocated() / (1024.0 ** 2),
+                    )
+                    max_cuda_reserved_mb = max(
+                        max_cuda_reserved_mb,
+                        torch.cuda.max_memory_reserved() / (1024.0 ** 2),
+                    )
+                profiling_time_s += time.perf_counter() - profile_start
             importance_rows.extend(current)
             write_csv(output_dir / "lora_importance_evolution.csv", importance_rows)
             write_csv(output_dir / "lora_importance_topk.csv", topk_summary(importance_rows))
@@ -433,17 +694,48 @@ def main():
                     if row["selected_topk"]
                 )
             )
+        if args.checkpoint_every > 0 and (
+            step % args.checkpoint_every == 0 or step == args.train_steps
+        ):
+            write_csv(output_dir / "train_log.csv", train_rows)
+            checkpoint_path = output_dir / f"lora_adapter_step_{step:05d}.pt"
+            checkpoint_start = time.perf_counter()
+            adaptive.save_lora_adapter(model, checkpoint_path)
+            checkpoint_time_s += time.perf_counter() - checkpoint_start
+            print(f"Saved checkpoint to {checkpoint_path}")
 
     write_csv(output_dir / "train_log.csv", train_rows)
+    checkpoint_start = time.perf_counter()
     adapter_summary = adaptive.save_lora_adapter(
         model, output_dir / "lora_adapter.pt"
     )
+    checkpoint_time_s += time.perf_counter() - checkpoint_start
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    experiment_time_s = time.perf_counter() - experiment_start
+    train_step_time_s = sum(float(row["train_step_time_s"]) for row in train_rows)
+    summary = {
+        "train_steps": args.train_steps,
+        "train_step_time_s": train_step_time_s,
+        "mean_train_step_time_s": train_step_time_s / max(len(train_rows), 1),
+        "experiment_time_s": experiment_time_s,
+        "profiling_time_s": profiling_time_s,
+        "checkpoint_time_s": checkpoint_time_s,
+        "non_train_overhead_s": max(0.0, experiment_time_s - train_step_time_s),
+        "peak_cuda_mem_mb": max_cuda_mem_mb,
+        "peak_cuda_reserved_mb": max_cuda_reserved_mb,
+    } | adapter_summary
+    write_csv(output_dir / "summary.csv", [summary])
     metadata = vars(args) | {
         "parsed_blockskip_schedule": blockskip_schedule,
+        "parsed_blockskip_fraction_schedule": blockskip_fraction_schedule,
         "profile_steps": sorted(profile_steps),
         "injected_module_count": len(injected),
+        "candidate_lora_blocks": candidate_blocks,
+        "selected_lora_blocks": selected_lora_blocks,
         "model": "DiT-SR",
-    } | adapter_summary
+        "objective": args.loss_mode,
+    } | summary
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(f"Wrote results to {output_dir}")
 
