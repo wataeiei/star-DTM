@@ -226,7 +226,10 @@ def sample(sampler, lr: torch.Tensor, seed: int, fp32: bool) -> torch.Tensor:
     lq = (lr.unsqueeze(0).to(device) * 2.0 - 1.0)
     context = nullcontext if fp32 or device.type != "cuda" else torch.cuda.amp.autocast
     with context():
-        output = sampler.sample_func(lq, noise_repeat=False)
+        # The official sampler uses ``mask=False`` as its function default but
+        # tests ``mask is not None`` internally. Pass None explicitly for SR so
+        # the model follows the no-mask branch used by Sampler.inference().
+        output = sampler.sample_func(lq, noise_repeat=False, mask=None)
     return (output[0].float().cpu() * 0.5 + 0.5).clamp(0, 1)
 
 
