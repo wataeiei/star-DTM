@@ -209,8 +209,9 @@ def install_torchvision_stub_for_timm() -> None:
         std_tensor = torch.as_tensor(std, dtype=tensor.dtype, device=tensor.device)
         if (std_tensor == 0).any():
             raise ValueError("std contains a zero value.")
-        shape = (-1,) + (1,) * (tensor.ndim - 2)
-        return tensor.sub_(mean_tensor.view(shape)).div_(std_tensor.view(shape))
+        return tensor.sub_(mean_tensor.view(-1, 1, 1)).div_(
+            std_tensor.view(-1, 1, 1)
+        )
 
     feature_extraction.create_feature_extractor = create_feature_extractor
     ops_misc.FrozenBatchNorm2d = nn.BatchNorm2d
