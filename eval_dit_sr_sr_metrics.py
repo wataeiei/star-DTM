@@ -56,6 +56,23 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
+def read_csv_rows(path: Path) -> list[dict]:
+    if not path.is_file():
+        return []
+    with path.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def append_csv_row(path: Path, row: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.is_file() or path.stat().st_size == 0
+    with path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def image_paths(directory: str | Path, excluded: set[str], max_images: int) -> list[Path]:
     directory = Path(directory)
     paths = sorted(
@@ -238,15 +255,26 @@ def summarize(rows: list[dict], adapter_sizes: dict[str, float]) -> list[dict]:
     summaries = []
     for method in methods:
         selected = [row for row in rows if row["method"] == method]
-        elapsed = sum(float(row["inference_time_s"]) for row in selected)
+        times = [
+            float(row["inference_time_s"])
+            for row in selected
+            if row.get("inference_time_s", "") not in ("", None)
+        ]
+        peaks = [
+            float(row["peak_cuda_mem_mb"])
+            for row in selected
+            if row.get("peak_cuda_mem_mb", "") not in ("", None)
+        ]
+        elapsed = sum(times)
         summaries.append({
             "method": method,
             "num_images": len(selected),
             "mean_psnr": sum(float(row["psnr"]) for row in selected) / len(selected),
             "mean_ssim": sum(float(row["ssim"]) for row in selected) / len(selected),
-            "mean_inference_time_s": elapsed / len(selected),
-            "images_per_hour": 3600.0 * len(selected) / elapsed if elapsed else "",
-            "peak_cuda_mem_mb": max(float(row["peak_cuda_mem_mb"]) for row in selected),
+            "mean_inference_time_s": elapsed / len(times) if times else "",
+            "num_timed_images": len(times),
+            "images_per_hour": 3600.0 * len(times) / elapsed if elapsed else "",
+            "peak_cuda_mem_mb": max(peaks) if peaks else "",
             "adapter_size_mb": adapter_sizes.get(method, 0.0),
         })
     base = next(row for row in summaries if row["method"] == "Base-DiT-SR")
@@ -278,6 +306,11 @@ def main() -> None:
     parser.add_argument("--alpha", type=int, default=16)
     parser.add_argument("--block_regex", default="")
     parser.add_argument("--save_images", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse saved method images and append recoverable per-image metrics.",
+    )
     parser.add_argument("--fp32", action="store_true")
     args = parser.parse_args()
 
@@ -291,6 +324,18 @@ def main() -> None:
     overlap_report = audit_overlap(paths, args.train_dir_for_overlap_check)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.resume and not args.save_images:
+        raise SystemExit("--resume requires --save_images so completed outputs can be reused.")
+
+    metrics_path = output_dir / "sr_metrics_per_image.csv"
+    recovery_path = output_dir / "sr_metrics_recovery.csv"
+    previous_rows = read_csv_rows(metrics_path) if args.resume else []
+    if args.resume and recovery_path.is_file():
+        previous_rows.extend(read_csv_rows(recovery_path))
+    image_rows_by_key: dict[tuple[str, str], dict] = {}
+    for row in previous_rows:
+        image_rows_by_key[(row["method"], row["image"])] = row
+    recovered_saved_images = 0
 
     sampler = build_sampler(args)
     union_blocks = adapter_blocks([path for _label, path in args.adapter], args.block_regex)
@@ -303,7 +348,6 @@ def main() -> None:
     sampler.model.eval()
     print(f"Injected union LoRA targets: blocks={len(union_blocks)} modules={len(injected)}")
 
-    image_rows = []
     adapter_sizes = {"Bicubic": 0.0, "Base-DiT-SR": 0.0}
     load_reports = {}
 
@@ -314,14 +358,18 @@ def main() -> None:
     for path in paths:
         hr = pil_to_tensor(Image.open(path), args.image_size)
         _lr, bicubic = make_lr(hr, args.sr_scale)
+        output_path = bicubic_dir / path.name
+        if args.resume and output_path.is_file():
+            bicubic = pil_to_tensor(Image.open(output_path), args.image_size)
         target, prediction = crop(hr, args.crop_border), crop(bicubic, args.crop_border)
-        image_rows.append({
+        row = {
             "method": "Bicubic", "image": path.name,
             "psnr": psnr(prediction, target), "ssim": ssim(prediction, target),
             "inference_time_s": 0.0, "peak_cuda_mem_mb": 0.0,
-        })
-        if args.save_images:
-            tensor_to_pil(bicubic).save(bicubic_dir / path.name)
+        }
+        image_rows_by_key[("Bicubic", path.name)] = row
+        if args.save_images and not output_path.is_file():
+            tensor_to_pil(bicubic).save(output_path)
 
     methods = [("Base-DiT-SR", None), *args.adapter]
     for method, adapter_path in methods:
@@ -334,7 +382,15 @@ def main() -> None:
             adapter_sizes[method] = adapter_path.stat().st_size / (1024.0**2)
             print(f"{method}: loaded={report['loaded']} inactive_union_modules={len(report['unexpected'])}")
 
-        if args.warmup_images > 0:
+        method_dir = output_dir / "images" / safe_name(method)
+        if args.save_images:
+            method_dir.mkdir(parents=True, exist_ok=True)
+        pending_inference = any(
+            not (args.resume and (method_dir / path.name).is_file())
+            for path in paths
+        )
+
+        if args.warmup_images > 0 and pending_inference:
             warm_hr = pil_to_tensor(Image.open(paths[0]), args.image_size)
             warm_lr, _warm_bicubic = make_lr(warm_hr, args.sr_scale)
             for warm_index in range(args.warmup_images):
@@ -343,13 +399,34 @@ def main() -> None:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
-        method_dir = output_dir / "images" / safe_name(method)
-        if args.save_images:
-            method_dir.mkdir(parents=True, exist_ok=True)
-
         for index, path in enumerate(paths):
             hr = pil_to_tensor(Image.open(path), args.image_size)
             lr, _bicubic = make_lr(hr, args.sr_scale)
+            output_path = method_dir / path.name
+            key = (method, path.name)
+            if args.resume and output_path.is_file():
+                if key not in image_rows_by_key:
+                    prediction = pil_to_tensor(
+                        Image.open(output_path), args.image_size
+                    )
+                    target_eval = crop(hr, args.crop_border)
+                    prediction_eval = crop(prediction, args.crop_border)
+                    row = {
+                        "method": method,
+                        "image": path.name,
+                        "psnr": psnr(prediction_eval, target_eval),
+                        "ssim": ssim(prediction_eval, target_eval),
+                        "inference_time_s": "",
+                        "peak_cuda_mem_mb": "",
+                    }
+                    image_rows_by_key[key] = row
+                    append_csv_row(recovery_path, row)
+                    recovered_saved_images += 1
+                print(
+                    f"{method:<28} [{index + 1:03d}/{len(paths)}] "
+                    "resume=existing"
+                )
+                continue
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             started = time.perf_counter()
@@ -369,16 +446,22 @@ def main() -> None:
                 "ssim": ssim(prediction_eval, target_eval),
                 "inference_time_s": elapsed, "peak_cuda_mem_mb": peak_mb,
             }
-            image_rows.append(row)
+            image_rows_by_key[key] = row
+            append_csv_row(recovery_path, row)
             if args.save_images:
-                tensor_to_pil(prediction).save(method_dir / path.name)
+                tensor_to_pil(prediction).save(output_path)
             print(
                 f"{method:<28} [{index + 1:03d}/{len(paths)}] "
                 f"PSNR={row['psnr']:.3f} SSIM={row['ssim']:.4f} time={elapsed:.2f}s"
             )
 
+    method_order = ["Bicubic", "Base-DiT-SR", *(label for label, _ in args.adapter)]
+    image_rows = sorted(
+        image_rows_by_key.values(),
+        key=lambda row: (method_order.index(row["method"]), row["image"]),
+    )
     summaries = summarize(image_rows, adapter_sizes)
-    write_csv(output_dir / "sr_metrics_per_image.csv", image_rows)
+    write_csv(metrics_path, image_rows)
     write_csv(output_dir / "sr_metrics_summary.csv", summaries)
     metadata = {
         "config_path": args.config_path,
@@ -393,10 +476,17 @@ def main() -> None:
         "injected_module_count": len(injected),
         "overlap_audit": overlap_report,
         "load_reports": load_reports,
+        "resume": args.resume,
+        "recovered_saved_images_without_timing": recovered_saved_images,
     }
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2, default=str), encoding="utf-8"
     )
+    if recovered_saved_images:
+        print(
+            f"Recovered {recovered_saved_images} saved predictions without timing; "
+            "see num_timed_images in the summary."
+        )
     print(f"Wrote results to {output_dir}")
 
 
