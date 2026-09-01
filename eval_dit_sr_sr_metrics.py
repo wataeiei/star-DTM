@@ -157,10 +157,18 @@ def atomic_save_png(image: torch.Tensor, path: Path) -> None:
 
 def make_lr(hr: torch.Tensor, scale: int) -> tuple[torch.Tensor, torch.Tensor]:
     lr = F.interpolate(
-        hr.unsqueeze(0), scale_factor=1.0 / scale, mode="bicubic", align_corners=False
+        hr.unsqueeze(0),
+        scale_factor=1.0 / scale,
+        mode="bicubic",
+        align_corners=False,
+        antialias=True,
     ).clamp(0, 1)
     bicubic = F.interpolate(
-        lr, size=hr.shape[-2:], mode="bicubic", align_corners=False
+        lr,
+        size=hr.shape[-2:],
+        mode="bicubic",
+        align_corners=False,
+        antialias=True,
     ).clamp(0, 1)
     return lr.squeeze(0), bicubic.squeeze(0)
 
@@ -505,6 +513,8 @@ def main() -> None:
         "num_images": len(paths),
         "excluded_images": args.exclude_image,
         "eval_seed": args.eval_seed,
+        "lr_degradation": "torch_bicubic_antialias",
+        "sr_scale": args.sr_scale,
         "official_sampler": True,
         "union_lora_blocks": sorted(union_blocks, key=core.natural_key),
         "injected_module_count": len(injected),
