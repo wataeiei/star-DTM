@@ -77,12 +77,18 @@ def build_per_seed(manifest: pd.DataFrame, expected_steps: int) -> pd.DataFrame:
         mean_requested = mean_numeric(gradskip_log, "requested_skip_count")
         total_blocks = int(item.total_blocks)
 
-        baseline_peak = max_numeric(baseline_log, "train_peak_cuda_mem_mb")
-        gradskip_peak = max_numeric(gradskip_log, "train_peak_cuda_mem_mb")
-        if np.isnan(baseline_peak):
-            baseline_peak = float(baseline_summary["peak_cuda_mem_mb"])
-        if np.isnan(gradskip_peak):
-            gradskip_peak = float(gradskip_summary["peak_cuda_mem_mb"])
+        baseline_train_peak = max_numeric(
+            baseline_log, "train_peak_cuda_mem_mb"
+        )
+        gradskip_train_peak = max_numeric(
+            gradskip_log, "train_peak_cuda_mem_mb"
+        )
+        baseline_experiment_peak = float(baseline_summary["peak_cuda_mem_mb"])
+        gradskip_experiment_peak = float(gradskip_summary["peak_cuda_mem_mb"])
+        if np.isnan(baseline_train_peak):
+            baseline_train_peak = baseline_experiment_peak
+        if np.isnan(gradskip_train_peak):
+            gradskip_train_peak = gradskip_experiment_peak
 
         baseline_adapter = float(baseline_summary["adapter_size_mb"])
         gradskip_adapter = float(gradskip_summary["adapter_size_mb"])
@@ -104,10 +110,15 @@ def build_per_seed(manifest: pd.DataFrame, expected_steps: int) -> pd.DataFrame:
                     gradskip_step_s, baseline_step_s
                 ),
                 "train_speedup_x": baseline_step_s / gradskip_step_s,
-                "baseline_peak_cuda_mb": baseline_peak,
-                "gradskip_peak_cuda_mb": gradskip_peak,
-                "peak_memory_reduction_pct": reduction(
-                    gradskip_peak, baseline_peak
+                "baseline_train_peak_cuda_mb": baseline_train_peak,
+                "gradskip_train_peak_cuda_mb": gradskip_train_peak,
+                "train_peak_memory_reduction_pct": reduction(
+                    gradskip_train_peak, baseline_train_peak
+                ),
+                "baseline_experiment_peak_cuda_mb": baseline_experiment_peak,
+                "gradskip_experiment_peak_cuda_mb": gradskip_experiment_peak,
+                "experiment_peak_memory_reduction_pct": reduction(
+                    gradskip_experiment_peak, baseline_experiment_peak
                 ),
                 "baseline_adapter_mb": baseline_adapter,
                 "gradskip_adapter_mb": gradskip_adapter,
@@ -132,7 +143,8 @@ def aggregate(per_seed: pd.DataFrame) -> pd.DataFrame:
         "gradskip_step_time_s",
         "train_time_reduction_pct",
         "train_speedup_x",
-        "peak_memory_reduction_pct",
+        "train_peak_memory_reduction_pct",
+        "experiment_peak_memory_reduction_pct",
         "adapter_reduction_pct",
         "parameter_reduction_pct",
     ]
@@ -147,6 +159,12 @@ def aggregate(per_seed: pd.DataFrame) -> pd.DataFrame:
             values = pd.to_numeric(group[metric], errors="coerce")
             row[f"{metric}_mean"] = values.mean()
             row[f"{metric}_sample_std"] = values.std(ddof=1)
+        row["train_time_reduction_from_mean_pct"] = reduction(
+            row["gradskip_step_time_s_mean"], row["baseline_step_time_s_mean"]
+        )
+        row["train_speedup_from_mean_x"] = (
+            row["baseline_step_time_s_mean"] / row["gradskip_step_time_s_mean"]
+        )
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -158,7 +176,7 @@ def plot_summary(summary: pd.DataFrame, output_dir: Path) -> None:
 
     fig, ax = plt.subplots(figsize=(6.6, 3.7))
     skip = summary["skip_ratio_pct_mean"].to_numpy()
-    speed = summary["train_time_reduction_pct_mean"].to_numpy()
+    speed = summary["train_time_reduction_from_mean_pct"].to_numpy()
     skip_std = summary["skip_ratio_pct_sample_std"].fillna(0).to_numpy()
     speed_std = summary["train_time_reduction_pct_sample_std"].fillna(0).to_numpy()
 
