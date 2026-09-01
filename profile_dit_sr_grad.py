@@ -124,21 +124,87 @@ def install_torchvision_stub_for_timm() -> None:
     feature_extraction = types.ModuleType("torchvision.models.feature_extraction")
     ops = types.ModuleType("torchvision.ops")
     ops_misc = types.ModuleType("torchvision.ops.misc")
+    utils = types.ModuleType("torchvision.utils")
 
     def create_feature_extractor(*args, **kwargs):
         raise RuntimeError("torchvision feature_extraction is not available in this profiling environment.")
 
+    def make_grid(
+        tensor,
+        nrow=8,
+        padding=2,
+        normalize=False,
+        value_range=None,
+        scale_each=False,
+        pad_value=0.0,
+        **_kwargs,
+    ):
+        """Small torchvision.utils.make_grid replacement used by BasicSR."""
+        if isinstance(tensor, (list, tuple)):
+            tensor = torch.stack(list(tensor), dim=0)
+        if not torch.is_tensor(tensor):
+            raise TypeError(f"Expected tensor or tensor list, got {type(tensor)!r}")
+        if tensor.ndim == 2:
+            tensor = tensor.unsqueeze(0)
+        if tensor.ndim == 3:
+            tensor = tensor.unsqueeze(0)
+        if tensor.ndim != 4:
+            raise ValueError(f"Expected 4D mini-batch, got shape {tuple(tensor.shape)}")
+        if tensor.shape[1] == 1:
+            tensor = tensor.repeat(1, 3, 1, 1)
+
+        tensor = tensor.detach().clone()
+        if normalize:
+            def norm_ip(image, low, high):
+                image.clamp_(min=low, max=high)
+                image.sub_(low).div_(max(high - low, 1e-5))
+
+            def norm_range(image):
+                if value_range is not None:
+                    norm_ip(image, value_range[0], value_range[1])
+                else:
+                    norm_ip(image, float(image.min()), float(image.max()))
+
+            if scale_each:
+                for image in tensor:
+                    norm_range(image)
+            else:
+                norm_range(tensor)
+
+        if tensor.shape[0] == 1:
+            return tensor.squeeze(0)
+        nrow = max(1, min(int(nrow), tensor.shape[0]))
+        ncol = int(math.ceil(float(tensor.shape[0]) / nrow))
+        height, width = int(tensor.shape[2]), int(tensor.shape[3])
+        grid = tensor.new_full(
+            (
+                tensor.shape[1],
+                ncol * height + padding * (ncol + 1),
+                nrow * width + padding * (nrow + 1),
+            ),
+            pad_value,
+        )
+        for index, image in enumerate(tensor):
+            row, col = divmod(index, nrow)
+            top = padding + row * (height + padding)
+            left = padding + col * (width + padding)
+            grid[:, top : top + height, left : left + width] = image
+        return grid
+
     feature_extraction.create_feature_extractor = create_feature_extractor
     ops_misc.FrozenBatchNorm2d = nn.BatchNorm2d
+    utils.make_grid = make_grid
     ops.misc = ops_misc
     models.feature_extraction = feature_extraction
     torchvision.models = models
     torchvision.ops = ops
+    torchvision.utils = utils
     sys.modules["torchvision"] = torchvision
     sys.modules["torchvision.models"] = models
     sys.modules["torchvision.models.feature_extraction"] = feature_extraction
     sys.modules["torchvision.ops"] = ops
     sys.modules["torchvision.ops.misc"] = ops_misc
+    sys.modules["torchvision.utils"] = utils
 
 
 class ImageFolderDataset(Dataset):
