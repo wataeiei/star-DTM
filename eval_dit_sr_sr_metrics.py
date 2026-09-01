@@ -132,6 +132,29 @@ def tensor_to_pil(image: torch.Tensor) -> Image.Image:
     return Image.fromarray(array, mode="RGB")
 
 
+def load_complete_image(path: Path, size: int) -> torch.Tensor | None:
+    """Load a complete saved prediction, returning None for partial files."""
+    try:
+        with Image.open(path) as image:
+            image.load()
+            if image.size != (size, size):
+                raise ValueError(
+                    f"expected {(size, size)}, found {image.size}"
+                )
+            return pil_to_tensor(image, size)
+    except (OSError, ValueError) as error:
+        print(f"Invalid saved image; rerunning {path}: {error}")
+        return None
+
+
+def atomic_save_png(image: torch.Tensor, path: Path) -> None:
+    """Write a PNG completely before replacing its final destination."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    tensor_to_pil(image).save(temporary, format="PNG")
+    temporary.replace(path)
+
+
 def make_lr(hr: torch.Tensor, scale: int) -> tuple[torch.Tensor, torch.Tensor]:
     lr = F.interpolate(
         hr.unsqueeze(0), scale_factor=1.0 / scale, mode="bicubic", align_corners=False
@@ -359,8 +382,13 @@ def main() -> None:
         hr = pil_to_tensor(Image.open(path), args.image_size)
         _lr, bicubic = make_lr(hr, args.sr_scale)
         output_path = bicubic_dir / path.name
-        if args.resume and output_path.is_file():
-            bicubic = pil_to_tensor(Image.open(output_path), args.image_size)
+        saved_bicubic = (
+            load_complete_image(output_path, args.image_size)
+            if args.resume and output_path.is_file()
+            else None
+        )
+        if saved_bicubic is not None:
+            bicubic = saved_bicubic
         target, prediction = crop(hr, args.crop_border), crop(bicubic, args.crop_border)
         row = {
             "method": "Bicubic", "image": path.name,
@@ -368,8 +396,8 @@ def main() -> None:
             "inference_time_s": 0.0, "peak_cuda_mem_mb": 0.0,
         }
         image_rows_by_key[("Bicubic", path.name)] = row
-        if args.save_images and not output_path.is_file():
-            tensor_to_pil(bicubic).save(output_path)
+        if args.save_images and saved_bicubic is None:
+            atomic_save_png(bicubic, output_path)
 
     methods = [("Base-DiT-SR", None), *args.adapter]
     for method, adapter_path in methods:
@@ -386,9 +414,12 @@ def main() -> None:
         if args.save_images:
             method_dir.mkdir(parents=True, exist_ok=True)
         pending_inference = any(
-            not (args.resume and (method_dir / path.name).is_file())
+            not (args.resume and load_complete_image(
+                method_dir / path.name, args.image_size
+            ) is not None)
             for path in paths
-        )
+            if (method_dir / path.name).is_file()
+        ) or any(not (method_dir / path.name).is_file() for path in paths)
 
         if args.warmup_images > 0 and pending_inference:
             warm_hr = pil_to_tensor(Image.open(paths[0]), args.image_size)
@@ -404,11 +435,14 @@ def main() -> None:
             lr, _bicubic = make_lr(hr, args.sr_scale)
             output_path = method_dir / path.name
             key = (method, path.name)
-            if args.resume and output_path.is_file():
+            saved_prediction = (
+                load_complete_image(output_path, args.image_size)
+                if args.resume and output_path.is_file()
+                else None
+            )
+            if saved_prediction is not None:
                 if key not in image_rows_by_key:
-                    prediction = pil_to_tensor(
-                        Image.open(output_path), args.image_size
-                    )
+                    prediction = saved_prediction
                     target_eval = crop(hr, args.crop_border)
                     prediction_eval = crop(prediction, args.crop_border)
                     row = {
@@ -449,7 +483,7 @@ def main() -> None:
             image_rows_by_key[key] = row
             append_csv_row(recovery_path, row)
             if args.save_images:
-                tensor_to_pil(prediction).save(output_path)
+                atomic_save_png(prediction, output_path)
             print(
                 f"{method:<28} [{index + 1:03d}/{len(paths)}] "
                 f"PSNR={row['psnr']:.3f} SSIM={row['ssim']:.4f} time={elapsed:.2f}s"
