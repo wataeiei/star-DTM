@@ -15,7 +15,9 @@ import csv
 import hashlib
 import json
 import math
+import sys
 import time
+import types
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -173,12 +175,32 @@ def reset_lora(model: torch.nn.Module) -> None:
         module.lora_up.weight.data.zero_()
 
 
+def install_unused_sampler_dataset_stub() -> None:
+    """Skip BasicSR dataset imports unused by direct ``sample_func`` calls."""
+    if "datapipe.datasets" in sys.modules:
+        return
+    import datapipe
+
+    datasets = types.ModuleType("datapipe.datasets")
+
+    def create_dataset(*_args, **_kwargs):
+        raise RuntimeError(
+            "Folder-based Sampler.inference is unavailable in this evaluator. "
+            "Use eval_dit_sr_sr_metrics.py --data_dir instead."
+        )
+
+    datasets.create_dataset = create_dataset
+    datapipe.datasets = datasets
+    sys.modules["datapipe.datasets"] = datasets
+
+
 def build_sampler(args):
     from omegaconf import OmegaConf
 
     # Install the same lightweight import guards used by the training scripts.
     core.install_timm_layers_stub()
     core.install_torchvision_stub_for_timm()
+    install_unused_sampler_dataset_stub()
     from sampler import Sampler
 
     configs = OmegaConf.load(args.config_path)
