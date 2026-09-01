@@ -124,6 +124,8 @@ def install_torchvision_stub_for_timm() -> None:
     feature_extraction = types.ModuleType("torchvision.models.feature_extraction")
     ops = types.ModuleType("torchvision.ops")
     ops_misc = types.ModuleType("torchvision.ops.misc")
+    transforms = types.ModuleType("torchvision.transforms")
+    transforms_functional = types.ModuleType("torchvision.transforms.functional")
     utils = types.ModuleType("torchvision.utils")
 
     def create_feature_extractor(*args, **kwargs):
@@ -191,19 +193,43 @@ def install_torchvision_stub_for_timm() -> None:
             grid[:, top : top + height, left : left + width] = image
         return grid
 
+    def normalize(tensor, mean, std, inplace=False):
+        """Torchvision-compatible channel normalization used by BasicSR."""
+        if not torch.is_tensor(tensor):
+            raise TypeError(f"Expected a tensor, got {type(tensor)!r}")
+        if tensor.ndim < 3:
+            raise ValueError(
+                f"Expected tensor image with at least 3 dimensions, got {tensor.ndim}"
+            )
+        if not tensor.is_floating_point():
+            raise TypeError("Input tensor must be floating point.")
+        if not inplace:
+            tensor = tensor.clone()
+        mean_tensor = torch.as_tensor(mean, dtype=tensor.dtype, device=tensor.device)
+        std_tensor = torch.as_tensor(std, dtype=tensor.dtype, device=tensor.device)
+        if (std_tensor == 0).any():
+            raise ValueError("std contains a zero value.")
+        shape = (-1,) + (1,) * (tensor.ndim - 2)
+        return tensor.sub_(mean_tensor.view(shape)).div_(std_tensor.view(shape))
+
     feature_extraction.create_feature_extractor = create_feature_extractor
     ops_misc.FrozenBatchNorm2d = nn.BatchNorm2d
+    transforms_functional.normalize = normalize
+    transforms.functional = transforms_functional
     utils.make_grid = make_grid
     ops.misc = ops_misc
     models.feature_extraction = feature_extraction
     torchvision.models = models
     torchvision.ops = ops
+    torchvision.transforms = transforms
     torchvision.utils = utils
     sys.modules["torchvision"] = torchvision
     sys.modules["torchvision.models"] = models
     sys.modules["torchvision.models.feature_extraction"] = feature_extraction
     sys.modules["torchvision.ops"] = ops
     sys.modules["torchvision.ops.misc"] = ops_misc
+    sys.modules["torchvision.transforms"] = transforms
+    sys.modules["torchvision.transforms.functional"] = transforms_functional
     sys.modules["torchvision.utils"] = utils
 
 
