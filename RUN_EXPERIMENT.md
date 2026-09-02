@@ -896,3 +896,58 @@ python3 eval_hf_dit4sr_sr_metrics.py \
 For a first run, verify that every row has `active_block_count=8`, the loss and
 gradient norm are finite, and `parallel_adapter.pt` is close to the intended
 parameter budget. Only then increase `--train_steps` to 100 or 1000.
+
+## All-LoRA vs Grad-BlockSkip on the SD-x4 Upscaler
+
+This verifies the same importance/block-skip pipeline on the on-board SD-x4
+Upscaler (`stabilityai/stable-diffusion-x4-upscaler`) that was validated on
+DiT-SR and DiT4SR. First confirm the UNet block/module naming for the installed
+diffusers:
+
+```bash
+python3 train_sdx4_all_lora_blockskip.py --inspect_only
+```
+
+Run the All-LoRA baseline:
+
+```bash
+python3 train_sdx4_all_lora_blockskip.py \
+  --method all_lora \
+  --data_dir data/ucmerced/train_hr \
+  --output_dir outputs/sdx4_all_lora \
+  --image_size 256 \
+  --target qv \
+  --rank 8 --alpha 16 \
+  --train_steps 200 \
+  --lr 1e-4 \
+  --profile_noise_ratios 0.05 0.2 0.4 0.6 0.8 0.95 \
+  --train_noise_ratios 0.05 0.2 0.4 0.6 0.8 0.95
+```
+
+Run Grad-BlockSkip (needs a skip trigger):
+
+```bash
+python3 train_sdx4_all_lora_blockskip.py \
+  --method grad_blockskip \
+  --data_dir data/ucmerced/train_hr \
+  --output_dir outputs/sdx4_blockskip \
+  --image_size 256 \
+  --target qv \
+  --rank 8 --alpha 16 \
+  --train_steps 200 \
+  --lr 1e-4 \
+  --profile_noise_ratios 0.05 0.2 0.4 0.6 0.8 0.95 \
+  --train_noise_ratios 0.05 0.2 0.4 0.6 0.8 0.95 \
+  --blockskip_count 6 \
+  --blockskip_min_run 2 --blockskip_max_run 4 --blockskip_max_runs 2 \
+  --residual_cache_device cpu \
+  --residual_cache_dtype fp32
+```
+
+Compare `summary.csv` between the two runs: `mean_train_step_time_s`,
+`peak_cuda_mem_mb`. In `train_log.csv`, a healthy Grad-BlockSkip run has
+`fallback_blocks == 0`, `replayable_blocks == skipped_block_count`, and a small
+`residual_loss_abs_diff`. Use `--blockskip_count 0` to disable the skip while
+keeping the rest of the pipeline, or `--disable_profiling` for fair
+selection-only timing. To isolate the skip (no patch sampling) set
+`--patch_min_fraction 1 --patch_max_fraction 1`.
