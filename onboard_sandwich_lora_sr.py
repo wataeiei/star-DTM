@@ -755,6 +755,12 @@ def comm(args: argparse.Namespace) -> None:
 
 
 def load_pipeline(dtype: torch.dtype):
+    # Transformers imports torchvision image helpers even though this training
+    # path only uses PIL/tensors. Install the existing compatibility stub first
+    # when the environment has a binary-incompatible torchvision build.
+    from profile_hf_dit4sr_grad import install_torchvision_stub
+
+    install_torchvision_stub()
     require_packages("diffusers", "transformers", "accelerate")
     from diffusers import StableDiffusionUpscalePipeline
 
