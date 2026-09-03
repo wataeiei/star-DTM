@@ -121,6 +121,17 @@ def main() -> None:
     parser.add_argument("--target", default="qv")
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--alpha", type=int, default=16)
+    parser.add_argument(
+        "--allow_sparse_adapter",
+        action="store_true",
+        help="Allow an adapter to contain a strict subset of the injected LoRA modules.",
+    )
+    parser.add_argument(
+        "--exclude_image",
+        action="append",
+        default=[],
+        help="Image basename to exclude from evaluation; repeat for multiple images.",
+    )
     parser.add_argument("--block_regex", default="")
     parser.add_argument("--dtype", default="bf16", choices=["fp32", "bf16", "fp16"])
     parser.add_argument("--cpu", action="store_true")
@@ -159,6 +170,11 @@ def main() -> None:
     dataset = core.ImageFolderDataset(
         args.data_dir, args.image_size, args.max_images
     )
+    if args.exclude_image:
+        excluded = set(args.exclude_image)
+        dataset.paths = [path for path in dataset.paths if path.name not in excluded]
+        if not dataset.paths:
+            raise SystemExit("No evaluation images remain after --exclude_image filtering.")
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -174,7 +190,9 @@ def main() -> None:
         reset_lora_to_base(transformer)
         if adapter_path is not None:
             report = adaptive.load_lora_adapter(transformer, adapter_path)
-            if report["missing"] or report["unexpected"]:
+            if report["missing"] or (
+                report["unexpected"] and not args.allow_sparse_adapter
+            ):
                 raise RuntimeError(
                     f"{method}: adapter mismatch: "
                     f"missing={report['missing'][:5]} "
@@ -239,6 +257,7 @@ def main() -> None:
         "target": args.target,
         "rank": args.rank,
         "alpha": args.alpha,
+        "excluded_images": args.exclude_image,
         "injected_module_count": len(injected),
         "load_reports": load_reports,
     }

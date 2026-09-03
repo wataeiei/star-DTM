@@ -321,6 +321,11 @@ def main():
         help="Profiler metadata JSON containing selected_blocks for metadata selection.",
     )
     parser.add_argument("--lora_selection_seed", type=int, default=42)
+    parser.add_argument(
+        "--reset_seed_after_lora_injection",
+        action="store_true",
+        help="Reset the training RNG after LoRA construction for controlled selection studies.",
+    )
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--grad_clip", type=float, default=1.0)
@@ -449,6 +454,8 @@ def main():
         args.block_regex,
         selected_blocks=set(selected_lora_blocks),
     )
+    if args.reset_seed_after_lora_injection:
+        core.set_seed(args.seed)
     print(
         f"LoRA selection={args.lora_selection} "
         f"blocks={len(selected_lora_blocks)}/{len(candidate_blocks)} "
