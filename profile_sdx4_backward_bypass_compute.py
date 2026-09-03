@@ -94,11 +94,14 @@ def load_bypass_blocks(
 
 def device_kernel_time_ms(profiler) -> float:
     total_us = 0.0
-    for event in profiler.key_averages():
-        value = getattr(event, "self_device_time_total", None)
-        if value is None:
-            value = getattr(event, "self_cuda_time_total", 0.0)
-        total_us += float(value or 0.0)
+    for event in profiler.events():
+        if "cuda" not in str(getattr(event, "device_type", "")).lower():
+            continue
+        time_range = getattr(event, "time_range", None)
+        if time_range is not None and hasattr(time_range, "elapsed_us"):
+            total_us += float(time_range.elapsed_us())
+        else:
+            total_us += float(getattr(event, "device_time_total", 0.0) or 0.0)
     return total_us / 1000.0
 
 
