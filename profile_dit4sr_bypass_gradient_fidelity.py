@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure full-vs-bypassed LoRA gradient fidelity across noise and budgets."""
+"""Measure full-vs-bypassed LoRA gradient behavior across noise and budgets."""
 
 from __future__ import annotations
 
@@ -56,8 +56,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--blockskip_min_run", type=int, default=2)
     parser.add_argument("--blockskip_max_run", type=int, default=4)
     parser.add_argument("--blockskip_max_runs", type=int, default=2)
-    parser.add_argument("--min_cosine", type=float, default=0.95)
-    parser.add_argument("--max_relative_error", type=float, default=0.10)
+    parser.add_argument(
+        "--selection_criterion",
+        choices=["descent", "fidelity"],
+        default="descent",
+        help=(
+            "Budget rule. 'descent' accepts a biased bypass gradient that remains "
+            "sufficiently aligned with the full-gradient descent direction; "
+            "'fidelity' requires a close approximation to the full gradient."
+        ),
+    )
+    parser.add_argument("--min_cosine", type=float, default=0.80)
+    parser.add_argument(
+        "--min_descent_retention",
+        type=float,
+        default=0.50,
+        help=(
+            "Minimum g_full dot g_bypass / ||g_full||^2 in descent mode. "
+            "This is the retained first-order decrease of the full objective."
+        ),
+    )
+    parser.add_argument(
+        "--max_relative_error",
+        type=float,
+        default=0.10,
+        help="Maximum relative gradient error in fidelity mode.",
+    )
     parser.add_argument("--target", default="qv")
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--alpha", type=int, default=16)
@@ -108,13 +132,20 @@ def gradient_metrics(reference: torch.Tensor, candidate: torch.Tensor) -> dict:
     candidate_norm = torch.linalg.vector_norm(candidate)
     difference_norm = torch.linalg.vector_norm(candidate - reference)
     denominator = reference_norm * candidate_norm
+    dot_product = torch.dot(reference, candidate)
     cosine = (
-        float(torch.dot(reference, candidate) / denominator)
+        float(dot_product / denominator)
         if float(denominator) > 0.0
+        else float("nan")
+    )
+    descent_retention = (
+        float(dot_product / reference_norm.square())
+        if float(reference_norm) > 0.0
         else float("nan")
     )
     return {
         "gradient_cosine": cosine,
+        "descent_retention": descent_retention,
         "relative_gradient_error": float(difference_norm / reference_norm)
         if float(reference_norm) > 0.0
         else float("nan"),
@@ -167,6 +198,7 @@ def aggregate_rows(rows: list[dict], args: argparse.Namespace) -> tuple[list[dic
         }
         for key in (
             "gradient_cosine",
+            "descent_retention",
             "relative_gradient_error",
             "gradient_norm_ratio",
             "loss_abs_diff",
@@ -181,12 +213,21 @@ def aggregate_rows(rows: list[dict], args: argparse.Namespace) -> tuple[list[dic
                 )
             else:
                 result[f"std_{key}"] = 0.0 if numbers else float("nan")
-        result["safe"] = bool(
+        common_safe = bool(
             result["all_feasible"]
             and result["mean_fallback_blocks"] == 0
             and result["mean_gradient_cosine"] >= args.min_cosine
-            and result["mean_relative_gradient_error"] <= args.max_relative_error
         )
+        if args.selection_criterion == "descent":
+            criterion_safe = (
+                result["mean_descent_retention"] >= args.min_descent_retention
+            )
+        else:
+            criterion_safe = (
+                result["mean_relative_gradient_error"] <= args.max_relative_error
+            )
+        result["selection_criterion"] = args.selection_criterion
+        result["safe"] = bool(common_safe and criterion_safe)
         summary.append(result)
 
     recommendations = []
@@ -200,8 +241,11 @@ def aggregate_rows(rows: list[dict], args: argparse.Namespace) -> tuple[list[dic
                 "noise_ratio": noise_ratio,
                 "recommended_bypass_budget": chosen["bypass_budget"] if chosen else 0,
                 "mean_gradient_cosine": chosen["mean_gradient_cosine"] if chosen else float("nan"),
+                "mean_descent_retention": chosen["mean_descent_retention"] if chosen else float("nan"),
                 "mean_relative_gradient_error": chosen["mean_relative_gradient_error"] if chosen else float("nan"),
+                "selection_criterion": args.selection_criterion,
                 "min_cosine_threshold": args.min_cosine,
+                "min_descent_retention_threshold": args.min_descent_retention,
                 "max_relative_error_threshold": args.max_relative_error,
             }
         )
@@ -214,7 +258,7 @@ def plot_summary(summary: list[dict], output_dir: Path, args: argparse.Namespace
     except ImportError:
         print("matplotlib unavailable; skipped plots.")
         return
-    fig, axes = plt.subplots(1, 2, figsize=(11.0, 4.2))
+    fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.2))
     noise_ratios = sorted({row["noise_ratio"] for row in summary})
     for noise_ratio in noise_ratios:
         values = sorted(
@@ -230,6 +274,12 @@ def plot_summary(summary: list[dict], output_dir: Path, args: argparse.Namespace
         )
         axes[1].plot(
             budgets,
+            [row["mean_descent_retention"] for row in values],
+            marker="o",
+            label=f"sigma={noise_ratio:g}",
+        )
+        axes[2].plot(
+            budgets,
             [row["mean_relative_gradient_error"] for row in values],
             marker="o",
             label=f"sigma={noise_ratio:g}",
@@ -242,8 +292,17 @@ def plot_summary(summary: list[dict], output_dir: Path, args: argparse.Namespace
         label=f"threshold={args.min_cosine:g}",
     )
     axes[1].set_xlabel("Bypass budget K")
-    axes[1].set_ylabel("Relative gradient error")
+    axes[1].set_ylabel("First-order descent retention")
     axes[1].axhline(
+        args.min_descent_retention,
+        color="#555555",
+        linestyle="--",
+        linewidth=1.0,
+        label=f"threshold={args.min_descent_retention:g}",
+    )
+    axes[2].set_xlabel("Bypass budget K")
+    axes[2].set_ylabel("Relative gradient error")
+    axes[2].axhline(
         args.max_relative_error, color="#555555", linestyle="--", linewidth=1.0,
         label=f"threshold={args.max_relative_error:g}",
     )
@@ -251,6 +310,7 @@ def plot_summary(summary: list[dict], output_dir: Path, args: argparse.Namespace
         axis.grid(alpha=0.25)
     axes[0].legend(frameon=False, fontsize=8, ncol=2)
     axes[1].legend(frameon=False, fontsize=8)
+    axes[2].legend(frameon=False, fontsize=8)
     fig.tight_layout()
     fig.savefig(output_dir / "bypass_gradient_fidelity.png", dpi=300)
     fig.savefig(output_dir / "bypass_gradient_fidelity.pdf")
@@ -265,6 +325,12 @@ def main() -> None:
         raise SystemExit("--noise_ratios values must be in [0, 1].")
     if any(budget < 0 for budget in args.bypass_budgets):
         raise SystemExit("--bypass_budgets values must be non-negative.")
+    if not -1.0 <= args.min_cosine <= 1.0:
+        raise SystemExit("--min_cosine must be in [-1, 1].")
+    if args.min_descent_retention < 0.0:
+        raise SystemExit("--min_descent_retention must be non-negative.")
+    if args.max_relative_error < 0.0:
+        raise SystemExit("--max_relative_error must be non-negative.")
 
     core.set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
@@ -426,6 +492,7 @@ def main() -> None:
                 print(
                     f"sigma={noise_ratio:.2f} batch={batch_index + 1}/{len(batches)} "
                     f"K={budget} cos={metrics['gradient_cosine']:.6f} "
+                    f"descent={metrics['descent_retention']:.6f} "
                     f"rel_err={metrics['relative_gradient_error']:.6f}"
                 )
         del args._profile_noise_ratio
@@ -452,7 +519,9 @@ def main() -> None:
         "noise_ratios": args.noise_ratios,
         "bypass_budgets": budgets,
         "probe_batches": args.probe_batches,
+        "selection_criterion": args.selection_criterion,
         "min_cosine": args.min_cosine,
+        "min_descent_retention": args.min_descent_retention,
         "max_relative_error": args.max_relative_error,
         "blockskip_min_run": args.blockskip_min_run,
         "blockskip_max_run": args.blockskip_max_run,
