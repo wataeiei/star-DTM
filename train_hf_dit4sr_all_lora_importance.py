@@ -386,6 +386,15 @@ def main():
         help="Exclude every selected trainable LoRA block from dynamic block skipping.",
     )
     parser.add_argument(
+        "--blockskip_protected_blocks",
+        nargs="*",
+        default=[],
+        help=(
+            "Additional logical blocks that must retain their exact backward "
+            "Jacobians. These blocks are excluded from dynamic and fixed bypass."
+        ),
+    )
+    parser.add_argument(
         "--fixed_skip_blocks", nargs="*", default=[],
         help="Explicit logical block names to skip on every step; overrides gradient selection.",
     )
@@ -426,6 +435,19 @@ def main():
         )
     if args.fixed_skip_blocks and args.always_skip_blocks:
         raise SystemExit("Use either --fixed_skip_blocks or --always_skip_blocks, not both.")
+    bypass_protected_blocks = set(args.blockskip_protected_blocks)
+    explicitly_skipped_blocks = (
+        set(args.fixed_skip_blocks) | set(args.always_skip_blocks)
+    )
+    protection_conflicts = sorted(
+        bypass_protected_blocks & explicitly_skipped_blocks,
+        key=core.natural_key,
+    )
+    if protection_conflicts:
+        raise SystemExit(
+            "Blocks cannot be both bypassed and protected: "
+            + ", ".join(protection_conflicts)
+        )
     if not 0.0 < args.patch_min_fraction <= args.patch_max_fraction <= 1.0:
         raise SystemExit("Require 0 < --patch_min_fraction <= --patch_max_fraction <= 1.")
     if args.checkpoint_every < 0:
@@ -446,6 +468,15 @@ def main():
     if not candidate_blocks:
         raise SystemExit("No candidate LoRA blocks found.")
     selected_lora_blocks = select_lora_blocks(args, candidate_blocks)
+    unknown_protected_blocks = sorted(
+        bypass_protected_blocks - set(candidate_blocks),
+        key=core.natural_key,
+    )
+    if unknown_protected_blocks:
+        raise SystemExit(
+            "Unknown protected block-skip blocks: "
+            + ", ".join(unknown_protected_blocks)
+        )
     injected = core.inject_lora(
         transformer,
         args.target,
@@ -462,6 +493,11 @@ def main():
         f"modules={len(injected)}"
     )
     print("Selected LoRA blocks: " + ", ".join(selected_lora_blocks))
+    if bypass_protected_blocks:
+        print(
+            "Additional backward-protected blocks: "
+            + ", ".join(sorted(bypass_protected_blocks, key=core.natural_key))
+        )
     transformer.train()
     dataset = core.ImageFolderDataset(args.data_dir, args.image_size, args.max_images)
     train_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
@@ -603,11 +639,9 @@ def main():
                 skip_blocks = list(args.fixed_skip_blocks)
             else:
                 mandatory = list(dict.fromkeys(args.always_skip_blocks))
-                protected = (
-                    set(selected_lora_blocks)
-                    if args.protect_selected_lora_blocks
-                    else set()
-                )
+                protected = set(bypass_protected_blocks)
+                if args.protect_selected_lora_blocks:
+                    protected.update(selected_lora_blocks)
                 if blockskip_fraction_schedule:
                     fraction = adaptive.noise_scheduled_float(
                         noise_ratio, blockskip_fraction_schedule, 0.0
