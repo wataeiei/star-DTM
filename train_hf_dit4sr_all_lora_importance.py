@@ -505,7 +505,11 @@ def main():
             args.blockskip_importance_csv,
             args.blockskip_importance_step,
         )
-    if blockskip_importance_rows:
+    if args.fixed_skip_blocks:
+        # Explicit fixed bypass may target any candidate block, including blocks
+        # outside a sparse LoRA placement. Do not restrict it to profiled LoRA blocks.
+        block_names = list(candidate_blocks)
+    elif blockskip_importance_rows:
         first_ratio = min(float(row["noise_ratio"]) for row in blockskip_importance_rows)
         block_names = [
             row["block"]
@@ -543,10 +547,14 @@ def main():
         or args.fixed_skip_blocks
         or args.always_skip_blocks
     ):
-        if args.disable_profiling and not args.fixed_skip_blocks:
+        if (
+            args.disable_profiling
+            and not args.fixed_skip_blocks
+            and not args.blockskip_importance_csv
+        ):
             raise SystemExit(
-                "Dynamic block skipping requires profiling; remove --disable_profiling "
-                "or use --fixed_skip_blocks."
+                "Dynamic block skipping requires an importance table; remove "
+                "--disable_profiling or provide --blockskip_importance_csv."
             )
         configured_blocks = set(args.fixed_skip_blocks) | set(args.always_skip_blocks)
         unknown = sorted(configured_blocks - set(block_names))
