@@ -40,6 +40,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_dir", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--selection_file", required=True)
+    parser.add_argument(
+        "--protected_block",
+        action="append",
+        default=[],
+        help="Additional frozen block to exclude from bypass; repeat as needed.",
+    )
     parser.add_argument("--importance_csv", required=True)
     parser.add_argument("--importance_step", type=int, default=0)
     parser.add_argument("--adapter", default="")
@@ -347,7 +353,8 @@ def main() -> None:
     candidates = train_core.candidate_lora_blocks(
         transformer, args.target, args.block_regex
     )
-    protected = selected_blocks(args.selection_file)
+    lora_blocks = selected_blocks(args.selection_file)
+    protected = list(dict.fromkeys(lora_blocks + args.protected_block))
     unknown = sorted(set(protected) - set(candidates), key=core.natural_key)
     if unknown:
         raise SystemExit("Selection file contains unknown blocks: " + ", ".join(unknown))
@@ -357,7 +364,7 @@ def main() -> None:
         args.rank,
         args.alpha,
         args.block_regex,
-        selected_blocks=set(protected),
+        selected_blocks=set(lora_blocks),
     )
     if args.adapter:
         report = adaptive.load_lora_adapter(transformer, args.adapter)
