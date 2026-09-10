@@ -97,6 +97,12 @@ def main() -> None:
     parser.add_argument("--max_run", type=int, default=6)
     parser.add_argument("--max_runs", type=int, default=3)
     parser.add_argument("--compute_tolerance_pct", type=float, default=1.0)
+    parser.add_argument(
+        "--objective",
+        choices=["descent_retention", "relative_gradient_error", "gradient_cosine"],
+        default="descent_retention",
+        help="Calibration quantity optimized under the matched-compute constraint.",
+    )
     parser.add_argument("--output_dir", required=True)
     args = parser.parse_args()
 
@@ -116,6 +122,11 @@ def main() -> None:
             key = (noise, budget)
             if key not in fidelity:
                 raise ValueError(f"Missing fidelity row for noise={noise:g}, budget={budget}")
+            fidelity_row = fidelity[key]
+            if fidelity_row.get("all_feasible", "True").lower() != "true":
+                raise ValueError(f"Infeasible calibration row for noise={noise:g}, budget={budget}")
+            if float(fidelity_row.get("mean_fallback_blocks", 0)) != 0:
+                raise ValueError(f"Fallback calibration row for noise={noise:g}, budget={budget}")
             blocks = select_low_score_runs(
                 importance, noise, budget, args.min_run, args.max_run,
                 args.max_runs, protected,
@@ -123,10 +134,21 @@ def main() -> None:
             missing = sorted(set(blocks) - costs.keys())
             if missing:
                 raise ValueError(f"Missing block costs: {missing}")
+            measurements = {
+                "descent_retention": float(fidelity_row["mean_descent_retention"]),
+                "relative_gradient_error": float(fidelity_row["mean_relative_gradient_error"]),
+                "gradient_cosine": float(fidelity_row["mean_gradient_cosine"]),
+            }
+            penalty = (
+                measurements["relative_gradient_error"]
+                if args.objective == "relative_gradient_error"
+                else -measurements[args.objective]
+            )
             policies[key] = {
                 "blocks": blocks,
                 "saved_gflops": sum(costs[block] for block in blocks),
-                "penalty": float(fidelity[key]["mean_relative_gradient_error"]),
+                "penalty": penalty,
+                **measurements,
             }
 
     target = sum(policies[(noise, args.fixed_budget)]["saved_gflops"] for noise in noises) / len(noises)
@@ -159,7 +181,9 @@ def main() -> None:
             rows.append({
                 "method": label, "noise_ratio": noise, "bypass_budget": schedule[noise],
                 "estimated_saved_gflops": policy["saved_gflops"],
-                "relative_gradient_error": policy["penalty"],
+                "gradient_cosine": policy["gradient_cosine"],
+                "descent_retention": policy["descent_retention"],
+                "relative_gradient_error": policy["relative_gradient_error"],
                 "skip_blocks": ";".join(policy["blocks"]),
             })
 
@@ -171,6 +195,7 @@ def main() -> None:
         "fixed_budget": args.fixed_budget,
         "target_saved_gflops_per_step": target,
         "compute_tolerance_pct": args.compute_tolerance_pct,
+        "optimization_objective": args.objective,
         "noise_aware_saved_gflops_per_step": chosen_saved,
         "noise_aware_difference_pct": (chosen_saved / target - 1.0) * 100.0,
         "reverse_saved_gflops_per_step": reverse_saved,
