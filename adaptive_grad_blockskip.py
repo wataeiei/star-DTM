@@ -532,6 +532,9 @@ class ResidualBlockWrapper(nn.Module):
                 self.controller.fallbacks[self.name] = str(exc)
                 return self.block(*args, **kwargs)
 
+        if self.controller.mode == "single_run_skip" and selected:
+            return self.controller.forward_run_block(self, args, kwargs)
+
         output = self.block(*args, **kwargs)
         if self.controller.mode == "cache" and selected:
             refs = _tensor_inputs(args, kwargs)
@@ -572,6 +575,8 @@ class CacheStats:
     peak_cuda_mem_mb: float = 0.0
     fallback_names: str = ""
     max_reconstruction_abs_diff: float = 0.0
+    bypass_run_count: int = 0
+    bypass_run_blocks: str = ""
 
 
 class ResidualBlockController:
@@ -590,6 +595,11 @@ class ResidualBlockController:
         self.cache_dtype = cache_dtype
         self.fallbacks: dict[str, str] = {}
         self.wrappers: dict[str, ResidualBlockWrapper] = {}
+        self.block_order = list(block_paths)
+        self.run_by_block: dict[str, tuple[int, int, int]] = {}
+        self.run_blocks: list[tuple[str, ...]] = []
+        self.active_run_refs: dict[int, list[torch.Tensor]] = {}
+        self.active_run_next_position: dict[int, int] = {}
         modules = {
             logical_name: (path, get_module(root, path))
             for logical_name, path in block_paths.items()
@@ -599,9 +609,111 @@ class ResidualBlockController:
             set_module(root, path, wrapper)
             self.wrappers[logical_name] = wrapper
 
+    @staticmethod
+    def _block_group_and_index(block: str) -> tuple[str, int] | None:
+        parts = block.split(".")
+        if parts[0] == "transformer_blocks" and len(parts) > 1 and parts[1].isdigit():
+            return "transformer_blocks", int(parts[1])
+        if parts[0] in {"input_blocks", "output_blocks"} and len(parts) > 1:
+            numeric = [int(part) for part in parts[1:] if part.isdigit()]
+            if numeric:
+                return ".".join(parts[:2]), numeric[-1]
+        if parts[0] == "middle_block":
+            numeric = [int(part) for part in parts[1:] if part.isdigit()]
+            if numeric:
+                return "middle_block", numeric[-1]
+        return None
+
+    def _configure_runs(self) -> None:
+        self.run_by_block.clear()
+        self.run_blocks.clear()
+        current: list[str] = []
+        previous: tuple[str, int] | None = None
+        for block in self.block_order:
+            if block not in self.skip_blocks:
+                if current:
+                    self.run_blocks.append(tuple(current))
+                    current = []
+                previous = None
+                continue
+            location = self._block_group_and_index(block)
+            contiguous = (
+                bool(current)
+                and location is not None
+                and previous is not None
+                and location[0] == previous[0]
+                and location[1] == previous[1] + 1
+            )
+            if current and not contiguous:
+                self.run_blocks.append(tuple(current))
+                current = []
+            current.append(block)
+            previous = location
+        if current:
+            self.run_blocks.append(tuple(current))
+        for run_index, blocks in enumerate(self.run_blocks):
+            for position, block in enumerate(blocks):
+                self.run_by_block[block] = (run_index, position, len(blocks))
+
+    def forward_run_block(
+        self,
+        wrapper: ResidualBlockWrapper,
+        args: tuple,
+        kwargs: dict,
+    ) -> Any:
+        run_index, position, run_length = self.run_by_block[wrapper.name]
+        if position == 0:
+            if run_index in self.active_run_refs:
+                raise RuntimeError(f"Bypass run {run_index} started more than once")
+            refs = _tensor_inputs(args, kwargs)
+            if not refs:
+                raise RuntimeError(
+                    f"Bypass run starting at {wrapper.name} has no tensor inputs"
+                )
+            self.active_run_refs[run_index] = refs
+            self.active_run_next_position[run_index] = 0
+        expected = self.active_run_next_position.get(run_index)
+        if expected != position:
+            blocks = ", ".join(self.run_blocks[run_index])
+            raise RuntimeError(
+                f"Non-contiguous execution for bypass run [{blocks}]: "
+                f"expected position {expected}, received {position}"
+            )
+
+        with torch.no_grad():
+            output = wrapper.block(*args, **kwargs)
+        wrapper.cached_bytes = 0
+        wrapper.replayable = True
+        wrapper.single_pass_used = True
+        wrapper.single_pass_max_abs_diff = 0.0
+        self.active_run_next_position[run_index] = position + 1
+        if position + 1 < run_length:
+            return output
+
+        refs = self.active_run_refs.pop(run_index)
+        self.active_run_next_position.pop(run_index)
+        try:
+            rebuilt, residual_bytes, max_abs_diff = _reconnect_residual(
+                output,
+                refs,
+                set(),
+                self.cache_dtype,
+            )
+        except ValueError as exc:
+            blocks = ", ".join(self.run_blocks[run_index])
+            raise RuntimeError(
+                f"Cannot reconnect complete bypass run [{blocks}]: {exc}"
+            ) from exc
+        wrapper.cached_bytes = residual_bytes
+        wrapper.single_pass_max_abs_diff = max_abs_diff
+        return rebuilt
+
     def configure(self, skip_blocks: Iterable[str]) -> None:
         self.skip_blocks = set(skip_blocks)
         self.fallbacks.clear()
+        self.active_run_refs.clear()
+        self.active_run_next_position.clear()
+        self._configure_runs()
         for wrapper in self.wrappers.values():
             wrapper.cached = None
             wrapper.cached_bytes = 0
@@ -610,8 +722,12 @@ class ResidualBlockController:
             wrapper.single_pass_max_abs_diff = 0.0
 
     def set_mode(self, mode: str) -> None:
-        if mode not in {"full", "cache", "skip", "single_skip"}:
+        if mode not in {"full", "cache", "skip", "single_skip", "single_run_skip"}:
             raise ValueError(f"Unknown block controller mode: {mode}")
+        if self.mode == "single_run_skip" and mode != "single_run_skip":
+            if self.active_run_refs:
+                pending = sorted(self.active_run_refs)
+                raise RuntimeError(f"Incomplete run-level bypass executions: {pending}")
         self.mode = mode
 
     def stats(
@@ -620,6 +736,9 @@ class ResidualBlockController:
         teacher_loss: float = 0.0,
         peak_cuda_mem_mb: float = 0.0,
     ) -> CacheStats:
+        if self.mode == "single_run_skip" and self.active_run_refs:
+            pending = sorted(self.active_run_refs)
+            raise RuntimeError(f"Incomplete run-level bypass executions: {pending}")
         selected = [self.wrappers[name] for name in self.skip_blocks]
         return CacheStats(
             elapsed_s=elapsed_s,
@@ -640,6 +759,10 @@ class ResidualBlockController:
                     if wrapper.single_pass_used
                 ),
                 default=0.0,
+            ),
+            bypass_run_count=len(self.run_blocks),
+            bypass_run_blocks="|".join(
+                ";".join(blocks) for blocks in self.run_blocks
             ),
         )
 

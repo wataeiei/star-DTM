@@ -406,9 +406,13 @@ def main():
     parser.add_argument("--residual_cache_dtype", choices=["fp16", "bf16", "fp32"], default="fp16")
     parser.add_argument(
         "--residual_execution",
-        choices=["two_pass", "single_pass"],
+        choices=["two_pass", "single_pass", "single_pass_run"],
         default="two_pass",
-        help="Separate teacher-cache forward or in-forward no-grad residual bypass.",
+        help=(
+            "Separate teacher-cache forward, per-block single-pass bypass, or "
+            "run-level single-pass bypass with one straight-through reconnect "
+            "per contiguous run."
+        ),
     )
     parser.add_argument("--patch_min_fraction", type=float, default=1.0)
     parser.add_argument("--patch_max_fraction", type=float, default=1.0)
@@ -677,7 +681,11 @@ def main():
                     device,
                 )
             else:
-                controller.set_mode("single_skip")
+                controller.set_mode(
+                    "single_run_skip"
+                    if args.residual_execution == "single_pass_run"
+                    else "single_skip"
+                )
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats()
         train_start = time.perf_counter()
@@ -706,7 +714,7 @@ def main():
             max_cuda_reserved_mb, train_peak_cuda_reserved_mb
         )
         if controller is not None:
-            if args.residual_execution == "single_pass":
+            if args.residual_execution in {"single_pass", "single_pass_run"}:
                 cache_stats = controller.stats(0.0)
             controller.set_mode("full")
         del args._profile_noise_ratio
@@ -728,6 +736,8 @@ def main():
                 else ""
             ),
             "replayable_blocks": cache_stats.replayable_blocks,
+            "bypass_run_count": cache_stats.bypass_run_count,
+            "bypass_run_blocks": cache_stats.bypass_run_blocks,
             "fallback_blocks": cache_stats.fallback_blocks,
             "fallback_block_names": cache_stats.fallback_names,
             "residual_forward_max_abs_diff": cache_stats.max_reconstruction_abs_diff,
