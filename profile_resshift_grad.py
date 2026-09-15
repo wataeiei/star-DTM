@@ -70,16 +70,26 @@ def split_parent_name(root: nn.Module, dotted_name: str) -> tuple[nn.Module, str
 
 
 class ImageFolderDataset(Dataset):
-    def __init__(self, root: str | Path, image_size: int, scale: int, max_images: int) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        image_size: int,
+        scale: int,
+        max_images: int,
+        seed: int,
+    ) -> None:
         root = Path(root)
         self.paths = sorted(
             (path for path in root.rglob("*") if path.suffix.lower() in IMAGE_EXTS),
             key=lambda path: natural_key(str(path)),
         )
-        if max_images > 0:
-            self.paths = self.paths[:max_images]
         if not self.paths:
             raise FileNotFoundError(f"No images found under {root}")
+        if 0 < max_images < len(self.paths):
+            self.paths = sorted(
+                random.Random(seed).sample(self.paths, max_images),
+                key=lambda path: natural_key(str(path)),
+            )
         if image_size % scale:
             raise ValueError(f"image_size={image_size} must be divisible by scale={scale}")
         self.image_size = image_size
@@ -127,13 +137,22 @@ class LoRALinear(nn.Module):
         return base + update.to(dtype=base.dtype)
 
 
-def inject_packed_qkv_lora(model: nn.Module, rank: int, alpha: float) -> dict[str, LoRALinear]:
+def inject_packed_qkv_lora(
+    model: nn.Module,
+    rank: int,
+    alpha: float,
+    selected_blocks: set[str] | None = None,
+) -> dict[str, LoRALinear]:
     replacements = []
     for name, module in model.named_modules():
         if (
             isinstance(module, nn.Linear)
             and name.endswith(".attn.qkv")
             and module.out_features == 3 * module.in_features
+            and (
+                selected_blocks is None
+                or block_from_qkv(name) in selected_blocks
+            )
         ):
             replacements.append((name, module))
     if not replacements:
@@ -221,7 +240,13 @@ def profile(args: argparse.Namespace) -> None:
     block_index = {block: index for index, block in enumerate(blocks)}
     model.train()
 
-    dataset = ImageFolderDataset(args.data_dir, args.image_size, args.sr_scale, args.max_images)
+    dataset = ImageFolderDataset(
+        args.data_dir,
+        args.image_size,
+        args.sr_scale,
+        args.max_images,
+        args.seed,
+    )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -335,6 +360,7 @@ def profile(args: argparse.Namespace) -> None:
         "injected_module_count": len(injected),
         "noise_anchors": anchors,
         "probe_batches_per_anchor": len(batches),
+        "calibration_images": [str(path) for path in dataset.paths[: len(batches) * args.batch_size]],
         "seed": args.seed,
         "importance_csv": str(importance_path),
     }
