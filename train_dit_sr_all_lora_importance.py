@@ -510,6 +510,7 @@ def main():
         "fp32": torch.float32,
     }[args.residual_cache_dtype]
     controller = None
+    controller_block_names = []
     if (
         args.blockskip_count > 0
         or blockskip_schedule
@@ -521,9 +522,20 @@ def main():
         unknown = sorted(configured_blocks - set(block_names))
         if unknown:
             raise SystemExit("Unknown explicitly configured blocks: " + ", ".join(unknown))
+        protected_from_dynamic_skip = set(args.blockskip_protected_blocks)
+        if args.protect_selected_lora_blocks:
+            protected_from_dynamic_skip.update(selected_lora_blocks)
+        controller_candidates = (
+            set(block_names) - protected_from_dynamic_skip
+        ) | configured_blocks
+        controller_block_names = [
+            block for block in block_names if block in controller_candidates
+        ]
+        if not controller_block_names:
+            raise SystemExit("No backward-bypass candidates remain after protection.")
         block_paths = adaptive.infer_block_module_paths(
             target_module_names,
-            block_names,
+            controller_block_names,
             core.block_key,
             args.block_regex,
         )
@@ -532,6 +544,10 @@ def main():
             block_paths,
             cache_device=args.residual_cache_device,
             cache_dtype=cache_dtype,
+        )
+        print(
+            "Backward controller hooks: "
+            f"{len(controller_block_names)}/{len(block_names)} candidate blocks"
         )
     train_noise_ratios = args.train_noise_ratios or args.profile_noise_ratios
     if any(not 0.0 <= ratio <= 1.0 for ratio in train_noise_ratios):
@@ -745,6 +761,8 @@ def main():
     metadata = vars(args) | {
         "parsed_blockskip_schedule": blockskip_schedule,
         "parsed_blockskip_fraction_schedule": blockskip_fraction_schedule,
+        "controller_block_names": controller_block_names,
+        "controller_block_count": len(controller_block_names),
         "profile_steps": sorted(profile_steps),
         "injected_module_count": len(injected),
         "candidate_lora_blocks": candidate_blocks,
