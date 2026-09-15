@@ -63,6 +63,169 @@ def read_csv_rows(path: Path) -> list[dict]:
         return list(csv.DictReader(handle))
 
 
+def resolved_path(value: str | Path) -> str:
+    return str(Path(value).expanduser().resolve())
+
+
+def file_identity(value: str | Path) -> dict:
+    path = Path(value).expanduser().resolve()
+    stat = path.stat()
+    return {"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def base_cache_signature(args, paths: list[Path]) -> dict:
+    digest = hashlib.sha256()
+    for path in paths:
+        stat = path.stat()
+        digest.update(str(path.resolve()).encode("utf-8"))
+        digest.update(f":{stat.st_size}:{stat.st_mtime_ns}\n".encode("ascii"))
+    return {
+        "config": file_identity(args.config_path),
+        "checkpoint": file_identity(args.ckpt_path),
+        "autoencoder": file_identity(args.autoencoder_ckpt),
+        "data_dir": resolved_path(args.data_dir),
+        "eval_manifest_sha256": digest.hexdigest(),
+        "image_names": [path.name for path in paths],
+        "image_size": args.image_size,
+        "lq_size": args.lq_size,
+        "sr_scale": args.sr_scale,
+        "eval_seed": args.eval_seed,
+        "fp32": args.fp32,
+        "sampler": "official_dit_sr",
+        "lr_degradation": "torch_bicubic_antialias",
+    }
+
+
+def metadata_base_compatible(metadata: dict, args, paths: list[Path]) -> bool:
+    """Support older result directories that predate cache signatures."""
+    path_fields = {
+        "config_path": args.config_path,
+        "ckpt_path": args.ckpt_path,
+        "autoencoder_ckpt": args.autoencoder_ckpt,
+        "data_dir": args.data_dir,
+    }
+    for key, expected in path_fields.items():
+        value = metadata.get(key)
+        if not value or resolved_path(value) != resolved_path(expected):
+            return False
+    scalar_defaults = {
+        "eval_seed": args.eval_seed,
+        "sr_scale": args.sr_scale,
+        "image_size": 256,
+        "lq_size": 64,
+        "fp32": False,
+    }
+    current = {
+        "eval_seed": args.eval_seed,
+        "sr_scale": args.sr_scale,
+        "image_size": args.image_size,
+        "lq_size": args.lq_size,
+        "fp32": args.fp32,
+    }
+    for key, expected in current.items():
+        if metadata.get(key, scalar_defaults[key]) != expected:
+            return False
+    if metadata.get("lr_degradation", "torch_bicubic_antialias") != "torch_bicubic_antialias":
+        return False
+    if metadata.get("official_sampler", True) is not True:
+        return False
+    if int(metadata.get("num_images", len(paths))) != len(paths):
+        return False
+    return True
+
+
+def rebuild_cached_base_rows(
+    result_csv: Path,
+    eval_paths: list[Path],
+    args,
+) -> list[dict]:
+    rows = [row for row in read_csv_rows(result_csv) if row.get("method") == "Base-DiT-SR"]
+    by_name = {Path(row.get("image", "")).name: row for row in rows}
+    expected_names = [path.name for path in eval_paths]
+    if len(rows) != len(eval_paths) or set(by_name) != set(expected_names):
+        return []
+
+    image_dir = result_csv.parent / "images" / safe_name("Base-DiT-SR")
+    rebuilt = []
+    for source_path in eval_paths:
+        cached_path = image_dir / source_path.name
+        prediction = load_complete_image(cached_path, args.image_size) if cached_path.is_file() else None
+        if prediction is None:
+            return []
+        hr = pil_to_tensor(Image.open(source_path), args.image_size)
+        target_eval = crop(hr, args.crop_border)
+        prediction_eval = crop(prediction, args.crop_border)
+        previous = by_name[source_path.name]
+        rebuilt.append({
+            "method": "Base-DiT-SR",
+            "image": source_path.name,
+            "psnr": psnr(prediction_eval, target_eval),
+            "ssim": ssim(prediction_eval, target_eval),
+            "inference_time_s": previous.get("inference_time_s", ""),
+            "peak_cuda_mem_mb": previous.get("peak_cuda_mem_mb", ""),
+        })
+    return rebuilt
+
+
+def find_cached_base(args, eval_paths: list[Path], output_dir: Path) -> tuple[list[dict], Path | None]:
+    if not args.auto_reuse_base or args.force_base_eval:
+        return [], None
+    search_root = (
+        Path(args.baseline_search_dir).expanduser()
+        if args.baseline_search_dir
+        else output_dir.parent
+    )
+    if not search_root.is_dir():
+        return [], None
+    current_csv = (output_dir / "sr_metrics_per_image.csv").resolve()
+    candidates = sorted(
+        search_root.rglob("sr_metrics_per_image.csv"),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    signature = base_cache_signature(args, eval_paths)
+    for result_csv in candidates:
+        if result_csv.resolve() == current_csv:
+            continue
+        metadata_path = result_csv.parent / "metadata.json"
+        if not metadata_path.is_file():
+            continue
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        saved_signature = metadata.get("base_cache_signature")
+        if saved_signature is not None:
+            compatible = saved_signature == signature
+        else:
+            compatible = metadata_base_compatible(metadata, args, eval_paths)
+        if not compatible:
+            continue
+        rows = rebuild_cached_base_rows(result_csv, eval_paths, args)
+        if rows:
+            return rows, result_csv
+    return [], None
+
+
+def link_cached_base_images(
+    source_csv: Path,
+    eval_paths: list[Path],
+    output_dir: Path,
+) -> None:
+    source_dir = source_csv.parent / "images" / safe_name("Base-DiT-SR")
+    destination_dir = output_dir / "images" / safe_name("Base-DiT-SR")
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    for eval_path in eval_paths:
+        source = (source_dir / eval_path.name).resolve()
+        destination = destination_dir / eval_path.name
+        if destination.exists() or destination.is_symlink():
+            continue
+        try:
+            destination.hardlink_to(source)
+        except OSError:
+            destination.symlink_to(source)
+
+
 def append_csv_row(path: Path, row: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not path.is_file() or path.stat().st_size == 0
@@ -323,6 +486,22 @@ def main() -> None:
     parser.add_argument("--data_dir", required=True)
     parser.add_argument("--train_dir_for_overlap_check", default="")
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument(
+        "--baseline_search_dir",
+        default="",
+        help="Directory searched recursively for compatible completed Base-DiT-SR results; defaults to the output directory's parent.",
+    )
+    parser.add_argument(
+        "--auto_reuse_base",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Automatically reuse a compatible completed Base-DiT-SR evaluation.",
+    )
+    parser.add_argument(
+        "--force_base_eval",
+        action="store_true",
+        help="Ignore cached Base-DiT-SR results and run base inference again.",
+    )
     parser.add_argument("--adapter", action="append", type=parse_adapter, default=[])
     parser.add_argument("--exclude_image", action="append", default=[])
     parser.add_argument("--image_size", type=int, default=256)
@@ -368,6 +547,19 @@ def main() -> None:
         image_rows_by_key[(row["method"], row["image"])] = row
     recovered_saved_images = 0
 
+    cached_base_rows, cached_base_source = find_cached_base(args, paths, output_dir)
+    for row in cached_base_rows:
+        image_rows_by_key[(row["method"], row["image"])] = row
+    if cached_base_source is not None:
+        print(
+            "Automatically reusing Base-DiT-SR from "
+            f"{cached_base_source}; base diffusion inference is skipped."
+        )
+        if args.save_images:
+            link_cached_base_images(cached_base_source, paths, output_dir)
+    elif args.auto_reuse_base and not args.force_base_eval:
+        print("No compatible Base-DiT-SR cache found; evaluating base normally.")
+
     sampler = build_sampler(args)
     union_blocks = adapter_blocks([path for _label, path in args.adapter], args.block_regex)
     injected = []
@@ -407,7 +599,7 @@ def main() -> None:
         if args.save_images and saved_bicubic is None:
             atomic_save_png(bicubic, output_path)
 
-    methods = [("Base-DiT-SR", None), *args.adapter]
+    methods = [*([("Base-DiT-SR", None)] if not cached_base_rows else []), *args.adapter]
     for method, adapter_path in methods:
         reset_lora(sampler.model)
         if adapter_path is not None:
@@ -520,6 +712,10 @@ def main() -> None:
         "injected_module_count": len(injected),
         "overlap_audit": overlap_report,
         "load_reports": load_reports,
+        "base_cache_signature": base_cache_signature(args, paths),
+        "auto_reuse_base": args.auto_reuse_base,
+        "cached_base_source": str(cached_base_source) if cached_base_source else "",
+        "base_inference_skipped": bool(cached_base_rows),
         "resume": args.resume,
         "recovered_saved_images_without_timing": recovered_saved_images,
     }
