@@ -20,6 +20,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
+import adaptive_grad_blockskip as adaptive
 from inspect_resshift_structure import install_timm_layers_stub, load_checkpoint
 from profile_resshift_grad import (
     ImageFolderDataset,
@@ -98,6 +99,48 @@ def aggregate_importance(
         row["aggregate_rank"] = rank
         row["cumulative_utility"] = cumulative
     return details
+
+
+def read_blockskip_importance(path: Path, step: int) -> list[dict]:
+    rows = read_csv(path)
+    required = {
+        "train_step",
+        "noise_ratio",
+        "block",
+        "block_index",
+        "normalized_grad_score",
+    }
+    if not rows:
+        raise ValueError("Block-skip importance CSV is empty")
+    missing = sorted(required - set(rows[0]))
+    if missing:
+        raise ValueError(
+            "Block-skip importance CSV is missing columns: " + ", ".join(missing)
+        )
+    chosen = [row for row in rows if int(row["train_step"]) == step]
+    if not chosen:
+        available = sorted({int(row["train_step"]) for row in rows})
+        raise ValueError(
+            f"Block-skip importance step {step} is unavailable; available={available}"
+        )
+    return chosen
+
+
+def read_blockskip_policy(path: Path) -> dict[float, list[str]]:
+    rows = read_csv(path)
+    if not rows:
+        raise ValueError("Block-skip policy CSV is empty")
+    required = {"noise_ratio", "skip_blocks"}
+    missing = sorted(required - set(rows[0]))
+    if missing:
+        raise ValueError("Block-skip policy CSV is missing columns: " + ", ".join(missing))
+    result = {}
+    for row in rows:
+        noise = float(row["noise_ratio"])
+        if noise in result:
+            raise ValueError(f"Duplicate block-skip policy noise ratio: {noise:g}")
+        result[noise] = [block for block in row["skip_blocks"].split(";") if block]
+    return result
 
 
 def choose_blocks(
@@ -240,6 +283,72 @@ def train(args: argparse.Namespace) -> None:
     )
     if len(injected) != len(selected):
         raise RuntimeError(f"Injected {len(injected)} modules for {len(selected)} blocks")
+
+    blockskip_schedule = adaptive.parse_noise_int_schedule(args.blockskip_schedule)
+    blockskip_policy = (
+        read_blockskip_policy(Path(args.blockskip_policy_csv))
+        if args.blockskip_policy_csv
+        else {}
+    )
+    controller = None
+    controller_blocks: list[str] = []
+    blockskip_rows: list[dict] = []
+    if blockskip_schedule or blockskip_policy or args.blockskip_controller_only:
+        if not args.blockskip_importance_csv and not blockskip_policy:
+            raise ValueError(
+                "--blockskip_importance_csv is required when the bypass controller is enabled"
+            )
+        if args.blockskip_importance_csv:
+            blockskip_rows = read_blockskip_importance(
+                Path(args.blockskip_importance_csv), args.blockskip_importance_step
+            )
+            known = {str(row["block"]) for row in blockskip_rows}
+            if known != set(all_blocks):
+                raise ValueError(
+                    "Block-skip importance blocks do not match the model: "
+                    f"missing={sorted(set(all_blocks) - known)} "
+                    f"unknown={sorted(known - set(all_blocks))}"
+                )
+        protected = set(selected) if args.protect_selected_lora_blocks else set()
+        if blockskip_policy:
+            potential = {block for blocks in blockskip_policy.values() for block in blocks}
+            unknown = potential - set(all_blocks)
+            if unknown:
+                raise ValueError(f"Block-skip policy contains unknown blocks: {sorted(unknown)}")
+            overlap = potential & protected
+            if overlap:
+                raise ValueError(f"Block-skip policy contains protected LoRA blocks: {sorted(overlap)}")
+        else:
+            potential = set()
+            for ratio in sorted({float(row["noise_ratio"]) for row in blockskip_rows}):
+                requested = adaptive.noise_scheduled_int(ratio, blockskip_schedule, 0)
+                potential.update(
+                    adaptive.select_low_score_runs(
+                        blockskip_rows,
+                        args.blockskip_importance_step,
+                        ratio,
+                        requested,
+                        args.blockskip_min_run,
+                        args.blockskip_max_run,
+                        args.blockskip_max_runs,
+                        score_key=args.blockskip_score_key,
+                        excluded_blocks=protected,
+                    )
+                )
+        controller_blocks = [block for block in all_blocks if block in potential]
+        if not controller_blocks and not args.blockskip_controller_only:
+            raise ValueError("The configured bypass policy never selects a block")
+        if controller_blocks:
+            controller = adaptive.ResidualBlockController(
+                model,
+                {block: block for block in controller_blocks},
+                cache_device="cpu",
+                cache_dtype=torch.float32,
+            )
+        print(
+            f"Backward controller wrappers: {len(controller_blocks)}/{len(all_blocks)} "
+            "candidate blocks"
+        )
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not trainable:
         raise RuntimeError("No trainable LoRA parameters")
@@ -310,6 +419,40 @@ def train(args: argparse.Namespace) -> None:
             dtype=gt.dtype,
         )
 
+        if blockskip_policy:
+            policy_ratio = min(blockskip_policy, key=lambda value: abs(value - ratio))
+            policy_blocks = list(blockskip_policy[policy_ratio])
+            requested_skip_count = len(policy_blocks)
+        else:
+            policy_blocks = []
+            requested_skip_count = adaptive.noise_scheduled_int(
+                ratio, blockskip_schedule, 0
+            )
+        skipped_blocks: list[str] = []
+        if controller is not None:
+            if not args.blockskip_controller_only and requested_skip_count > 0:
+                if blockskip_policy:
+                    skipped_blocks = policy_blocks
+                else:
+                    excluded = set(selected) if args.protect_selected_lora_blocks else set()
+                    skipped_blocks = adaptive.select_low_score_runs(
+                        blockskip_rows,
+                        args.blockskip_importance_step,
+                        ratio,
+                        requested_skip_count,
+                        args.blockskip_min_run,
+                        args.blockskip_max_run,
+                        args.blockskip_max_runs,
+                        score_key=args.blockskip_score_key,
+                        excluded_blocks=excluded,
+                    )
+            controller.configure(skipped_blocks)
+            controller.set_mode(
+                "single_run_skip"
+                if args.residual_execution == "single_run"
+                else "single_skip"
+            )
+
         sync(device)
         step_started = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
@@ -333,6 +476,16 @@ def train(args: argparse.Namespace) -> None:
         sync(device)
         elapsed = time.perf_counter() - step_started
         train_time += elapsed
+        bypass_stats = (
+            controller.stats(elapsed)
+            if controller is not None
+            else adaptive.CacheStats(
+                elapsed_s=elapsed,
+                cache_mb=0.0,
+                replayable_blocks=0,
+                fallback_blocks=0,
+            )
+        )
         peak_mb = (
             torch.cuda.max_memory_allocated(device) / (1024.0**2)
             if device.type == "cuda" else 0.0
@@ -346,6 +499,21 @@ def train(args: argparse.Namespace) -> None:
             "grad_norm": float(torch.as_tensor(grad_norm).detach().cpu()),
             "train_step_time_s": elapsed,
             "peak_cuda_mem_mb": peak_mb,
+            "train_peak_cuda_mem_mb": peak_mb,
+            "cache_peak_cuda_mem_mb": 0.0,
+            "residual_cache_time_s": 0.0,
+            "residual_cache_mb": 0.0,
+            "requested_skip_count": requested_skip_count,
+            "skipped_block_count": len(skipped_blocks),
+            "skipped_blocks": ";".join(skipped_blocks),
+            "replayable_blocks": bypass_stats.replayable_blocks,
+            "fallback_blocks": bypass_stats.fallback_blocks,
+            "fallback_block_names": bypass_stats.fallback_names,
+            "residual_forward_max_abs_diff": (
+                bypass_stats.max_reconstruction_abs_diff
+            ),
+            "bypass_run_count": bypass_stats.bypass_run_count,
+            "bypass_run_blocks": bypass_stats.bypass_run_blocks,
         }
         rows.append(row)
         if step == 1 or step % args.log_every == 0 or step == args.train_steps:
@@ -387,6 +555,16 @@ def train(args: argparse.Namespace) -> None:
         "batch_size": args.batch_size,
         "lr": args.lr,
         "seed": args.seed,
+        "blockskip_schedule": blockskip_schedule,
+        "blockskip_importance_csv": args.blockskip_importance_csv or None,
+        "blockskip_policy_csv": args.blockskip_policy_csv or None,
+        "blockskip_importance_step": args.blockskip_importance_step,
+        "blockskip_score_key": args.blockskip_score_key,
+        "protect_selected_lora_blocks": args.protect_selected_lora_blocks,
+        "blockskip_controller_only": args.blockskip_controller_only,
+        "controller_blocks": controller_blocks,
+        "controller_block_count": len(controller_blocks),
+        "residual_execution": args.residual_execution,
         **selection_report,
     }
     (output_dir / "metadata.json").write_text(
@@ -441,6 +619,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument("--blockskip_schedule", nargs="*", default=[])
+    parser.add_argument("--blockskip_importance_csv", default="")
+    parser.add_argument("--blockskip_policy_csv", default="")
+    parser.add_argument("--blockskip_importance_step", type=int, default=0)
+    parser.add_argument("--blockskip_score_key", default="normalized_grad_score")
+    parser.add_argument("--blockskip_min_run", type=int, default=1)
+    parser.add_argument("--blockskip_max_run", type=int, default=18)
+    parser.add_argument("--blockskip_max_runs", type=int, default=18)
+    parser.add_argument("--protect_selected_lora_blocks", action="store_true")
+    parser.add_argument("--blockskip_controller_only", action="store_true")
+    parser.add_argument(
+        "--residual_execution",
+        choices=["single_pass", "single_run"],
+        default="single_pass",
+    )
     parser.add_argument("--cpu", action="store_true")
     return parser
 
@@ -456,6 +649,12 @@ def main() -> None:
         parser.error("lr and grad_clip must be positive")
     if args.importance_threshold < 0:
         parser.error("importance_threshold must be non-negative")
+    if args.blockskip_min_run < 1:
+        parser.error("blockskip_min_run must be positive")
+    if args.blockskip_max_run < args.blockskip_min_run:
+        parser.error("blockskip_max_run must be >= blockskip_min_run")
+    if args.blockskip_max_runs < 1:
+        parser.error("blockskip_max_runs must be positive")
     if any(not 0.0 <= ratio <= 1.0 for ratio in args.train_noise_ratios):
         parser.error("train_noise_ratios must be in [0, 1]")
     try:
