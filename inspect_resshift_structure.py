@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import sys
+import types
 from pathlib import Path
 
 
@@ -32,6 +33,44 @@ def stage_from_name(name: str) -> str:
 def block_from_target(name: str) -> str:
     marker = ".attn.qkv"
     return name[: name.index(marker)] if marker in name else ""
+
+
+def install_timm_layers_stub(torch) -> None:
+    """Provide the three legacy timm helpers used by ResShift's Swin module."""
+    for name in list(sys.modules):
+        if name == "timm" or name.startswith("timm."):
+            del sys.modules[name]
+
+    class DropPath(torch.nn.Module):
+        def __init__(self, drop_prob: float = 0.0) -> None:
+            super().__init__()
+            self.drop_prob = float(drop_prob)
+
+        def forward(self, value):
+            if self.drop_prob == 0.0 or not self.training:
+                return value
+            keep_prob = 1.0 - self.drop_prob
+            shape = (value.shape[0],) + (1,) * (value.ndim - 1)
+            random_tensor = keep_prob + torch.rand(
+                shape, dtype=value.dtype, device=value.device
+            )
+            random_tensor.floor_()
+            return value.div(keep_prob) * random_tensor
+
+    def to_2tuple(value):
+        return value if isinstance(value, tuple) else (value, value)
+
+    timm = types.ModuleType("timm")
+    models = types.ModuleType("timm.models")
+    layers = types.ModuleType("timm.models.layers")
+    layers.DropPath = DropPath
+    layers.to_2tuple = to_2tuple
+    layers.trunc_normal_ = torch.nn.init.trunc_normal_
+    timm.models = models
+    models.layers = layers
+    sys.modules["timm"] = timm
+    sys.modules["timm.models"] = models
+    sys.modules["timm.models.layers"] = layers
 
 
 def load_checkpoint(model, checkpoint: Path, torch) -> tuple[list[str], list[str]]:
@@ -136,6 +175,7 @@ def main() -> None:
     except ImportError as exc:
         parser.error(f"ResShift environment is incomplete: {exc}")
 
+    install_timm_layers_stub(torch)
     config = OmegaConf.load(config_path)
     model = get_obj_from_str(config.model.target)(**config.model.get("params", {}))
     missing = []
