@@ -8,6 +8,8 @@ import csv
 import json
 import math
 import shlex
+import subprocess
+import sys
 from pathlib import Path
 
 from build_dit_sr_threshold_lora import make_selection, read_csv
@@ -99,6 +101,63 @@ def choose_lora(candidates, retention, metric):
         raise ValueError("No LoRA candidate satisfies the utility-retention constraint")
     chosen = min(feasible, key=lambda row: (row[metric], row["selected_count"], -row["utility"]))
     return chosen, rows, reference_utility
+
+
+def profile_bypass_costs(args, out, chosen_lora, training_data_dir, source):
+    """Measure the chosen LoRA placement's per-block bypass costs before training."""
+    profile_dir = out / "bypass_cost_profile"
+    selection_path = out / "lora_selection_for_cost_profile.json"
+    metadata = dict(chosen_lora["metadata"])
+    metadata["selected_blocks"] = list(chosen_lora["selected_blocks"])
+    metadata["selected_lora_blocks"] = list(chosen_lora["selected_blocks"])
+    metadata["topk_blocks"] = chosen_lora["selected_count"]
+    write_json(selection_path, metadata)
+
+    script = Path(args.cost_profile_script)
+    if not script.is_absolute() and not script.is_file():
+        sibling = Path(__file__).resolve().parent / script
+        if sibling.is_file():
+            script = sibling
+    if not script.is_file():
+        raise ValueError(f"Cost profiling script does not exist: {script}")
+    command = [
+        sys.executable,
+        str(script),
+        "--model", "dit-sr",
+        "--selection_file", str(selection_path),
+        "--data_dir", str(training_data_dir),
+        "--output_dir", str(profile_dir),
+        "--importance_csv", str(args.importance_csv),
+        "--importance_step", str(args.importance_step),
+        "--noise_ratio", str(args.cost_noise_ratio),
+        "--batch_size", "1",
+        "--warmup", str(args.cost_warmup),
+        "--repeats", str(args.cost_repeats),
+        "--num_workers", "0",
+        "--seed", str(args.cost_seed),
+    ]
+    overrides = (
+        ("--config_path", args.config_path or source.get("config_path", "")),
+        ("--ckpt_path", args.ckpt_path or source.get("ckpt_path", "")),
+        ("--autoencoder_ckpt", args.autoencoder_ckpt or source.get("autoencoder_ckpt", "")),
+    )
+    for flag, value in overrides:
+        if value:
+            command.extend([flag, str(value)])
+    for block in args.protected_block:
+        command.extend(["--protected_block", block])
+    if args.cpu_cost_profile:
+        command.append("--cpu")
+    print(
+        f"Profiling K={chosen_lora['selected_count']} LoRA-specific bypass costs "
+        f"into {profile_dir}"
+    )
+    subprocess.run(command, check=True)
+    cost_path = profile_dir / "block_backward_costs.csv"
+    if not cost_path.is_file():
+        raise ValueError(f"Cost profiler did not create {cost_path}")
+    print(f"Using newly profiled bypass costs: {cost_path}")
+    return cost_path, command
 
 
 def load_costs(path, all_blocks, selected, explicit_protected):
@@ -252,22 +311,33 @@ def auto_select(args):
         args.lora_policy_dir, args.lora_compute_csv, utility, args.max_lora_blocks)
     chosen_lora, candidate_rows, reference_utility = choose_lora(
         candidates, args.min_lora_utility_retention, args.lora_cost_metric)
-    costs, protected, invalid_cost, eligible = load_costs(
-        args.bypass_cost_csv, all_blocks, chosen_lora["selected_blocks"], args.protected_block)
-    chosen_bypass, bypass_scan, policy, cap, fidelity_checked = choose_bypass(
-        groups, indices, eligible, costs, weights, chosen_lora["reported_gflops"],
-        reference_cost, args)
 
     out = Path(args.output_dir)
     if out.exists() and (not out.is_dir() or any(out.iterdir())):
         raise ValueError(f"Output directory is not empty: {out}")
     out.mkdir(parents=True, exist_ok=True)
+    if args.bypass_cost_csv:
+        bypass_cost_path = Path(args.bypass_cost_csv)
+        cost_source = "reused"
+        cost_profile_command = None
+    else:
+        bypass_cost_path, cost_profile_command = profile_bypass_costs(
+            args, out, chosen_lora, training_data_dir, source
+        )
+        cost_source = "profiled_pretraining"
+    costs, protected, invalid_cost, eligible = load_costs(
+        bypass_cost_path, all_blocks, chosen_lora["selected_blocks"], args.protected_block)
+    chosen_bypass, bypass_scan, policy, cap, fidelity_checked = choose_bypass(
+        groups, indices, eligible, costs, weights, chosen_lora["reported_gflops"],
+        reference_cost, args)
+
     lora_meta = dict(chosen_lora["metadata"])
     lora_meta.update({
         "selection_policy": "auto-noise-normalized-threshold",
         "auto_selected_label": chosen_lora["label"],
         "auto_utility_retention": chosen_lora["utility_retention"],
         "auto_selection_report": str(out / "auto_selection.json"),
+        "selected_lora_blocks": list(chosen_lora["selected_blocks"]),
     })
     write_json(out / "dit_sr_grad_metadata.json", lora_meta)
     public_candidates = [{key: row[key] for key in (
@@ -292,6 +362,11 @@ def auto_select(args):
         "lora_cost_metric": args.lora_cost_metric,
         "lora_reported_gflops": chosen_lora["reported_gflops"],
         "reference_top8_reported_gflops": reference_cost,
+        "bypass_cost_source": cost_source,
+        "bypass_cost_csv": str(bypass_cost_path),
+        "bypass_cost_profile_command": (
+            shlex.join(cost_profile_command) if cost_profile_command else None
+        ),
         "bypass_threshold": chosen_bypass["bypass_threshold"],
         "bypass_schedule": schedule,
         "mean_bypass_budget": chosen_bypass["mean_bypass_budget"],
@@ -365,10 +440,23 @@ def main():
     parser.add_argument("--source_metadata", required=True)
     parser.add_argument("--lora_policy_dir", required=True)
     parser.add_argument("--lora_compute_csv", required=True)
-    parser.add_argument("--bypass_cost_csv", required=True)
+    parser.add_argument(
+        "--bypass_cost_csv",
+        default="",
+        help="Reuse an existing K-specific cost CSV; omit to profile it automatically.",
+    )
     parser.add_argument("--fidelity_csv", default="")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--data_dir", default="", help="Override the calibration metadata data directory")
+    parser.add_argument("--cost_profile_script", default="profile_dit_bypass_block_costs.py")
+    parser.add_argument("--config_path", default="")
+    parser.add_argument("--ckpt_path", default="")
+    parser.add_argument("--autoencoder_ckpt", default="")
+    parser.add_argument("--cost_noise_ratio", type=float, default=0.4)
+    parser.add_argument("--cost_warmup", type=int, default=3)
+    parser.add_argument("--cost_repeats", type=int, default=10)
+    parser.add_argument("--cost_seed", type=int, default=4242)
+    parser.add_argument("--cpu_cost_profile", action="store_true")
     parser.add_argument("--train_output_dir", default="outputs/dit_sr_auto_lora_bypass_seed42")
     parser.add_argument("--train_steps", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
@@ -396,9 +484,11 @@ def main():
         parser.error("target_total_compute_reduction_pct must be in [0, 100)")
     if args.train_steps < 1:
         parser.error("train_steps must be positive")
+    if args.cost_warmup < 0 or args.cost_repeats < 1:
+        parser.error("cost_warmup must be non-negative and cost_repeats must be positive")
     try:
         report = auto_select(args)
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as exc:
         parser.error(str(exc))
     print(json.dumps(report, indent=2, allow_nan=False))
     if not report["gradient_fidelity_checked"]:

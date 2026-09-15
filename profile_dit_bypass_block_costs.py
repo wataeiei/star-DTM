@@ -134,7 +134,15 @@ def join_importance(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, choices=["dit4sr", "dit-sr"])
-    parser.add_argument("--run_dir", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--run_dir",
+        help="Existing training run containing metadata.json and lora_adapter.pt.",
+    )
+    source.add_argument(
+        "--selection_file",
+        help="Pretraining LoRA selection metadata; profiles fresh injected LoRA weights.",
+    )
     parser.add_argument("--data_dir", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--importance_csv", default="")
@@ -156,12 +164,28 @@ def main() -> None:
     if args.warmup < 0 or args.repeats <= 0:
         raise SystemExit("Require --warmup >= 0 and --repeats > 0")
 
-    run_dir = Path(args.run_dir)
-    metadata_path = run_dir / "metadata.json"
-    adapter_path = run_dir / "lora_adapter.pt"
-    if not metadata_path.is_file() or not adapter_path.is_file():
-        raise SystemExit(f"Missing metadata.json or lora_adapter.pt in {run_dir}")
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if args.run_dir:
+        run_dir = Path(args.run_dir)
+        metadata_path = run_dir / "metadata.json"
+        adapter_path = run_dir / "lora_adapter.pt"
+        if not metadata_path.is_file() or not adapter_path.is_file():
+            raise SystemExit(f"Missing metadata.json or lora_adapter.pt in {run_dir}")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        args.adapter_path = str(adapter_path)
+        adapter_loaded = True
+    else:
+        run_dir = None
+        selection_path = Path(args.selection_file)
+        if not selection_path.is_file():
+            raise SystemExit(f"Missing selection metadata: {selection_path}")
+        metadata = json.loads(selection_path.read_text(encoding="utf-8-sig"))
+        selected = metadata.get("selected_lora_blocks", metadata.get("selected_blocks"))
+        if not selected:
+            raise SystemExit("Selection metadata contains no selected LoRA blocks.")
+        metadata["selected_lora_blocks"] = list(selected)
+        args.run_dir = ""
+        args.adapter_path = ""
+        adapter_loaded = False
 
     core_seed = int(metadata.get("seed", args.seed))
     torch.manual_seed(core_seed)
@@ -287,7 +311,9 @@ def main() -> None:
 
     summary = {
         "model": args.model,
-        "run_dir": str(run_dir),
+        "run_dir": str(run_dir) if run_dir is not None else None,
+        "selection_file": args.selection_file,
+        "adapter_loaded": adapter_loaded,
         "profile_noise_ratio": args.noise_ratio,
         "importance_csv": args.importance_csv,
         "importance_step": args.importance_step,

@@ -85,6 +85,16 @@ def modal_skip_sets(log_rows: list[dict]) -> list[dict]:
     return result
 
 
+def load_optional_adapter(model: torch.nn.Module, args: argparse.Namespace) -> dict:
+    """Load a trained adapter when supplied, or retain fresh LoRA weights."""
+    adapter_path = getattr(args, "adapter_path", "")
+    if not adapter_path and getattr(args, "run_dir", ""):
+        adapter_path = Path(args.run_dir) / "lora_adapter.pt"
+    if not adapter_path:
+        return {"missing": [], "unexpected": [], "loaded": 0}
+    return adaptive.load_lora_adapter(model, adapter_path)
+
+
 def load_experiment(args: argparse.Namespace, metadata: dict, device: torch.device):
     run_args = argparse.Namespace(**metadata)
     run_args.data_dir = args.data_dir
@@ -111,7 +121,9 @@ def load_experiment(args: argparse.Namespace, metadata: dict, device: torch.devi
         candidates = train_core.candidate_lora_blocks(
             model, run_args.target, run_args.block_regex
         )
-        selected = metadata["selected_lora_blocks"]
+        selected = metadata.get("selected_lora_blocks", metadata.get("selected_blocks"))
+        if not selected:
+            raise SystemExit("Selection metadata contains no selected LoRA blocks.")
         core.inject_lora(
             model,
             run_args.target,
@@ -120,9 +132,7 @@ def load_experiment(args: argparse.Namespace, metadata: dict, device: torch.devi
             run_args.block_regex,
             selected_blocks=set(selected),
         )
-        adapter_status = adaptive.load_lora_adapter(
-            model, Path(args.run_dir) / "lora_adapter.pt"
-        )
+        adapter_status = load_optional_adapter(model, args)
         dataset = core.ImageFolderDataset(args.data_dir, run_args.image_size, 0)
 
         def loss_fn(batch, ratio):
@@ -155,7 +165,9 @@ def load_experiment(args: argparse.Namespace, metadata: dict, device: torch.devi
         candidates = train_core.candidate_lora_blocks(
             model, run_args.target, run_args.block_regex
         )
-        selected = metadata["selected_lora_blocks"]
+        selected = metadata.get("selected_lora_blocks", metadata.get("selected_blocks"))
+        if not selected:
+            raise SystemExit("Selection metadata contains no selected LoRA blocks.")
         core.inject_lora(
             model,
             run_args.target,
@@ -164,9 +176,7 @@ def load_experiment(args: argparse.Namespace, metadata: dict, device: torch.devi
             run_args.block_regex,
             selected_blocks=set(selected),
         )
-        adapter_status = adaptive.load_lora_adapter(
-            model, Path(args.run_dir) / "lora_adapter.pt"
-        )
+        adapter_status = load_optional_adapter(model, args)
         dataset = core.ImageFolderDataset(args.data_dir, run_args.image_size, 0)
 
         def loss_fn(batch, ratio):

@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from auto_select_lora_bypass import auto_select
 
@@ -79,6 +80,11 @@ class AutoSelectionTests(unittest.TestCase):
             min_gradient_cosine=0.9, max_relative_gradient_error=0.5,
             train_output_dir="outputs/auto", train_steps=100, seed=42,
             data_dir=str(self.root / "data"),
+            cost_profile_script=str(Path(__file__).with_name("profile_dit_bypass_block_costs.py")),
+            config_path="configs/realsr_DiT.yaml", ckpt_path="weights/realsr.pth",
+            autoencoder_ckpt="weights/autoencoder_vq_f4.pth",
+            cost_noise_ratio=0.4, cost_warmup=3, cost_repeats=10,
+            cost_seed=4242, cpu_cost_profile=False,
         )
 
     def test_joint_selection_and_training_outputs(self):
@@ -119,6 +125,33 @@ class AutoSelectionTests(unittest.TestCase):
         report = auto_select(args)
         self.assertEqual(report["nonpositive_cost_blocks_protected"], ["b3"])
         self.assertIn("b3", report["additional_protected_blocks"])
+
+    def test_missing_cost_csv_profiles_then_selects(self):
+        args = self.args("profiled")
+        args.bypass_cost_csv = ""
+
+        def fake_profile(command, check):
+            self.assertTrue(check)
+            self.assertIn("--selection_file", command)
+            self.assertNotIn("--run_dir", command)
+            output_dir = Path(command[command.index("--output_dir") + 1])
+            output_dir.mkdir(parents=True)
+            write_csv(output_dir / "block_backward_costs.csv", [
+                dict(block=f"b{i}", reported_gflops_saved=2, max_loss_abs_diff=0)
+                for i in range(4)
+            ])
+
+        with mock.patch("auto_select_lora_bypass.subprocess.run", side_effect=fake_profile) as run:
+            report = auto_select(args)
+
+        run.assert_called_once()
+        self.assertEqual(report["bypass_cost_source"], "profiled_pretraining")
+        self.assertTrue(Path(report["bypass_cost_csv"]).is_file())
+        self.assertIn("--selection_file", report["bypass_cost_profile_command"])
+        metadata = json.loads(
+            (self.root / "profiled/lora_selection_for_cost_profile.json").read_text()
+        )
+        self.assertEqual(metadata["selected_lora_blocks"], ["b4", "b5"])
 
 
 if __name__ == "__main__":
