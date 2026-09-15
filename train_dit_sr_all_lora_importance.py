@@ -330,6 +330,14 @@ def main():
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--blockskip_count", type=int, default=0)
     parser.add_argument(
+        "--blockskip_controller_only",
+        action="store_true",
+        help=(
+            "Install the wrappers implied by the configured policy but execute "
+            "zero bypasses. This is a timing control, not a training policy."
+        ),
+    )
+    parser.add_argument(
         "--blockskip_schedule", nargs="*", default=[],
         metavar="SIGMA:COUNT",
         help="Noise-aware skip counts, for example 0.05:8 0.4:4 0.95:8.",
@@ -504,6 +512,9 @@ def main():
             "--protect_selected_lora_blocks requires --blockskip_importance_csv "
             "from a full-model probe."
         )
+    train_noise_ratios = args.train_noise_ratios or args.profile_noise_ratios
+    if any(not 0.0 <= ratio <= 1.0 for ratio in train_noise_ratios):
+        raise SystemExit("--train_noise_ratios values must be in [0, 1].")
     cache_dtype = {
         "fp16": torch.float16,
         "bf16": torch.bfloat16,
@@ -525,9 +536,38 @@ def main():
         protected_from_dynamic_skip = set(args.blockskip_protected_blocks)
         if args.protect_selected_lora_blocks:
             protected_from_dynamic_skip.update(selected_lora_blocks)
-        controller_candidates = (
-            set(block_names) - protected_from_dynamic_skip
-        ) | configured_blocks
+        controller_candidates = set(configured_blocks)
+        if args.blockskip_importance_csv and not args.fixed_skip_blocks:
+            mandatory = list(dict.fromkeys(args.always_skip_blocks))
+            controller_candidates.update(mandatory)
+            for noise_ratio in sorted(set(train_noise_ratios)):
+                if blockskip_fraction_schedule:
+                    fraction = adaptive.noise_scheduled_float(
+                        noise_ratio, blockskip_fraction_schedule, 0.0
+                    )
+                    scheduled_count = round(fraction * len(block_names))
+                else:
+                    scheduled_count = adaptive.noise_scheduled_int(
+                        noise_ratio, blockskip_schedule, args.blockskip_count
+                    )
+                extra_count = max(0, scheduled_count - len(mandatory))
+                if extra_count:
+                    controller_candidates.update(
+                        adaptive.select_low_score_runs(
+                            blockskip_importance_rows,
+                            args.blockskip_importance_step,
+                            noise_ratio,
+                            extra_count,
+                            args.blockskip_min_run,
+                            args.blockskip_max_run,
+                            args.blockskip_max_runs,
+                            excluded_blocks=set(mandatory) | protected_from_dynamic_skip,
+                        )
+                    )
+        else:
+            controller_candidates.update(
+                set(block_names) - protected_from_dynamic_skip
+            )
         controller_block_names = [
             block for block in block_names if block in controller_candidates
         ]
@@ -546,12 +586,9 @@ def main():
             cache_dtype=cache_dtype,
         )
         print(
-            "Backward controller hooks: "
+            "Backward controller wrappers: "
             f"{len(controller_block_names)}/{len(block_names)} candidate blocks"
         )
-    train_noise_ratios = args.train_noise_ratios or args.profile_noise_ratios
-    if any(not 0.0 <= ratio <= 1.0 for ratio in train_noise_ratios):
-        raise SystemExit("--train_noise_ratios values must be in [0, 1].")
     train_rows = []
     iterator = iter(train_loader)
     write_csv(output_dir / "lora_importance_evolution.csv", importance_rows)
@@ -613,6 +650,9 @@ def main():
                 )
                 selected = set(mandatory) | set(extras)
                 skip_blocks = [block for block in block_names if block in selected]
+            if args.blockskip_controller_only:
+                requested_skip_count = 0
+                skip_blocks = []
             controller.configure(skip_blocks)
             if args.residual_execution == "two_pass":
                 cache_stats = adaptive.populate_online_cache(
