@@ -361,6 +361,10 @@ def main():
         help="Never skip a block that contains a selected trainable LoRA module.",
     )
     parser.add_argument(
+        "--blockskip_protected_blocks", nargs="*", default=[],
+        help="Additional logical blocks that must retain their backward computation.",
+    )
+    parser.add_argument(
         "--fixed_skip_blocks", nargs="*", default=[],
         help="Explicit logical block names to skip on every step; overrides gradient selection.",
     )
@@ -421,6 +425,12 @@ def main():
     if not candidate_blocks:
         raise SystemExit("No candidate LoRA blocks found.")
     selected_lora_blocks = select_lora_blocks(args, candidate_blocks)
+    unknown_protected = set(args.blockskip_protected_blocks) - set(candidate_blocks)
+    if unknown_protected:
+        raise SystemExit(
+            "Unknown --blockskip_protected_blocks: "
+            + ", ".join(sorted(unknown_protected))
+        )
     injected = core.inject_lora(
         model,
         args.target,
@@ -435,6 +445,11 @@ def main():
         f"modules={len(injected)}"
     )
     print("Selected LoRA blocks: " + ", ".join(selected_lora_blocks))
+    if args.blockskip_protected_blocks:
+        print(
+            "Additional backward-protected blocks: "
+            + ", ".join(args.blockskip_protected_blocks)
+        )
     model.train()
 
     dataset = core.ImageFolderDataset(args.data_dir, args.image_size, args.max_images)
@@ -554,6 +569,7 @@ def main():
                     if args.protect_selected_lora_blocks
                     else set()
                 )
+                protected.update(args.blockskip_protected_blocks)
                 if blockskip_fraction_schedule:
                     fraction = adaptive.noise_scheduled_float(
                         noise_ratio, blockskip_fraction_schedule, 0.0
