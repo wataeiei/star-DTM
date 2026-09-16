@@ -49,10 +49,17 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
-def image_paths(directory: str | Path, max_images: int) -> list[Path]:
+def image_paths(
+    directory: str | Path,
+    max_images: int,
+    excluded: set[str] | None = None,
+) -> list[Path]:
+    excluded = excluded or set()
     paths = sorted(
         path for path in Path(directory).rglob("*")
-        if path.is_file() and path.suffix.lower() in IMAGE_EXTS
+        if path.is_file()
+        and path.suffix.lower() in IMAGE_EXTS
+        and path.name not in excluded
     )
     if max_images > 0:
         paths = paths[:max_images]
@@ -309,6 +316,7 @@ def main() -> None:
     parser.add_argument("--lq_size", type=int, default=64)
     parser.add_argument("--sr_scale", type=int, default=4)
     parser.add_argument("--max_images", type=int, default=0)
+    parser.add_argument("--exclude_image", action="append", default=[])
     parser.add_argument("--eval_seed", type=int, default=4242)
     parser.add_argument("--warmup_images", type=int, default=1)
     parser.add_argument("--crop_border", type=int, default=4)
@@ -322,7 +330,7 @@ def main() -> None:
     if missing:
         parser.error("Missing adapters: " + ", ".join(missing))
 
-    paths = image_paths(args.data_dir, args.max_images)
+    paths = image_paths(args.data_dir, args.max_images, set(args.exclude_image))
     overlap = audit_overlap(paths, args.train_dir_for_overlap_check)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -430,6 +438,7 @@ def main() -> None:
         "autoencoder_checkpoint": str(Path(args.autoencoder_checkpoint).resolve()),
         "data_dir": str(Path(args.data_dir).resolve()),
         "num_images": len(paths),
+        "excluded_images": args.exclude_image,
         "eval_seed": args.eval_seed,
         "official_sampler": True,
         "inference_bypass_enabled": False,
