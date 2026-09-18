@@ -258,6 +258,7 @@ class LoRAConv2d:
                 self.rank = rank
                 self.alpha = float(alpha)
                 self.scale = self.alpha / rank
+                self.enabled = True
                 self.lora_down = nn.Conv2d(base.in_channels, rank, 1, bias=False)
                 self.lora_up = nn.Conv2d(rank, base.out_channels, 1, bias=False)
                 self.lora_down.to(device=base.weight.device, dtype=torch.float32)
@@ -268,6 +269,8 @@ class LoRAConv2d:
 
             def forward(self, value):
                 result = self.base(value)
+                if not self.enabled:
+                    return result
                 update = self.lora_up(self.lora_down(value.float())) * self.scale
                 return result + update.to(dtype=result.dtype)
 
