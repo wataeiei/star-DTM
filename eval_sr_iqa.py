@@ -20,6 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from PIL import Image
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
@@ -117,6 +118,24 @@ def scalar_score(value) -> float:
     return score
 
 
+def load_rgb_tensor(path: str | Path, resize_to: int = 0) -> torch.Tensor:
+    """Load one RGB image as a [1, 3, H, W] float tensor in [0, 1]."""
+    with Image.open(path) as image:
+        image = image.convert("RGB")
+        if resize_to > 0:
+            image = image.resize(
+                (resize_to, resize_to), Image.Resampling.BICUBIC
+            )
+        array = np.asarray(image, dtype=np.uint8).copy()
+    return (
+        torch.from_numpy(array)
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .float()
+        .div_(255.0)
+    )
+
+
 def summarize(rows: list[dict]) -> list[dict]:
     methods = sorted({str(row["method"]) for row in rows})
     metrics = [name for name in DEFAULT_METRICS if any(row["metric"] == name for row in rows)]
@@ -212,7 +231,21 @@ def evaluate(args: argparse.Namespace) -> None:
                 distorted_path = row["resolved_path"]
                 with torch.inference_mode():
                     if metric_name in FULL_REFERENCE_METRICS:
-                        value = metric(distorted_path, reference_by_name[row["filename"]])
+                        reference_path = reference_by_name[row["filename"]]
+                        if args.reference_size > 0:
+                            distorted = load_rgb_tensor(distorted_path)
+                            reference = load_rgb_tensor(
+                                reference_path, resize_to=args.reference_size
+                            )
+                            if distorted.shape[-2:] != reference.shape[-2:]:
+                                raise RuntimeError(
+                                    f"{row['filename']}: distorted size "
+                                    f"{tuple(distorted.shape[-2:])} does not match "
+                                    f"resized reference size {tuple(reference.shape[-2:])}"
+                                )
+                            value = metric(distorted, reference)
+                        else:
+                            value = metric(distorted_path, reference_path)
                     else:
                         value = metric(distorted_path)
                 score = scalar_score(value)
@@ -251,6 +284,7 @@ def evaluate(args: argparse.Namespace) -> None:
     metadata = {
         "eval_manifest": args.eval_manifest,
         "hr_dir": args.hr_dir,
+        "reference_size": args.reference_size,
         "sources": [{"method": label, "directory": str(path)} for label, path in args.source],
         "metrics": args.metrics,
         "metric_direction": {
@@ -278,6 +312,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--metrics", nargs="+", default=DEFAULT_METRICS)
     parser.add_argument("--max_images", type=int, default=0)
+    parser.add_argument(
+        "--reference_size",
+        type=int,
+        default=0,
+        help=(
+            "Resize full-reference HR images to this square size with PIL "
+            "bicubic interpolation. Use the SR evaluator's image size when "
+            "the source dataset contains larger originals; 0 keeps originals."
+        ),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--log_every", type=int, default=25)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
