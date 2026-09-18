@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a reproducible, class-balanced AID-2.1K split.
+"""Build a reproducible, class-balanced AID split.
 
 The expected source layout is one directory per class::
 
@@ -8,10 +8,10 @@ The expected source layout is one directory per class::
       bare_land/*.jpg
       ...
 
-By default the script selects 70 source images from each of AID's 30 classes,
-placing 56 per class in ``train_hr`` and 14 per class in ``val_hr``.  It writes
-manifests compatible with ``ucmerced_semantic_classifier.py`` and audits pixel
-duplicates before materializing the split.
+By default the script selects 84 source images from each of AID's 30 classes,
+placing 56 per class in ``train_hr``, 14 in ``val_hr``, and 14 in ``test_hr``.
+It writes manifests compatible with ``ucmerced_semantic_classifier.py`` and
+audits pixel duplicates before materializing the split.
 """
 
 from __future__ import annotations
@@ -141,9 +141,17 @@ def build_split(
     samples_per_class: int,
     train_per_class: int,
     materialize_mode: str,
+    test_per_class: int = 0,
 ) -> dict:
-    if train_per_class <= 0 or train_per_class >= samples_per_class:
-        raise ValueError("train_per_class must be between 1 and samples_per_class - 1")
+    val_per_class = samples_per_class - train_per_class - test_per_class
+    if train_per_class <= 0:
+        raise ValueError("train_per_class must be positive")
+    if test_per_class < 0:
+        raise ValueError("test_per_class cannot be negative")
+    if val_per_class <= 0:
+        raise ValueError(
+            "samples_per_class must exceed train_per_class + test_per_class"
+        )
     if output_dir.exists() and any(output_dir.iterdir()):
         raise SystemExit(
             f"Output directory is not empty: {output_dir}\n"
@@ -167,13 +175,18 @@ def build_split(
     output_dir.mkdir(parents=True, exist_ok=True)
     train_dir = output_dir / "train_hr"
     val_dir = output_dir / "val_hr"
+    test_dir = output_dir / "test_hr"
     train_dir.mkdir()
     val_dir.mkdir()
+    if test_per_class:
+        test_dir.mkdir()
 
     rng = random.Random(seed)
     class_names = sorted(unique_by_class)
     class_ids = {name: index for index, name in enumerate(class_names)}
     selected: dict[str, list[SourceImage]] = {"train": [], "val": []}
+    if test_per_class:
+        selected["test"] = []
     selected_by_class: dict[str, dict[str, list[SourceImage]]] = {}
 
     for class_name in class_names:
@@ -181,19 +194,30 @@ def build_split(
         rng.shuffle(candidates)
         chosen = candidates[:samples_per_class]
         class_train = chosen[:train_per_class]
-        class_val = chosen[train_per_class:]
+        val_end = train_per_class + val_per_class
+        class_val = chosen[train_per_class:val_end]
+        class_test = chosen[val_end:]
         selected["train"].extend(class_train)
         selected["val"].extend(class_val)
-        selected_by_class[class_name] = {"train": class_train, "val": class_val}
+        if test_per_class:
+            selected["test"].extend(class_test)
+        selected_by_class[class_name] = {
+            "train": class_train,
+            "val": class_val,
+            "test": class_test,
+        }
 
     # Remove class ordering from the exported filenames while retaining a fixed seed.
     rng.shuffle(selected["train"])
     rng.shuffle(selected["val"])
+    if test_per_class:
+        rng.shuffle(selected["test"])
 
     rows: list[dict] = []
     realized_modes = Counter()
+    split_dirs = {"train": train_dir, "val": val_dir, "test": test_dir}
     for split_name, images in selected.items():
-        split_dir = train_dir if split_name == "train" else val_dir
+        split_dir = split_dirs[split_name]
         for position, item in enumerate(images):
             suffix = item.path.suffix.lower()
             filename = f"{split_name}_{position:04d}{suffix}"
@@ -220,6 +244,7 @@ def build_split(
 
     train_rows = [row for row in rows if row["split"] == "train"]
     val_rows = [row for row in rows if row["split"] == "val"]
+    test_rows = [row for row in rows if row["split"] == "test"]
     selected_hashes = [row["pixel_sha256"] for row in rows]
     if len(selected_hashes) != len(set(selected_hashes)):
         raise AssertionError("Selected split unexpectedly contains duplicate pixels")
@@ -228,6 +253,9 @@ def build_split(
     write_csv(output_dir / "train_manifest.csv", train_rows)
     write_csv(output_dir / "val_manifest.csv", val_rows)
     write_csv(output_dir / "val_eval_manifest.csv", val_rows)
+    if test_rows:
+        write_csv(output_dir / "test_manifest.csv", test_rows)
+        write_csv(output_dir / "test_eval_manifest.csv", test_rows)
     if duplicate_rows:
         write_csv(output_dir / "source_duplicate_pixels.csv", duplicate_rows)
 
@@ -236,10 +264,12 @@ def build_split(
         "source_dir": source_dir.resolve().as_posix(),
         "samples_per_class": samples_per_class,
         "train_per_class": train_per_class,
-        "val_per_class": samples_per_class - train_per_class,
+        "val_per_class": val_per_class,
+        "test_per_class": test_per_class,
         "class_names": class_names,
         "train": [row["source_relative_path"] for row in train_rows],
         "val": [row["source_relative_path"] for row in val_rows],
+        "test": [row["source_relative_path"] for row in test_rows],
     }
     (output_dir / "split.json").write_text(
         json.dumps(split_json, indent=2), encoding="utf-8"
@@ -249,10 +279,15 @@ def build_split(
         split_name: dict(
             sorted(Counter(row["class_name"] for row in split_rows).items())
         )
-        for split_name, split_rows in (("train", train_rows), ("val", val_rows))
+        for split_name, split_rows in (
+            ("train", train_rows),
+            ("val", val_rows),
+            ("test", test_rows),
+        )
+        if split_rows
     }
     summary = {
-        "dataset": "AID-2.1K",
+        "dataset": f"AID-{len(rows)}",
         "source_dir": source_dir.resolve().as_posix(),
         "split_seed": seed,
         "num_source_images": sum(len(paths) for paths in grouped_paths.values()),
@@ -265,6 +300,8 @@ def build_split(
         "num_train_images": len(train_rows),
         "num_val_images": len(val_rows),
         "num_val_eval_images": len(val_rows),
+        "num_test_images": len(test_rows),
+        "num_test_eval_images": len(test_rows),
         "num_source_duplicate_pixel_groups": len(duplicate_rows),
         "num_cross_split_duplicate_groups": 0,
         "requested_materialize_mode": materialize_mode,
@@ -280,11 +317,12 @@ def build_split(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source_dir", required=True)
-    parser.add_argument("--output_dir", default="data/aid2100")
+    parser.add_argument("--output_dir", default="data/aid2520")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--expected_classes", type=int, default=30)
-    parser.add_argument("--samples_per_class", type=int, default=70)
+    parser.add_argument("--samples_per_class", type=int, default=84)
     parser.add_argument("--train_per_class", type=int, default=56)
+    parser.add_argument("--test_per_class", type=int, default=14)
     parser.add_argument(
         "--materialize",
         choices=["hardlink", "symlink", "copy"],
@@ -304,9 +342,10 @@ def main() -> None:
         samples_per_class=args.samples_per_class,
         train_per_class=args.train_per_class,
         materialize_mode=args.materialize,
+        test_per_class=args.test_per_class,
     )
     print(json.dumps(summary, indent=2))
-    print(f"Wrote AID-2.1K split to {args.output_dir}")
+    print(f"Wrote AID split to {args.output_dir}")
 
 
 if __name__ == "__main__":

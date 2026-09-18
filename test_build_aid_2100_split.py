@@ -40,6 +40,7 @@ class BuildAidSplitTest(unittest.TestCase):
                         samples_per_class=5,
                         train_per_class=3,
                         materialize_mode="copy",
+                        test_per_class=1,
                     )
                 )
                 with (output / "split_manifest.csv").open(
@@ -49,7 +50,8 @@ class BuildAidSplitTest(unittest.TestCase):
 
             self.assertEqual(summaries[0]["num_selected_images"], 15)
             self.assertEqual(summaries[0]["num_train_images"], 9)
-            self.assertEqual(summaries[0]["num_val_images"], 6)
+            self.assertEqual(summaries[0]["num_val_images"], 3)
+            self.assertEqual(summaries[0]["num_test_images"], 3)
             self.assertEqual(summaries[0]["num_cross_split_duplicate_groups"], 0)
             self.assertEqual(summaries[0]["class_counts"]["train"], {
                 "alpha": 3,
@@ -61,13 +63,14 @@ class BuildAidSplitTest(unittest.TestCase):
                 [row["source_relative_path"] for row in manifests[1]],
             )
             self.assertEqual(len(list((root / "first" / "train_hr").iterdir())), 9)
-            self.assertEqual(len(list((root / "first" / "val_hr").iterdir())), 6)
+            self.assertEqual(len(list((root / "first" / "val_hr").iterdir())), 3)
+            self.assertEqual(len(list((root / "first" / "test_hr").iterdir())), 3)
             metadata = json.loads(
                 (root / "first" / "split_manifest_summary.json").read_text(
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(metadata["dataset"], "AID-2.1K")
+            self.assertEqual(metadata["dataset"], "AID-15")
 
 
 if __name__ == "__main__":
