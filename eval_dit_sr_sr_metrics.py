@@ -471,10 +471,17 @@ def summarize(rows: list[dict], adapter_sizes: dict[str, float]) -> list[dict]:
             "peak_cuda_mem_mb": max(peaks) if peaks else "",
             "adapter_size_mb": adapter_sizes.get(method, 0.0),
         })
-    base = next(row for row in summaries if row["method"] == "Base-DiT-SR")
+    base = next(
+        (row for row in summaries if row["method"] == "Base-DiT-SR"),
+        None,
+    )
     for row in summaries:
-        row["delta_psnr_vs_base"] = row["mean_psnr"] - base["mean_psnr"]
-        row["delta_ssim_vs_base"] = row["mean_ssim"] - base["mean_ssim"]
+        row["delta_psnr_vs_base"] = (
+            row["mean_psnr"] - base["mean_psnr"] if base is not None else ""
+        )
+        row["delta_ssim_vs_base"] = (
+            row["mean_ssim"] - base["mean_ssim"] if base is not None else ""
+        )
     return summaries
 
 
@@ -502,6 +509,11 @@ def main() -> None:
         action="store_true",
         help="Ignore cached Base-DiT-SR results and run base inference again.",
     )
+    parser.add_argument(
+        "--skip_base_eval",
+        action="store_true",
+        help="Run only the requested adapters; omit Base-DiT-SR inference and base deltas.",
+    )
     parser.add_argument("--adapter", action="append", type=parse_adapter, default=[])
     parser.add_argument("--exclude_image", action="append", default=[])
     parser.add_argument("--image_size", type=int, default=256)
@@ -524,6 +536,8 @@ def main() -> None:
     parser.add_argument("--fp32", action="store_true")
     args = parser.parse_args()
 
+    if args.skip_base_eval and args.force_base_eval:
+        raise SystemExit("Use either --skip_base_eval or --force_base_eval, not both.")
     if args.image_size != args.lq_size * args.sr_scale:
         raise SystemExit("Require --image_size == --lq_size * --sr_scale.")
     missing = [str(path) for _label, path in args.adapter if not path.is_file()]
@@ -547,7 +561,11 @@ def main() -> None:
         image_rows_by_key[(row["method"], row["image"])] = row
     recovered_saved_images = 0
 
-    cached_base_rows, cached_base_source = find_cached_base(args, paths, output_dir)
+    if args.skip_base_eval:
+        cached_base_rows, cached_base_source = [], None
+        print("Skipping Base-DiT-SR inference by request; base deltas will be empty.")
+    else:
+        cached_base_rows, cached_base_source = find_cached_base(args, paths, output_dir)
     for row in cached_base_rows:
         image_rows_by_key[(row["method"], row["image"])] = row
     if cached_base_source is not None:
@@ -557,7 +575,7 @@ def main() -> None:
         )
         if args.save_images:
             link_cached_base_images(cached_base_source, paths, output_dir)
-    elif args.auto_reuse_base and not args.force_base_eval:
+    elif args.auto_reuse_base and not args.force_base_eval and not args.skip_base_eval:
         print("No compatible Base-DiT-SR cache found; evaluating base normally.")
 
     sampler = build_sampler(args)
@@ -599,7 +617,10 @@ def main() -> None:
         if args.save_images and saved_bicubic is None:
             atomic_save_png(bicubic, output_path)
 
-    methods = [*([("Base-DiT-SR", None)] if not cached_base_rows else []), *args.adapter]
+    methods = [
+        *([("Base-DiT-SR", None)] if not cached_base_rows and not args.skip_base_eval else []),
+        *args.adapter,
+    ]
     for method, adapter_path in methods:
         reset_lora(sampler.model)
         if adapter_path is not None:
@@ -689,7 +710,11 @@ def main() -> None:
                 f"PSNR={row['psnr']:.3f} SSIM={row['ssim']:.4f} time={elapsed:.2f}s"
             )
 
-    method_order = ["Bicubic", "Base-DiT-SR", *(label for label, _ in args.adapter)]
+    method_order = [
+        "Bicubic",
+        *(["Base-DiT-SR"] if not args.skip_base_eval else []),
+        *(label for label, _ in args.adapter),
+    ]
     image_rows = sorted(
         image_rows_by_key.values(),
         key=lambda row: (method_order.index(row["method"]), row["image"]),
@@ -715,7 +740,8 @@ def main() -> None:
         "base_cache_signature": base_cache_signature(args, paths),
         "auto_reuse_base": args.auto_reuse_base,
         "cached_base_source": str(cached_base_source) if cached_base_source else "",
-        "base_inference_skipped": bool(cached_base_rows),
+        "base_inference_skipped": bool(cached_base_rows) or args.skip_base_eval,
+        "skip_base_eval": args.skip_base_eval,
         "resume": args.resume,
         "recovered_saved_images_without_timing": recovered_saved_images,
     }
