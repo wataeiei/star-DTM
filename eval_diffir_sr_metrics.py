@@ -215,6 +215,79 @@ def build_model(checkpoint: Path, checkpoint_key: str, device):
     return model, selected_key
 
 
+def load_lora_adapter(model, adapter_path: Path, device) -> dict[str, Any]:
+    import torch
+
+    from profile_diffir_grad import block_from_qkv, inject_qkv_lora
+
+    payload = torch.load(adapter_path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError("DiffIR LoRA adapter must be a dictionary")
+    if payload.get("format") != "diffir_packed_qkv_lora_v1":
+        raise ValueError(
+            f"Unsupported DiffIR adapter format: {payload.get('format')!r}"
+        )
+    rank = int(payload["rank"])
+    alpha = float(payload["alpha"])
+    module_states = payload.get("modules")
+    if not isinstance(module_states, dict) or not module_states:
+        raise ValueError("DiffIR adapter contains no module states")
+
+    injected = inject_qkv_lora(model, rank, alpha)
+    unknown = sorted(set(module_states) - set(injected))
+    if unknown:
+        raise ValueError(f"Adapter has unknown LoRA modules: {unknown[:5]}")
+
+    loaded_blocks = []
+    with torch.no_grad():
+        for module_name, wrapper in injected.items():
+            wrapper.enabled = module_name in module_states
+            if not wrapper.enabled:
+                continue
+            state = module_states[module_name]
+            required = {"lora_down", "lora_up"}
+            missing = required - set(state)
+            if missing:
+                raise ValueError(
+                    f"{module_name} is missing adapter tensors: {sorted(missing)}"
+                )
+            for key, target in (
+                ("lora_down", wrapper.lora_down.weight),
+                ("lora_up", wrapper.lora_up.weight),
+            ):
+                source = state[key]
+                if tuple(source.shape) != tuple(target.shape):
+                    raise ValueError(
+                        f"{module_name}.{key} shape mismatch: "
+                        f"adapter={tuple(source.shape)} model={tuple(target.shape)}"
+                    )
+                target.copy_(source.to(device=target.device, dtype=target.dtype))
+            loaded_blocks.append(block_from_qkv(module_name))
+
+    declared_blocks = set(payload.get("selected_blocks", []))
+    if declared_blocks and declared_blocks != set(loaded_blocks):
+        raise ValueError(
+            "Adapter selected-block metadata does not match its module tensors"
+        )
+    model.eval().requires_grad_(False)
+    report = {
+        "path": str(adapter_path.resolve()),
+        "format": payload["format"],
+        "step": int(payload.get("step", 0)),
+        "rank": rank,
+        "alpha": alpha,
+        "loaded_module_count": len(module_states),
+        "loaded_block_count": len(loaded_blocks),
+        "selected_blocks": loaded_blocks,
+        "size_mb": adapter_path.stat().st_size / 2**20,
+    }
+    print(
+        f"Strict LoRA load: OK; blocks={len(loaded_blocks)} "
+        f"rank={rank} alpha={alpha:g}"
+    )
+    return report
+
+
 def atomic_save_png(array: np.ndarray, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
@@ -265,6 +338,12 @@ def evaluate(args: argparse.Namespace) -> None:
 
     device = torch.device(args.device)
     model, selected_key = build_model(checkpoint, args.checkpoint_key, device)
+    adapter_report = None
+    if args.adapter:
+        adapter_path = Path(args.adapter).expanduser()
+        if not adapter_path.is_file():
+            raise SystemExit(f"Adapter not found: {adapter_path}")
+        adapter_report = load_lora_adapter(model, adapter_path, device)
     if device.type == "cuda":
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
@@ -348,7 +427,10 @@ def evaluate(args: argparse.Namespace) -> None:
             "mean_inference_time_s": inference_time,
             "images_per_hour": 3600.0 / inference_time if inference_time > 0 else "",
             "peak_cuda_mem_mb": peak_mb if label == args.method else 0.0,
-            "adapter_size_mb": 0.0,
+            "adapter_size_mb": (
+                adapter_report["size_mb"]
+                if label == args.method and adapter_report is not None else 0.0
+            ),
         })
 
     write_csv(output_dir / "sr_metrics_per_image.csv", rows)
@@ -359,6 +441,7 @@ def evaluate(args: argparse.Namespace) -> None:
         "checkpoint": str(checkpoint.resolve()),
         "checkpoint_key": selected_key,
         "strict_checkpoint_load": True,
+        "adapter": adapter_report,
         "data_dir": str(data_dir.resolve()),
         "eval_manifest": str(manifest.resolve()) if manifest else None,
         "num_images": len(eval_paths),
@@ -390,6 +473,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--checkpoint",
         default="experiments/pretrained/SISR-DiffIRS2.pth",
+    )
+    parser.add_argument(
+        "--adapter",
+        default="",
+        help="Optional diffir_packed_qkv_lora_v1 adapter checkpoint.",
     )
     parser.add_argument(
         "--checkpoint_key",

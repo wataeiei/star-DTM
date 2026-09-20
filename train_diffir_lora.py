@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 import time
 from pathlib import Path
 from typing import Any
@@ -76,11 +75,16 @@ def adapter_payload(
 
 
 def grad_norm(parameters) -> float:
-    total = 0.0
+    import torch
+
+    squared_norms = []
     for parameter in parameters:
         if parameter.grad is not None:
-            total += float(parameter.grad.detach().float().pow(2).sum().cpu())
-    return math.sqrt(total)
+            squared_norms.append(parameter.grad.detach().float().pow(2).sum())
+    if not squared_norms:
+        return 0.0
+    # Perform one device-to-host synchronization instead of one per parameter.
+    return float(torch.stack(squared_norms).sum().sqrt().cpu())
 
 
 def train(args: argparse.Namespace) -> None:
@@ -280,15 +284,20 @@ def train(args: argparse.Namespace) -> None:
                 raise RuntimeError(f"Non-finite loss at step {step}: {loss}")
             loss.backward()
             if args.grad_clip > 0:
-                current_grad_norm = float(
-                    torch.nn.utils.clip_grad_norm_(parameters, args.grad_clip)
+                current_grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
+                    parameters, args.grad_clip
                 )
             else:
-                current_grad_norm = grad_norm(parameters)
+                current_grad_norm_tensor = None
             optimizer.step()
             sync(device)
             step_time = time.perf_counter() - step_started
             train_time += step_time
+            current_grad_norm = (
+                float(current_grad_norm_tensor.detach().cpu())
+                if current_grad_norm_tensor is not None
+                else grad_norm(parameters)
+            )
 
             loss_value = float(loss.detach().cpu())
             pixel_value = float(pixel_loss.detach().cpu())
