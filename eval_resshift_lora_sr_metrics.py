@@ -272,7 +272,29 @@ def sample(sampler, lr: torch.Tensor, seed: int, fp32: bool) -> torch.Tensor:
     return output[0].float().cpu().mul(0.5).add(0.5).clamp(0, 1)
 
 
-def summarize(rows: list[dict], adapter_sizes: dict[str, float]) -> list[dict]:
+def read_base_summary(path: str) -> dict[str, float] | None:
+    if not path:
+        return None
+    with Path(path).open(newline="", encoding="utf-8") as handle:
+        matches = [
+            row for row in csv.DictReader(handle)
+            if row.get("method") == "Base-ResShift"
+        ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected exactly one Base-ResShift row in {path}; found {len(matches)}"
+        )
+    return {
+        "mean_psnr": float(matches[0]["mean_psnr"]),
+        "mean_ssim": float(matches[0]["mean_ssim"]),
+    }
+
+
+def summarize(
+    rows: list[dict],
+    adapter_sizes: dict[str, float],
+    external_base: dict[str, float] | None = None,
+) -> list[dict]:
     summaries = []
     for method in dict.fromkeys(row["method"] for row in rows):
         selected = [row for row in rows if row["method"] == method]
@@ -296,7 +318,14 @@ def summarize(rows: list[dict], adapter_sizes: dict[str, float]) -> list[dict]:
             "peak_cuda_mem_mb": max(peaks) if peaks else "",
             "adapter_size_mb": adapter_sizes.get(method, 0.0),
         })
-    base = next(row for row in summaries if row["method"] == "Base-ResShift")
+    base = next(
+        (row for row in summaries if row["method"] == "Base-ResShift"),
+        external_base,
+    )
+    if base is None:
+        raise ValueError(
+            "Base-ResShift was skipped but --base_metrics_csv was not supplied"
+        )
     for row in summaries:
         row["delta_psnr_vs_base"] = row["mean_psnr"] - base["mean_psnr"]
         row["delta_ssim_vs_base"] = row["mean_ssim"] - base["mean_ssim"]
@@ -321,6 +350,12 @@ def main() -> None:
     parser.add_argument("--warmup_images", type=int, default=1)
     parser.add_argument("--crop_border", type=int, default=4)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--skip_base_eval", action="store_true")
+    parser.add_argument(
+        "--base_metrics_csv",
+        default="",
+        help="Existing summary containing one Base-ResShift row; required with --skip_base_eval",
+    )
     parser.add_argument("--fp32", action="store_true")
     args = parser.parse_args()
 
@@ -329,6 +364,12 @@ def main() -> None:
     missing = [str(path) for _label, path in args.adapter if not path.is_file()]
     if missing:
         parser.error("Missing adapters: " + ", ".join(missing))
+    if args.skip_base_eval and not args.adapter:
+        parser.error("--skip_base_eval requires at least one --adapter")
+    if args.skip_base_eval and not args.base_metrics_csv:
+        parser.error("--skip_base_eval requires --base_metrics_csv")
+    if args.base_metrics_csv and not Path(args.base_metrics_csv).is_file():
+        parser.error(f"Missing base metrics CSV: {args.base_metrics_csv}")
 
     paths = image_paths(args.data_dir, args.max_images, set(args.exclude_image))
     overlap = audit_overlap(paths, args.train_dir_for_overlap_check)
@@ -368,7 +409,7 @@ def main() -> None:
             "inference_time_s": 0.0, "peak_cuda_mem_mb": 0.0,
         })
 
-    methods = [("Base-ResShift", None), *args.adapter]
+    methods = list(args.adapter) if args.skip_base_eval else [("Base-ResShift", None), *args.adapter]
     for method, adapter_path in methods:
         reset_lora(injected)
         if adapter_path is not None:
@@ -429,7 +470,7 @@ def main() -> None:
                 f"PSNR={row['psnr']:.3f} SSIM={row['ssim']:.4f}"
             )
 
-    summaries = summarize(rows, adapter_sizes)
+    summaries = summarize(rows, adapter_sizes, read_base_summary(args.base_metrics_csv))
     write_csv(output_dir / "sr_metrics_per_image.csv", rows)
     write_csv(output_dir / "sr_metrics_summary.csv", summaries)
     metadata = {
@@ -441,6 +482,8 @@ def main() -> None:
         "excluded_images": args.exclude_image,
         "eval_seed": args.eval_seed,
         "official_sampler": True,
+        "base_evaluation_skipped": args.skip_base_eval,
+        "base_metrics_csv": args.base_metrics_csv or None,
         "inference_bypass_enabled": False,
         "union_lora_blocks": sorted(union_blocks),
         "load_reports": load_reports,
