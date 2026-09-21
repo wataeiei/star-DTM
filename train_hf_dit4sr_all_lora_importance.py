@@ -142,6 +142,90 @@ def select_lora_blocks(args, candidates):
     return sorted(set(selected), key=core.natural_key)
 
 
+def load_initial_lora_adapter(transformer, path, strict=True):
+    """Validate and load a previously trained custom LoRA adapter."""
+    path = Path(path).expanduser()
+    if not path.is_file():
+        raise SystemExit(f"Initial LoRA adapter does not exist: {path}")
+
+    payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict) or payload.get("format") != "custom_lora_linear_v1":
+        raise SystemExit(f"Unsupported initial LoRA adapter format: {path}")
+    saved_modules = payload.get("modules")
+    if not isinstance(saved_modules, dict) or not saved_modules:
+        raise SystemExit(f"Initial LoRA adapter contains no modules: {path}")
+
+    current_modules = {
+        adaptive.canonical_lora_name(name): module
+        for name, module in core.iter_lora_modules(transformer)
+    }
+    missing = sorted(set(saved_modules) - set(current_modules), key=core.natural_key)
+    unexpected = sorted(set(current_modules) - set(saved_modules), key=core.natural_key)
+    incompatible = []
+    for name in sorted(set(saved_modules) & set(current_modules), key=core.natural_key):
+        weights = saved_modules[name]
+        module = current_modules[name]
+        expected_down = tuple(module.lora_down.weight.shape)
+        expected_up = tuple(module.lora_up.weight.shape)
+        saved_down = tuple(weights["lora_down"].shape)
+        saved_up = tuple(weights["lora_up"].shape)
+        saved_rank = int(weights.get("rank", saved_down[0]))
+        saved_alpha = float(weights.get("alpha", saved_rank))
+        if (
+            saved_down != expected_down
+            or saved_up != expected_up
+            or saved_rank != int(module.rank)
+            or not math.isclose(saved_alpha, float(module.alpha))
+        ):
+            incompatible.append(
+                f"{name}: saved down/up={saved_down}/{saved_up}, "
+                f"rank={saved_rank}, alpha={saved_alpha}; expected "
+                f"down/up={expected_down}/{expected_up}, "
+                f"rank={module.rank}, alpha={module.alpha}"
+            )
+
+    if incompatible:
+        raise SystemExit(
+            "Initial LoRA adapter has incompatible modules:\n  "
+            + "\n  ".join(incompatible[:10])
+        )
+    if strict and (missing or unexpected):
+        raise SystemExit(
+            "Initial LoRA adapter module mismatch: "
+            f"missing_from_model={missing[:10]} "
+            f"missing_from_adapter={unexpected[:10]}"
+        )
+
+    report = adaptive.load_lora_adapter(transformer, path)
+    return {
+        "path": str(path),
+        "strict": bool(strict),
+        "saved_module_count": len(saved_modules),
+        "current_module_count": len(current_modules),
+        **report,
+    }
+
+
+def configure_trainable_lora_blocks(transformer, selected_blocks, block_regex):
+    """Freeze every LoRA module except those in selected logical blocks."""
+    selected_blocks = set(selected_blocks)
+    trainable_modules = []
+    frozen_modules = []
+    for name, module in core.iter_lora_modules(transformer):
+        canonical_name = adaptive.canonical_lora_name(name)
+        block = core.block_key(canonical_name, block_regex)
+        trainable = block in selected_blocks
+        module.lora_down.weight.requires_grad_(trainable)
+        module.lora_up.weight.requires_grad_(trainable)
+        (trainable_modules if trainable else frozen_modules).append(canonical_name)
+    if not trainable_modules:
+        raise SystemExit("No LoRA modules remain trainable after block selection.")
+    return {
+        "trainable_modules": sorted(trainable_modules, key=core.natural_key),
+        "frozen_modules": sorted(frozen_modules, key=core.natural_key),
+    }
+
+
 def profile_importance(pipe, transformer, loader, args, device, train_step, noise_ratio):
     cpu_state = torch.random.get_rng_state()
     cuda_state = torch.cuda.get_rng_state_all() if device.type == "cuda" else None
@@ -322,6 +406,28 @@ def main():
     )
     parser.add_argument("--lora_selection_seed", type=int, default=42)
     parser.add_argument(
+        "--init_adapter",
+        default="",
+        help=(
+            "Optional custom_lora_linear_v1 adapter used to initialize target-domain "
+            "training. The adapter is loaded after LoRA injection and before optimizer creation."
+        ),
+    )
+    parser.add_argument(
+        "--init_adapter_strict",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require the initialized model and source adapter to contain identical LoRA modules.",
+    )
+    parser.add_argument(
+        "--train_selected_lora_only",
+        action="store_true",
+        help=(
+            "With --init_adapter, inject and load the complete source adapter but optimize "
+            "only the blocks chosen by --lora_selection."
+        ),
+    )
+    parser.add_argument(
         "--reset_seed_after_lora_injection",
         action="store_true",
         help="Reset the training RNG after LoRA construction for controlled selection studies.",
@@ -456,6 +562,17 @@ def main():
         raise SystemExit("Require 0 < --patch_min_fraction <= --patch_max_fraction <= 1.")
     if args.checkpoint_every < 0:
         raise SystemExit("--checkpoint_every must be non-negative.")
+    if args.train_selected_lora_only and not args.init_adapter:
+        raise SystemExit("--train_selected_lora_only requires --init_adapter.")
+    if (
+        args.init_adapter
+        and args.lora_selection != "all"
+        and not args.train_selected_lora_only
+    ):
+        raise SystemExit(
+            "Target adaptation from a full source adapter with sparse LoRA selection "
+            "requires --train_selected_lora_only so frozen source modules remain active."
+        )
     core.set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     pipe = core.load_pipe(args, device)
@@ -481,22 +598,52 @@ def main():
             "Unknown protected block-skip blocks: "
             + ", ".join(unknown_protected_blocks)
         )
+    injected_lora_blocks = (
+        candidate_blocks
+        if args.init_adapter and args.train_selected_lora_only
+        else selected_lora_blocks
+    )
     injected = core.inject_lora(
         transformer,
         args.target,
         args.rank,
         args.alpha,
         args.block_regex,
-        selected_blocks=set(selected_lora_blocks),
+        selected_blocks=set(injected_lora_blocks),
     )
+    init_adapter_report = None
+    if args.init_adapter:
+        init_adapter_report = load_initial_lora_adapter(
+            transformer,
+            args.init_adapter,
+            strict=args.init_adapter_strict,
+        )
+        print(
+            f"Loaded initial adapter {args.init_adapter}: "
+            f"modules={init_adapter_report['loaded']}/"
+            f"{init_adapter_report['saved_module_count']}"
+        )
+    train_scope_report = None
+    if args.train_selected_lora_only:
+        train_scope_report = configure_trainable_lora_blocks(
+            transformer,
+            selected_lora_blocks,
+            args.block_regex,
+        )
     if args.reset_seed_after_lora_injection:
         core.set_seed(args.seed)
     print(
         f"LoRA selection={args.lora_selection} "
         f"blocks={len(selected_lora_blocks)}/{len(candidate_blocks)} "
-        f"modules={len(injected)}"
+        f"injected_modules={len(injected)}"
     )
     print("Selected LoRA blocks: " + ", ".join(selected_lora_blocks))
+    if train_scope_report is not None:
+        print(
+            "Target adaptation train scope: "
+            f"trainable_modules={len(train_scope_report['trainable_modules'])} "
+            f"frozen_source_modules={len(train_scope_report['frozen_modules'])}"
+        )
     if bypass_protected_blocks:
         print(
             "Additional backward-protected blocks: "
@@ -507,6 +654,11 @@ def main():
     train_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     profile_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
     params = [param for param in transformer.parameters() if param.requires_grad]
+    trainable_lora_params = sum(param.numel() for param in params)
+    trainable_lora_module_count = sum(
+        int(module.lora_down.weight.requires_grad or module.lora_up.weight.requires_grad)
+        for _name, module in core.iter_lora_modules(transformer)
+    )
     optimizer = torch.optim.AdamW(params, lr=args.lr)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -797,6 +949,9 @@ def main():
     adapter_summary = adaptive.save_lora_adapter(
         transformer, output_dir / "lora_adapter.pt"
     )
+    adapter_summary["stored_lora_params"] = adapter_summary["trainable_lora_params"]
+    adapter_summary["trainable_lora_params"] = trainable_lora_params
+    adapter_summary["trainable_lora_module_count"] = trainable_lora_module_count
     checkpoint_time_s += time.perf_counter() - checkpoint_start
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -819,8 +974,11 @@ def main():
         "parsed_blockskip_fraction_schedule": blockskip_fraction_schedule,
         "profile_steps": sorted(profile_steps),
         "injected_module_count": len(injected),
+        "injected_lora_blocks": injected_lora_blocks,
         "candidate_lora_blocks": candidate_blocks,
         "selected_lora_blocks": selected_lora_blocks,
+        "init_adapter_load_report": init_adapter_report,
+        "train_scope_report": train_scope_report,
         "model": "DiT4SR-HF",
         "objective": args.loss_mode,
     } | summary
