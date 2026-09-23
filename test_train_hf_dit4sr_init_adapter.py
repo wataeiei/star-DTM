@@ -10,6 +10,7 @@ import profile_hf_dit4sr_grad as core
 from train_hf_dit4sr_all_lora_importance import (
     configure_trainable_lora_blocks,
     load_initial_lora_adapter,
+    merge_lora_into_base,
 )
 
 
@@ -85,6 +86,29 @@ class InitialAdapterTests(unittest.TestCase):
             )
             with self.assertRaises(SystemExit):
                 load_initial_lora_adapter(target, path, strict=True)
+
+    def test_merge_preserves_forward_and_removes_wrappers(self):
+        model = TinyTransformer()
+        inject_all(model)
+        for index, (_name, module) in enumerate(core.iter_lora_modules(model), start=1):
+            module.lora_down.weight.data.fill_(index * 0.1)
+            module.lora_up.weight.data.fill_(index * 0.2)
+
+        inputs = [torch.randn(3, 4), torch.randn(3, 4)]
+        before = [
+            model.transformer_blocks[index]["to_q"](value)
+            for index, value in enumerate(inputs)
+        ]
+        report = merge_lora_into_base(model)
+        after = [
+            model.transformer_blocks[index]["to_q"](value)
+            for index, value in enumerate(inputs)
+        ]
+
+        self.assertEqual(report["merged_module_count"], 2)
+        self.assertEqual(list(core.iter_lora_modules(model)), [])
+        for expected, actual in zip(before, after):
+            self.assertTrue(torch.allclose(expected, actual, atol=1e-6, rtol=1e-6))
 
 
 if __name__ == "__main__":

@@ -226,6 +226,37 @@ def configure_trainable_lora_blocks(transformer, selected_blocks, block_regex):
     }
 
 
+def merge_lora_into_base(transformer):
+    """Fold every active LoRA update into its base Linear and remove the wrapper."""
+    merged = []
+    total_delta_norm = 0.0
+    lora_modules = list(core.iter_lora_modules(transformer))
+    if not lora_modules:
+        raise SystemExit("No LoRA modules are available to merge into the base model.")
+    with torch.no_grad():
+        for name, module in lora_modules:
+            canonical_name = adaptive.canonical_lora_name(name)
+            delta = (
+                module.lora_up.weight.detach().float()
+                @ module.lora_down.weight.detach().float()
+            ) * float(module.scale)
+            module.base.weight.add_(
+                delta.to(
+                    device=module.base.weight.device,
+                    dtype=module.base.weight.dtype,
+                )
+            )
+            total_delta_norm += float(delta.norm().cpu())
+            parent, child_name = core.split_parent_name(transformer, name)
+            setattr(parent, child_name, module.base)
+            merged.append(canonical_name)
+    return {
+        "merged_module_count": len(merged),
+        "merged_modules": sorted(merged, key=core.natural_key),
+        "sum_unmerged_delta_norm": total_delta_norm,
+    }
+
+
 def profile_importance(pipe, transformer, loader, args, device, train_step, noise_ratio):
     cpu_state = torch.random.get_rng_state()
     cuda_state = torch.cuda.get_rng_state_all() if device.type == "cuda" else None
@@ -428,6 +459,14 @@ def main():
         ),
     )
     parser.add_argument(
+        "--merge_init_adapter",
+        action="store_true",
+        help=(
+            "Fold --init_adapter into the frozen base weights, remove its LoRA wrappers, "
+            "and inject a fresh target-domain adapter only in the selected blocks."
+        ),
+    )
+    parser.add_argument(
         "--reset_seed_after_lora_injection",
         action="store_true",
         help="Reset the training RNG after LoRA construction for controlled selection studies.",
@@ -564,10 +603,16 @@ def main():
         raise SystemExit("--checkpoint_every must be non-negative.")
     if args.train_selected_lora_only and not args.init_adapter:
         raise SystemExit("--train_selected_lora_only requires --init_adapter.")
+    if args.merge_init_adapter and not args.init_adapter:
+        raise SystemExit("--merge_init_adapter requires --init_adapter.")
+    if args.merge_init_adapter and args.train_selected_lora_only:
+        raise SystemExit(
+            "Use either --merge_init_adapter or --train_selected_lora_only, not both."
+        )
     if (
         args.init_adapter
         and args.lora_selection != "all"
-        and not args.train_selected_lora_only
+        and not (args.train_selected_lora_only or args.merge_init_adapter)
     ):
         raise SystemExit(
             "Target adaptation from a full source adapter with sparse LoRA selection "
@@ -598,38 +643,72 @@ def main():
             "Unknown protected block-skip blocks: "
             + ", ".join(unknown_protected_blocks)
         )
-    injected_lora_blocks = (
-        candidate_blocks
-        if args.init_adapter and args.train_selected_lora_only
-        else selected_lora_blocks
-    )
-    injected = core.inject_lora(
-        transformer,
-        args.target,
-        args.rank,
-        args.alpha,
-        args.block_regex,
-        selected_blocks=set(injected_lora_blocks),
-    )
     init_adapter_report = None
-    if args.init_adapter:
+    init_adapter_merge_report = None
+    train_scope_report = None
+    if args.merge_init_adapter:
+        source_injected = core.inject_lora(
+            transformer,
+            args.target,
+            args.rank,
+            args.alpha,
+            args.block_regex,
+            selected_blocks=set(candidate_blocks),
+        )
         init_adapter_report = load_initial_lora_adapter(
             transformer,
             args.init_adapter,
             strict=args.init_adapter_strict,
         )
-        print(
-            f"Loaded initial adapter {args.init_adapter}: "
-            f"modules={init_adapter_report['loaded']}/"
-            f"{init_adapter_report['saved_module_count']}"
-        )
-    train_scope_report = None
-    if args.train_selected_lora_only:
-        train_scope_report = configure_trainable_lora_blocks(
+        init_adapter_merge_report = merge_lora_into_base(transformer)
+        if list(core.iter_lora_modules(transformer)):
+            raise RuntimeError("Source LoRA wrappers remain after adapter merge.")
+        injected_lora_blocks = selected_lora_blocks
+        injected = core.inject_lora(
             transformer,
-            selected_lora_blocks,
+            args.target,
+            args.rank,
+            args.alpha,
             args.block_regex,
+            selected_blocks=set(injected_lora_blocks),
         )
+        print(
+            f"Loaded and merged initial adapter {args.init_adapter}: "
+            f"modules={init_adapter_report['loaded']}/"
+            f"{init_adapter_report['saved_module_count']} "
+            f"fresh_target_modules={len(injected)}"
+        )
+    else:
+        injected_lora_blocks = (
+            candidate_blocks
+            if args.init_adapter and args.train_selected_lora_only
+            else selected_lora_blocks
+        )
+        injected = core.inject_lora(
+            transformer,
+            args.target,
+            args.rank,
+            args.alpha,
+            args.block_regex,
+            selected_blocks=set(injected_lora_blocks),
+        )
+        if args.init_adapter:
+            init_adapter_report = load_initial_lora_adapter(
+                transformer,
+                args.init_adapter,
+                strict=args.init_adapter_strict,
+            )
+            print(
+                f"Loaded initial adapter {args.init_adapter}: "
+                f"modules={init_adapter_report['loaded']}/"
+                f"{init_adapter_report['saved_module_count']}"
+            )
+        if args.train_selected_lora_only:
+            train_scope_report = configure_trainable_lora_blocks(
+                transformer,
+                selected_lora_blocks,
+                args.block_regex,
+            )
     if args.reset_seed_after_lora_injection:
         core.set_seed(args.seed)
     print(
@@ -978,6 +1057,7 @@ def main():
         "candidate_lora_blocks": candidate_blocks,
         "selected_lora_blocks": selected_lora_blocks,
         "init_adapter_load_report": init_adapter_report,
+        "init_adapter_merge_report": init_adapter_merge_report,
         "train_scope_report": train_scope_report,
         "model": "DiT4SR-HF",
         "objective": args.loss_mode,

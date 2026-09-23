@@ -82,6 +82,43 @@ def enable_nonzero_lora(transformer: torch.nn.Module) -> int:
     return active
 
 
+def merge_lora_into_base_for_eval(transformer: torch.nn.Module) -> dict:
+    """Fold loaded LoRA updates into native Linear weights for inference."""
+    lora_modules = list(core.iter_lora_modules(transformer))
+    if not lora_modules:
+        raise RuntimeError("No LoRA modules are available to merge for evaluation.")
+
+    merged_modules = []
+    active_modules = 0
+    with torch.no_grad():
+        for name, module in lora_modules:
+            enabled = bool(
+                module.lora_enabled
+                and torch.count_nonzero(module.lora_up.weight).item()
+            )
+            if enabled:
+                delta = (
+                    module.lora_up.weight.detach().float()
+                    @ module.lora_down.weight.detach().float()
+                ) * float(module.scale)
+                module.base.weight.add_(
+                    delta.to(
+                        device=module.base.weight.device,
+                        dtype=module.base.weight.dtype,
+                    )
+                )
+                active_modules += 1
+            parent, child_name = core.split_parent_name(transformer, name)
+            setattr(parent, child_name, module.base)
+            merged_modules.append(adaptive.canonical_lora_name(name))
+
+    return {
+        "merged_module_count": len(merged_modules),
+        "active_merged_module_count": active_modules,
+        "merged_modules": sorted(merged_modules, key=core.natural_key),
+    }
+
+
 def safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "method"
 
@@ -417,6 +454,15 @@ def main() -> None:
         help="Allow an adapter to omit injected LoRA modules; omitted modules remain disabled.",
     )
     parser.add_argument(
+        "--merge_lora_for_eval",
+        action="store_true",
+        help=(
+            "Fold one loaded LoRA adapter into native Linear weights before inference. "
+            "This removes wrapper overhead and requires exactly one --adapter and no "
+            "--parallel_adapter."
+        ),
+    )
+    parser.add_argument(
         "--parallel_adapter",
         action="append",
         type=parse_adapter,
@@ -452,6 +498,13 @@ def main() -> None:
 
     if args.image_size % args.sr_scale:
         raise SystemExit("--image_size must be divisible by --sr_scale.")
+    if args.merge_lora_for_eval and (
+        len(args.adapter) != 1 or args.parallel_adapter
+    ):
+        raise SystemExit(
+            "--merge_lora_for_eval requires exactly one --adapter and no "
+            "--parallel_adapter. Run separate evaluation commands for multiple adapters."
+        )
     missing = [
         str(path)
         for _label, path in [*args.adapter, *args.parallel_adapter]
@@ -571,11 +624,21 @@ def main() -> None:
                     f"unexpected={report['unexpected'][:5]}"
                 )
             report["active_lora_modules"] = enable_nonzero_lora(transformer)
+            if args.merge_lora_for_eval:
+                report["merge_report"] = merge_lora_into_base_for_eval(transformer)
+                report["execution_mode"] = "merged_native_linear"
             load_reports[method] = report
             print(
                 f"{method}: active LoRA modules="
                 f"{report['active_lora_modules']}/{len(injected)}"
             )
+            if args.merge_lora_for_eval:
+                merge_report = report["merge_report"]
+                print(
+                    f"{method}: merged LoRA into native Linear modules="
+                    f"{merge_report['active_merged_module_count']}/"
+                    f"{merge_report['merged_module_count']}"
+                )
             if report["unexpected"]:
                 print(
                     f"{method}: sparse adapter leaves "
@@ -686,6 +749,7 @@ def main() -> None:
         "prompt_condition": f"zeros[{args.prompt_seq_len},{args.caption_dim}]",
         "lpips_status": lpips_status,
         "injected_module_count": len(injected),
+        "merge_lora_for_eval": args.merge_lora_for_eval,
         "parallel_adapter_count": len(args.parallel_adapter),
         "load_reports": load_reports,
     }
