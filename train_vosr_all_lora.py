@@ -20,6 +20,10 @@ from vosr_bypass_cost_probe import (
     configure_bypass_cost_probe,
     profile_frozen_block_costs,
 )
+from vosr_bypass_gradient_fidelity import (
+    configure_bypass_fidelity_probe,
+    profile_threshold_gradient_fidelity,
+)
 import adaptive_grad_blockskip as adaptive
 from pathlib import Path
 from vosr import VOSR
@@ -345,6 +349,7 @@ def main(
     config_path,
     force_importance_probe=False,
     force_bypass_cost_probe=False,
+    force_bypass_fidelity_probe=False,
     config_overrides=None,
 ):
     
@@ -359,17 +364,30 @@ def main(
         config["importance_probe_only"] = True
     if force_bypass_cost_probe:
         config["bypass_cost_probe_only"] = True
+    if force_bypass_fidelity_probe:
+        config["bypass_fidelity_probe_only"] = True
     args = Namespace(**config)
     args.report_to = normalize_report_to(getattr(args, "report_to", None))
     probe_config = configure_importance_probe(args)
     importance_probe_only = probe_config is not None
     bypass_cost_config = configure_bypass_cost_probe(args)
     bypass_cost_probe_only = bypass_cost_config is not None
-    if importance_probe_only and bypass_cost_probe_only:
-        raise ValueError(
-            "Importance probing and bypass cost probing are mutually exclusive"
+    bypass_fidelity_config = configure_bypass_fidelity_probe(args)
+    bypass_fidelity_probe_only = bypass_fidelity_config is not None
+    enabled_probe_modes = sum(
+        int(value)
+        for value in (
+            importance_probe_only,
+            bypass_cost_probe_only,
+            bypass_fidelity_probe_only,
         )
-    update_free_mode = importance_probe_only or bypass_cost_probe_only
+    )
+    if enabled_probe_modes > 1:
+        raise ValueError(
+            "Importance, bypass cost, and bypass fidelity probes are "
+            "mutually exclusive"
+        )
+    update_free_mode = bool(enabled_probe_modes)
 
 
     if args.train_dataset_config is not None:
@@ -505,8 +523,14 @@ def main(
     del pretrained_state
 
     selected_lora_blocks = (
-        list(bypass_cost_config["selected_indices"])
-        if bypass_cost_probe_only
+        list(
+            (
+                bypass_cost_config
+                if bypass_cost_probe_only
+                else bypass_fidelity_config
+            )["selected_indices"]
+        )
+        if bypass_cost_probe_only or bypass_fidelity_probe_only
         else list(range(28))
     )
     injected_lora_modules = inject_vosr_lora(
@@ -546,7 +570,7 @@ def main(
     model.train()
 
     bypass_controller = None
-    if bypass_cost_probe_only:
+    if bypass_cost_probe_only or bypass_fidelity_probe_only:
         block_paths = {
             f"blocks.{index}": f"blocks.{index}"
             for index in range(28)
@@ -792,6 +816,10 @@ def main(
             logger.info(
                 "  Update-free frozen-block bypass cost profile"
             )
+        elif bypass_fidelity_probe_only:
+            logger.info(
+                "  Update-free Threshold bypass gradient fidelity audit"
+            )
         else:
             logger.info(
                 f"  Total optimization steps = {args.max_train_steps}"
@@ -826,6 +854,14 @@ def main(
             f"flow_t={bypass_cost_config['flow_t']} "
             f"warmup={bypass_cost_config['warmup']} "
             f"repeats={bypass_cost_config['repeats']}"
+        )
+
+    if bypass_fidelity_probe_only:
+        logger.info(
+            "Running update-free VOSR Threshold bypass fidelity audit: "
+            f"schedule="
+            f"{[(row['flow_t'], row['bypass_budget']) for row in bypass_fidelity_config['policies']]} "
+            f"batches={bypass_fidelity_config['probe_batches']}"
         )
 
     unwrapped_model_ae = accelerator.unwrap_model(model_ae)
@@ -932,6 +968,113 @@ def main(
         if accelerator.is_main_process:
             logger.info(
                 "Wrote VOSR bypass cost profile to "
+                f"{args.output_dir}"
+            )
+            print(json.dumps(report, indent=2))
+        accelerator.wait_for_everyone()
+        accelerator.end_training()
+        return
+
+    if bypass_fidelity_probe_only:
+        if accelerator.num_processes != 1:
+            raise RuntimeError(
+                "VOSR bypass fidelity auditing currently requires one process"
+            )
+
+        prepared_batches = []
+        fidelity_iterator = iter(train_dataloader)
+        for _ in range(bypass_fidelity_config["probe_batches"]):
+            try:
+                fidelity_batch = next(fidelity_iterator)
+            except StopIteration:
+                fidelity_iterator = iter(train_dataloader)
+                fidelity_batch = next(fidelity_iterator)
+
+            fidelity_hq = fidelity_batch["hq"].to(
+                accelerator.device, non_blocking=True
+            )
+            with torch.no_grad():
+                _, fidelity_lq = degradation.degrade_process(
+                    fidelity_hq, resize_bak=True
+                )
+                fidelity_hq = fidelity_hq * 2 - 1
+                fidelity_lq = fidelity_lq * 2 - 1
+
+                with accelerator.autocast():
+                    raw_image = (0.5 * fidelity_lq + 0.5) * 255
+                    raw_image = preprocess_raw_image(raw_image, args)
+                    features, x_norm = unwrapped_venc.forward_with_features(
+                        raw_image
+                    )
+                    fidelity_z = [
+                        value
+                        for key, value in features.items()
+                        if key.startswith("layer_")
+                    ]
+                    fidelity_z[-1] = x_norm
+                    fidelity_z = [
+                        fidelity_z[index]
+                        for index in args.layer_dinov2b_list
+                    ]
+
+                combined = torch.cat([fidelity_lq, fidelity_hq], dim=0)
+                if args.ae_type == "qwen":
+                    combined_latent = (
+                        unwrapped_model_ae.encode(combined).latent_dist.sample()
+                        - latents_mean
+                    ) * latents_std
+                elif args.ae_type == "sd2":
+                    combined_latent = (
+                        unwrapped_model_ae.encode(
+                            combined.to(unwrapped_model_ae.dtype)
+                        ).latent_dist.sample()
+                        * unwrapped_model_ae.config.scaling_factor
+                    )
+                fidelity_lq, fidelity_hq = combined_latent.chunk(2, dim=0)
+            prepared_batches.append(
+                {
+                    "lq": fidelity_lq,
+                    "hq": fidelity_hq,
+                    "z": fidelity_z,
+                }
+            )
+
+        def fidelity_loss_factory(batch, flow_t):
+            def loss_fn():
+                with accelerator.autocast():
+                    _loss, loss_backward = vosr.loss_fm(
+                        model,
+                        batch["lq"],
+                        batch["hq"],
+                        batch["z"],
+                        forced_t=flow_t,
+                    )
+                return loss_backward
+
+            return loss_fn
+
+        report = profile_threshold_gradient_fidelity(
+            model=model,
+            controller=bypass_controller,
+            parameters=params_to_optimize,
+            prepared_batches=prepared_batches,
+            loss_factory=fidelity_loss_factory,
+            probe_config=bypass_fidelity_config,
+            output_dir=args.output_dir,
+            device=accelerator.device,
+            metadata={
+                "config_path": str(config_path),
+                "data_config": str(args.train_dataset_config),
+                "pretrained_checkpoint": str(pretrained_path),
+                "seed": args.seed,
+                "selected_utility": bypass_fidelity_config[
+                    "selection"
+                ].get("selected_utility"),
+            },
+        )
+        if accelerator.is_main_process:
+            logger.info(
+                "Wrote VOSR Threshold bypass gradient fidelity audit to "
                 f"{args.output_dir}"
             )
             print(json.dumps(report, indent=2))
