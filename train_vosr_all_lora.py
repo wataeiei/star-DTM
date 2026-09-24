@@ -16,6 +16,11 @@ from vosr_importance_probe import (
     flow_anchor_for_step,
     write_importance_reports,
 )
+from vosr_bypass_cost_probe import (
+    configure_bypass_cost_probe,
+    profile_frozen_block_costs,
+)
+import adaptive_grad_blockskip as adaptive
 from pathlib import Path
 from vosr import VOSR
 from datasets import load_dataset
@@ -339,6 +344,7 @@ def load_dataset_config(path):
 def main(
     config_path,
     force_importance_probe=False,
+    force_bypass_cost_probe=False,
     config_overrides=None,
 ):
     
@@ -351,10 +357,19 @@ def main(
         config.update(config_overrides)
     if force_importance_probe:
         config["importance_probe_only"] = True
+    if force_bypass_cost_probe:
+        config["bypass_cost_probe_only"] = True
     args = Namespace(**config)
     args.report_to = normalize_report_to(getattr(args, "report_to", None))
     probe_config = configure_importance_probe(args)
     importance_probe_only = probe_config is not None
+    bypass_cost_config = configure_bypass_cost_probe(args)
+    bypass_cost_probe_only = bypass_cost_config is not None
+    if importance_probe_only and bypass_cost_probe_only:
+        raise ValueError(
+            "Importance probing and bypass cost probing are mutually exclusive"
+        )
+    update_free_mode = importance_probe_only or bypass_cost_probe_only
 
 
     if args.train_dataset_config is not None:
@@ -419,18 +434,18 @@ def main(
         json_dir = os.path.join(args.output_dir, "args.json")
         with open(json_dir, 'w') as f:
             json.dump(args_dict, f, indent=4)
-        if not importance_probe_only:
+        if not update_free_mode:
             os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(args.output_dir)
         logger.info(f"Experiment directory created at {args.output_dir}")
 
         iqa_lpips = (
             pyiqa.create_metric("lpips", device="cuda")
-            if pyiqa is not None and not importance_probe_only else None
+            if pyiqa is not None and not update_free_mode else None
         )
         iqa_musiq = (
             pyiqa.create_metric("musiq", device="cuda")
-            if pyiqa is not None and not importance_probe_only else None
+            if pyiqa is not None and not update_free_mode else None
         )
             
     if args.ae_type == "qwen":
@@ -489,7 +504,11 @@ def main(
     )
     del pretrained_state
 
-    selected_lora_blocks = list(range(28))
+    selected_lora_blocks = (
+        list(bypass_cost_config["selected_indices"])
+        if bypass_cost_probe_only
+        else list(range(28))
+    )
     injected_lora_modules = inject_vosr_lora(
         model,
         selected_blocks=selected_lora_blocks,
@@ -498,19 +517,20 @@ def main(
     )
     lora_report = validate_lora_model(
         model,
-        expected_blocks=28,
+        expected_blocks=len(selected_lora_blocks),
         rank=8,
     )
 
     logger.info(
-        "Injected VOSR All-LoRA: "
-        f"blocks=28 modules={len(injected_lora_modules)} "
+        "Injected VOSR LoRA: "
+        f"blocks={len(selected_lora_blocks)} "
+        f"modules={len(injected_lora_modules)} "
         f"trainable_params="
         f"{lora_report['trainable_lora_params']}"
     )
     print(
-        "Injected VOSR All-LoRA:",
-        "blocks=28",
+        "Injected VOSR LoRA:",
+        f"blocks={len(selected_lora_blocks)}",
         f"modules={len(injected_lora_modules)}",
         f"trainable_params="
         f"{lora_report['trainable_lora_params']}",
@@ -525,6 +545,19 @@ def main(
 
     model.train()
 
+    bypass_controller = None
+    if bypass_cost_probe_only:
+        block_paths = {
+            f"blocks.{index}": f"blocks.{index}"
+            for index in range(28)
+        }
+        bypass_controller = adaptive.ResidualBlockController(
+            model,
+            block_paths,
+            cache_device="cpu",
+            cache_dtype=torch.float16,
+        )
+
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
         return model
@@ -538,7 +571,7 @@ def main(
 
     optimizer = None
     lr_scheduler = None
-    if not importance_probe_only:
+    if not update_free_mode:
         if args.use_8bit_adam:
             try:
                 import bitsandbytes as bnb
@@ -580,7 +613,7 @@ def main(
 
     global_step = 0
 
-    if importance_probe_only:
+    if update_free_mode:
         resume_path, current_step = None, 0
     else:
         resume_path, current_step = find_latest_checkpoint(args)
@@ -666,7 +699,7 @@ def main(
         ema.eval()
         accelerator.register_for_checkpointing(ema)
 
-    if importance_probe_only:
+    if update_free_mode:
         model, model_ae, train_dataloader = accelerator.prepare(
             model, model_ae, train_dataloader
         )
@@ -755,6 +788,10 @@ def main(
             logger.info(
                 f"  Total backward probes = {args.max_train_steps}"
             )
+        elif bypass_cost_probe_only:
+            logger.info(
+                "  Update-free frozen-block bypass cost profile"
+            )
         else:
             logger.info(
                 f"  Total optimization steps = {args.max_train_steps}"
@@ -781,6 +818,127 @@ def main(
             f"backward_probes={probe_config['expected_steps']}"
         )
 
+    if bypass_cost_probe_only:
+        logger.info(
+            "Running update-free VOSR bypass cost profile: "
+            f"selected={bypass_cost_config['selected_indices']} "
+            f"frozen={bypass_cost_config['frozen_indices']} "
+            f"flow_t={bypass_cost_config['flow_t']} "
+            f"warmup={bypass_cost_config['warmup']} "
+            f"repeats={bypass_cost_config['repeats']}"
+        )
+
+    unwrapped_model_ae = accelerator.unwrap_model(model_ae)
+    unwrapped_venc = accelerator.unwrap_model(venc)
+    if args.ae_type == "qwen":
+        latents_mean = (
+            torch.tensor(unwrapped_model_ae.config.latents_mean)
+            .view(1, unwrapped_model_ae.config.z_dim, 1, 1)
+            .to(unwrapped_model_ae.device, unwrapped_model_ae.dtype)
+        )
+        latents_std = 1.0 / torch.tensor(
+            unwrapped_model_ae.config.latents_std
+        ).view(
+            1, unwrapped_model_ae.config.z_dim, 1, 1
+        ).to(
+            unwrapped_model_ae.device,
+            unwrapped_model_ae.dtype,
+        )
+
+    if bypass_cost_probe_only:
+        if accelerator.num_processes != 1:
+            raise RuntimeError(
+                "VOSR bypass cost profiling currently requires one process"
+            )
+        try:
+            cost_batch = next(iter(train_dataloader))
+        except StopIteration as exc:
+            raise RuntimeError("Training dataloader is empty") from exc
+
+        cost_hq = cost_batch["hq"].to(
+            accelerator.device,
+            non_blocking=True,
+        )
+        with torch.no_grad():
+            _, cost_lq = degradation.degrade_process(
+                cost_hq,
+                resize_bak=True,
+            )
+            cost_hq = cost_hq * 2 - 1
+            cost_lq = cost_lq * 2 - 1
+
+            with accelerator.autocast():
+                raw_image = (0.5 * cost_lq + 0.5) * 255
+                raw_image = preprocess_raw_image(raw_image, args)
+                features, x_norm = unwrapped_venc.forward_with_features(
+                    raw_image
+                )
+                cost_z = [
+                    value
+                    for key, value in features.items()
+                    if key.startswith("layer_")
+                ]
+                cost_z[-1] = x_norm
+                cost_z = [
+                    cost_z[index]
+                    for index in args.layer_dinov2b_list
+                ]
+
+            combined = torch.cat([cost_lq, cost_hq], dim=0)
+            if args.ae_type == "qwen":
+                combined_latent = (
+                    unwrapped_model_ae.encode(
+                        combined
+                    ).latent_dist.sample()
+                    - latents_mean
+                ) * latents_std
+            elif args.ae_type == "sd2":
+                combined_latent = (
+                    unwrapped_model_ae.encode(
+                        combined.to(unwrapped_model_ae.dtype)
+                    ).latent_dist.sample()
+                    * unwrapped_model_ae.config.scaling_factor
+                )
+            cost_lq, cost_hq = combined_latent.chunk(2, dim=0)
+
+        def bypass_cost_loss_fn():
+            with accelerator.autocast():
+                _loss, loss_backward = vosr.loss_fm(
+                    model,
+                    cost_lq,
+                    cost_hq,
+                    cost_z,
+                    forced_t=bypass_cost_config["flow_t"],
+                )
+            return loss_backward
+
+        report = profile_frozen_block_costs(
+            model=model,
+            controller=bypass_controller,
+            loss_fn=bypass_cost_loss_fn,
+            probe_config=bypass_cost_config,
+            output_dir=args.output_dir,
+            device=accelerator.device,
+            metadata={
+                "config_path": str(config_path),
+                "data_config": str(args.train_dataset_config),
+                "pretrained_checkpoint": str(pretrained_path),
+                "seed": args.seed,
+                "selected_utility": bypass_cost_config[
+                    "selection"
+                ].get("selected_utility"),
+            },
+        )
+        if accelerator.is_main_process:
+            logger.info(
+                "Wrote VOSR bypass cost profile to "
+                f"{args.output_dir}"
+            )
+            print(json.dumps(report, indent=2))
+        accelerator.wait_for_everyone()
+        accelerator.end_training()
+        return
+
     # initial_global_step = 0
     initial_global_step = global_step 
 
@@ -796,19 +954,6 @@ def main(
         "Importance probe" if importance_probe_only else "Training"
     )
     epoch = 0
-    unwrapped_model_ae = accelerator.unwrap_model(model_ae)
-    
-    unwrapped_venc = accelerator.unwrap_model(venc)
-    if args.ae_type == "qwen":
-        latents_mean = (
-            torch.tensor(unwrapped_model_ae.config.latents_mean)
-            .view(1, unwrapped_model_ae.config.z_dim, 1, 1)
-            .to(unwrapped_model_ae.device, unwrapped_model_ae.dtype)
-        )
-        latents_std = 1.0 / torch.tensor(unwrapped_model_ae.config.latents_std).view(1, unwrapped_model_ae.config.z_dim, 1, 1).to(
-            unwrapped_model_ae.device, unwrapped_model_ae.dtype
-        )
-
     gc.disable()
     
     while global_step < args.max_train_steps:
