@@ -8,6 +8,7 @@ import csv
 import hashlib
 import json
 import random
+import re
 import time
 from pathlib import Path
 
@@ -79,6 +80,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--official_lora_dir", required=True)
     parser.add_argument("--embedding_dir", required=True)
     parser.add_argument("--data_dir", required=True)
+    parser.add_argument(
+        "--lq_dir",
+        default="",
+        help="Optional directory of pre-generated LQ images. When omitted, LQ is regenerated.",
+    )
     parser.add_argument("--eval_manifest", default="")
     parser.add_argument("--train_dir_for_overlap_check", default="")
     parser.add_argument("--output_dir", required=True)
@@ -165,6 +171,32 @@ def discover_images(data_dir: Path, manifest_path: Path | None, max_images: int)
     if not paths:
         raise SystemExit("No evaluation images were found")
     return paths
+
+
+def canonical_stem(path: Path) -> str:
+    stem = path.stem
+    stem = re.sub(r"^\d+_", "", stem)
+    return stem
+
+
+def index_lq_images(directory: Path, eval_paths: list[Path]) -> dict[str, Path]:
+    if not directory.is_dir():
+        raise SystemExit(f"LQ directory not found: {directory}")
+    index = {}
+    for path in sorted(directory.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in IMAGE_SUFFIXES:
+            continue
+        key = canonical_stem(path)
+        if key in index:
+            raise SystemExit(f"Duplicate canonical LQ image key {key!r}")
+        index[key] = path
+    missing = [path.name for path in eval_paths if path.stem not in index]
+    if missing:
+        raise SystemExit(
+            f"LQ directory is missing {len(missing)} evaluation images; "
+            f"examples: {missing[:5]}"
+        )
+    return index
 
 
 def pixel_sha256(path: Path) -> str:
@@ -339,6 +371,10 @@ def main() -> None:
 
     manifest = Path(args.eval_manifest) if args.eval_manifest else None
     eval_paths = discover_images(Path(args.data_dir), manifest, args.max_images)
+    lq_index = (
+        index_lq_images(Path(args.lq_dir), eval_paths)
+        if args.lq_dir else None
+    )
     overlap = audit_overlap(
         eval_paths,
         Path(args.train_dir_for_overlap_check)
@@ -373,8 +409,13 @@ def main() -> None:
                 (args.image_size, args.image_size), Image.Resampling.BICUBIC
             )
         hr = image_to_tensor(hr_pil)
-        lr = imresize(hr, scale=1.0 / args.sr_scale).clamp(0, 1)
-        lr_pil = tensor_to_pil(lr)
+        if lq_index is None:
+            lr = imresize(hr, scale=1.0 / args.sr_scale).clamp(0, 1)
+            lr_pil = tensor_to_pil(lr)
+        else:
+            with Image.open(lq_index[hr_path.stem]) as source:
+                lr_pil = source.convert("RGB")
+            lr = image_to_tensor(lr_pil)
         lr_upscaled_pil = lr_pil.resize(
             (args.image_size, args.image_size), Image.Resampling.BICUBIC
         )
@@ -462,6 +503,7 @@ def main() -> None:
         "overlap_audit": overlap,
         "num_eval_images": len(eval_paths),
         "paired_vae_sampling": True,
+        "lq_source": str(Path(args.lq_dir).resolve()) if args.lq_dir else "generated_in_memory",
         "official_transformer_and_vae_adapters_loaded": True,
     }
     (output_dir / "metadata.json").write_text(
