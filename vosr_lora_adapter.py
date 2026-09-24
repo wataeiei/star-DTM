@@ -113,6 +113,47 @@ def get_lora_state_dict(model):
     }
 
 
+@torch.no_grad()
+def merge_vosr_lora(model):
+    merged = []
+    if not hasattr(model, "blocks"):
+        raise RuntimeError("Model has no blocks attribute")
+
+    for block_index, block in enumerate(model.blocks):
+        targets = (
+            (block.attn, "qkv", "attn.qkv"),
+            (
+                block.cross_attn,
+                "q_linear",
+                "cross_attn.q_linear",
+            ),
+            (
+                block.cross_attn,
+                "v_linear",
+                "cross_attn.v_linear",
+            ),
+        )
+        for parent, attribute, suffix in targets:
+            wrapper = getattr(parent, attribute)
+            if not isinstance(wrapper, VOSRLoRALinear):
+                continue
+
+            delta = wrapper.lora_B.weight.float().matmul(
+                wrapper.lora_A.weight.float()
+            )
+            delta.mul_(wrapper.scaling)
+            wrapper.base_layer.weight.add_(
+                delta.to(
+                    device=wrapper.base_layer.weight.device,
+                    dtype=wrapper.base_layer.weight.dtype,
+                )
+            )
+            setattr(parent, attribute, wrapper.base_layer)
+            merged.append(f"blocks.{block_index}.{suffix}")
+
+    return merged
+
+
 def validate_lora_model(
     model,
     expected_blocks,

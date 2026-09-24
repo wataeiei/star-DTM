@@ -28,6 +28,7 @@ from vosr import VOSR
 from vosr_lora_adapter import (
     inject_vosr_lora,
     load_vosr_lora_adapter,
+    merge_vosr_lora,
     validate_lora_model,
 )
 from tiled_vae import (
@@ -398,6 +399,12 @@ def main():
             'Omit this option for the unmodified Base-VOSR model.'
         ),
     )
+    parser.add_argument(
+        '--merge_lora',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Merge a loaded LoRA into base weights before inference.',
+    )
 
     temp_args, _ = parser.parse_known_args()
     args = load_config_with_cli(temp_args.checkpoint, parser)
@@ -532,6 +539,14 @@ def main():
             f"params={report['trainable_lora_params']} "
             f"rank={lora['rank']} alpha={lora['alpha']}"
         )
+        if args.merge_lora:
+            merged = merge_vosr_lora(model)
+            if len(merged) != len(injected):
+                raise RuntimeError(
+                    f"Merged {len(merged)} LoRA modules, "
+                    f"expected {len(injected)}"
+                )
+            print(f"Merged VOSR LoRA modules: {len(merged)}")
 
     model.to(device).eval()
     model.forward = model.forward_flexible
@@ -569,6 +584,7 @@ def main():
     to_tensor = transforms.ToTensor()
     print(f"Processing {len(image_paths)} images...")
     image_times = []
+    failed_images = []
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
@@ -603,16 +619,21 @@ def main():
                         sr_tensor = decode_dispatch(vae, sr_latent, args, latents_mean, latents_std, light_decoder)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-            image_times.append(time.perf_counter() - image_started)
+            image_elapsed = time.perf_counter() - image_started
 
-            sr_img = transforms.ToPILImage()(sr_tensor[0].cpu() * 0.5 + 0.5)
+            sr_for_save = (
+                sr_tensor[0].detach().float().cpu() * 0.5 + 0.5
+            ).clamp_(0.0, 1.0)
+            sr_img = transforms.ToPILImage()(sr_for_save)
             if args.align_method == 'adain':
                 sr_img = adain_color_fix(sr_img, input_img)
             elif args.align_method == 'wavelet':
                 sr_img = wavelet_color_fix(sr_img, input_img)
             sr_img.save(os.path.join(out_dir, os.path.splitext(img_name)[0] + '.png'))
+            image_times.append(image_elapsed)
 
         except Exception as e:
+            failed_images.append(img_name)
             print(f"Error processing {img_name}: {e}")
             import traceback
             traceback.print_exc()
@@ -624,6 +645,8 @@ def main():
         'method': method_name,
         'num_input_images': len(image_paths),
         'num_completed_images': len(image_times),
+        'num_failed_images': len(failed_images),
+        'failed_image_examples': failed_images[:10],
         'precision': args.precision,
         'seed': int(seed),
         'infer_steps': int(args.infer_steps),
@@ -632,6 +655,9 @@ def main():
         'lora_adapter': (
             os.path.abspath(args.lora_adapter)
             if args.lora_adapter else None
+        ),
+        'lora_merged': bool(
+            args.lora_adapter and args.merge_lora
         ),
         'mean_inference_time_s': (
             sum(image_times) / len(image_times)
@@ -653,6 +679,11 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
+    if failed_images:
+        raise RuntimeError(
+            f"Inference failed for {len(failed_images)} images; "
+            f"examples: {failed_images[:10]}"
+        )
     print("Done!")
 
 
