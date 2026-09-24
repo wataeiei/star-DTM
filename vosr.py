@@ -138,7 +138,16 @@ class VOSR(nn.Module):
 
     # ──────────────────── Training losses ──────────────────── #
 
-    def loss_fm(self, model, lq, hq, z=None, weight_dtype=None, forced_t=None):
+    def loss_fm(
+        self,
+        model,
+        lq,
+        hq,
+        z=None,
+        weight_dtype=None,
+        forced_t=None,
+        before_model=None,
+    ):
         B, device = hq.size(0), hq.device
         if forced_t is not None:
             if isinstance(forced_t, torch.Tensor):
@@ -181,6 +190,8 @@ class VOSR(nn.Module):
         inp = torch.cat([lq_mixed, z_t], dim=1)
 
         v = eps - hq
+        if before_model is not None:
+            before_model(t)
         v_current = model(inp, t, z=z_mixed)
         v_error = v_current - v
         loss = (v_error ** 2).mean()

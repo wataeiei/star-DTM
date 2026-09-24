@@ -107,7 +107,7 @@ def inject_vosr_lora(
 
 def get_lora_state_dict(model):
     return {
-        name: tensor.detach().cpu().contiguous()
+        name.replace(".block.", "."): tensor.detach().cpu().contiguous()
         for name, tensor in model.state_dict().items()
         if ".lora_A." in name or ".lora_B." in name
     }

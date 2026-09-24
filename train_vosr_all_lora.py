@@ -1,4 +1,6 @@
 import os, re
+import csv
+import time
 import yaml
 import copy, glob
 import logging
@@ -23,6 +25,11 @@ from vosr_bypass_cost_probe import (
 from vosr_bypass_gradient_fidelity import (
     configure_bypass_fidelity_probe,
     profile_threshold_gradient_fidelity,
+)
+from vosr_threshold_bypass_training import (
+    configure_threshold_bypass_training,
+    nearest_policy,
+    write_threshold_bypass_training_report,
 )
 import adaptive_grad_blockskip as adaptive
 from pathlib import Path
@@ -350,6 +357,7 @@ def main(
     force_importance_probe=False,
     force_bypass_cost_probe=False,
     force_bypass_fidelity_probe=False,
+    force_threshold_bypass_training=False,
     config_overrides=None,
 ):
     
@@ -366,6 +374,8 @@ def main(
         config["bypass_cost_probe_only"] = True
     if force_bypass_fidelity_probe:
         config["bypass_fidelity_probe_only"] = True
+    if force_threshold_bypass_training:
+        config["threshold_bypass_training"] = True
     args = Namespace(**config)
     args.report_to = normalize_report_to(getattr(args, "report_to", None))
     probe_config = configure_importance_probe(args)
@@ -374,6 +384,8 @@ def main(
     bypass_cost_probe_only = bypass_cost_config is not None
     bypass_fidelity_config = configure_bypass_fidelity_probe(args)
     bypass_fidelity_probe_only = bypass_fidelity_config is not None
+    threshold_bypass_config = configure_threshold_bypass_training(args)
+    threshold_bypass_training = threshold_bypass_config is not None
     enabled_probe_modes = sum(
         int(value)
         for value in (
@@ -531,6 +543,8 @@ def main(
             )["selected_indices"]
         )
         if bypass_cost_probe_only or bypass_fidelity_probe_only
+        else list(threshold_bypass_config["selected_indices"])
+        if threshold_bypass_training
         else list(range(28))
     )
     injected_lora_modules = inject_vosr_lora(
@@ -570,7 +584,11 @@ def main(
     model.train()
 
     bypass_controller = None
-    if bypass_cost_probe_only or bypass_fidelity_probe_only:
+    if (
+        bypass_cost_probe_only
+        or bypass_fidelity_probe_only
+        or threshold_bypass_training
+    ):
         block_paths = {
             f"blocks.{index}": f"blocks.{index}"
             for index in range(28)
@@ -824,6 +842,11 @@ def main(
             logger.info(
                 f"  Total optimization steps = {args.max_train_steps}"
             )
+            if threshold_bypass_training:
+                logger.info(
+                    "  Method = Threshold bypass; "
+                    f"threshold={threshold_bypass_config['threshold']}"
+                )
         logger.info(f"  Number of processes (GPUs) = {accelerator.num_processes}")
         logger.info(f"  Number of nodes = {accelerator.num_processes // 8 if accelerator.num_processes >= 8 else 1} (assuming 8 GPUs per node)")
         logger.info(f"  Distributed type = {accelerator.distributed_type}")
@@ -833,6 +856,8 @@ def main(
     losses = 0.0
     mse_losses = 0.0
     importance_probe_rows = []
+    threshold_bypass_rows = []
+    all_lora_training_rows = []
 
     if importance_probe_only:
         if accelerator.num_processes != 1:
@@ -1094,7 +1119,11 @@ def main(
         disable=not accelerator.is_local_main_process,
     )
     progress_bar.set_description(
-        "Importance probe" if importance_probe_only else "Training"
+        "Importance probe"
+        if importance_probe_only
+        else "Threshold bypass"
+        if threshold_bypass_training
+        else "Training"
     )
     epoch = 0
     gc.disable()
@@ -1107,6 +1136,13 @@ def main(
             torch.cuda.empty_cache()
             
         for batch in train_dataloader:
+            if not importance_probe_only:
+                if accelerator.device.type == "cuda":
+                    torch.cuda.synchronize(accelerator.device)
+                training_step_started = time.perf_counter()
+            if threshold_bypass_training:
+                threshold_step_policy = None
+                threshold_step_sampled_t = None
             hq = batch["hq"].to(accelerator.device, non_blocking=True)
             with torch.no_grad():
                 _, lq = degradation.degrade_process(hq, resize_bak=True)
@@ -1137,6 +1173,19 @@ def main(
                     flow_anchor_for_step(probe_config, global_step)
                     if importance_probe_only else None
                 )
+
+                def configure_threshold_bypass(sampled_t):
+                    nonlocal threshold_step_policy, threshold_step_sampled_t
+                    sampled = float(sampled_t.detach().float().mean().cpu())
+                    threshold_step_sampled_t = sampled
+                    threshold_step_policy = nearest_policy(
+                        threshold_bypass_config, sampled
+                    )
+                    bypass_controller.configure(
+                        threshold_step_policy["skip_blocks"]
+                    )
+                    bypass_controller.set_mode("single_skip")
+
                 with accelerator.autocast():
                     loss, loss_backward = vosr.loss_fm(
                         model,
@@ -1144,6 +1193,10 @@ def main(
                         hq,
                         z,
                         forced_t=probe_flow_t,
+                        before_model=(
+                            configure_threshold_bypass
+                            if threshold_bypass_training else None
+                        ),
                     )
                 
                 # Backward and optimize
@@ -1180,6 +1233,53 @@ def main(
                     lr_scheduler.step()
                 progress_bar.update(1)
                 global_step += 1
+                if threshold_bypass_training:
+                    if threshold_step_policy is None:
+                        raise RuntimeError(
+                            "Threshold bypass policy was not configured"
+                        )
+                    if accelerator.device.type == "cuda":
+                        torch.cuda.synchronize(accelerator.device)
+                    threshold_stats = bypass_controller.stats(0.0)
+                    threshold_bypass_rows.append(
+                        {
+                            "step": global_step,
+                            "sampled_flow_t": threshold_step_sampled_t,
+                            "policy_flow_t": threshold_step_policy["flow_t"],
+                            "noise_ratio": threshold_step_policy["flow_t"],
+                            "threshold": threshold_step_policy["threshold"],
+                            "requested_skip_count": threshold_step_policy[
+                                "bypass_budget"
+                            ],
+                            "skipped_block_count": threshold_stats.skipped_blocks,
+                            "skipped_blocks": ";".join(
+                                threshold_step_policy["skip_blocks"]
+                            ),
+                            "estimated_saved_gflops": threshold_step_policy[
+                                "estimated_saved_gflops"
+                            ],
+                            "loss": loss.detach().float().item(),
+                            "train_step_time_s": (
+                                time.perf_counter() - training_step_started
+                            ),
+                            "fallback_blocks": threshold_stats.fallback_blocks,
+                            "max_forward_abs_diff": (
+                                threshold_stats.max_reconstruction_abs_diff
+                            ),
+                        }
+                    )
+                elif not importance_probe_only:
+                    if accelerator.device.type == "cuda":
+                        torch.cuda.synchronize(accelerator.device)
+                    all_lora_training_rows.append(
+                        {
+                            "step": global_step,
+                            "loss": loss.detach().float().item(),
+                            "train_step_time_s": (
+                                time.perf_counter() - training_step_started
+                            ),
+                        }
+                    )
                 if (
                     not importance_probe_only
                     and global_step % args.checkpointing_steps == 0
@@ -1363,21 +1463,81 @@ def main(
     accelerator.wait_for_everyone()
     if accelerator.is_main_process and not importance_probe_only:
         unwrapped_model = accelerator.unwrap_model(model)
+        method_name = (
+            "Threshold bypass" if threshold_bypass_training else "All-LoRA"
+        )
         metadata = save_vosr_lora_adapter(
             unwrapped_model,
             output_dir=args.output_dir,
             selected_blocks=selected_lora_blocks,
             global_step=global_step,
             final_loss=loss.detach().float().item(),
-            method="All-LoRA",
+            method=method_name,
             rank=8,
             alpha=16.0,
         )
         logger.info(
-            f"Saved All-LoRA adapter to "
+            f"Saved {method_name} adapter to "
             f"{metadata['adapter_path']}"
         )
         print(json.dumps(metadata, indent=2))
+        if threshold_bypass_training:
+            training_report = write_threshold_bypass_training_report(
+                args.output_dir,
+                threshold_bypass_rows,
+                threshold_bypass_config,
+                metadata={
+                    "trainable_lora_params": metadata[
+                        "trainable_lora_params"
+                    ],
+                    "adapter_size_mb": metadata["adapter_size_mb"],
+                    "peak_cuda_mem_mb": metadata["peak_cuda_mem_mb"],
+                    "adapter_path": metadata["adapter_path"],
+                },
+            )
+            logger.info(
+                "Wrote Threshold bypass training report to "
+                f"{args.output_dir}"
+            )
+            print(json.dumps(training_report, indent=2))
+        else:
+            train_log_path = Path(args.output_dir) / "train_log.csv"
+            with train_log_path.open(
+                "w", newline="", encoding="utf-8"
+            ) as handle:
+                writer = csv.DictWriter(
+                    handle, fieldnames=list(all_lora_training_rows[0])
+                )
+                writer.writeheader()
+                writer.writerows(all_lora_training_rows)
+            train_time = sum(
+                float(row["train_step_time_s"])
+                for row in all_lora_training_rows
+            )
+            all_lora_summary = {
+                "method": "All-LoRA",
+                "train_steps": len(all_lora_training_rows),
+                "selected_lora_blocks": len(selected_lora_blocks),
+                "trainable_lora_params": metadata[
+                    "trainable_lora_params"
+                ],
+                "train_step_time_s": train_time,
+                "mean_train_step_time_s": (
+                    train_time / len(all_lora_training_rows)
+                ),
+                "mean_loss": sum(
+                    float(row["loss"])
+                    for row in all_lora_training_rows
+                ) / len(all_lora_training_rows),
+                "final_loss": float(all_lora_training_rows[-1]["loss"]),
+                "peak_cuda_mem_mb": metadata["peak_cuda_mem_mb"],
+                "adapter_size_mb": metadata["adapter_size_mb"],
+                "adapter_path": metadata["adapter_path"],
+            }
+            (Path(args.output_dir) / "all_lora_training_summary.json").write_text(
+                json.dumps(all_lora_summary, indent=2), encoding="utf-8"
+            )
+            print(json.dumps(all_lora_summary, indent=2))
 
     accelerator.wait_for_everyone()
     accelerator.end_training()

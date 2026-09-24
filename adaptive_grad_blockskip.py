@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Any, Iterable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 
 def canonical_lora_name(name: str) -> str:
@@ -767,17 +769,22 @@ class ResidualBlockController:
         )
 
 
-def snapshot_rng(device: torch.device) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+def snapshot_rng(device: torch.device):
     cpu_state = torch.random.get_rng_state()
     cuda_state = torch.cuda.get_rng_state_all() if device.type == "cuda" else None
-    return cpu_state, cuda_state
+    return cpu_state, cuda_state, random.getstate(), np.random.get_state()
 
 
-def restore_rng(state: tuple[torch.Tensor, list[torch.Tensor] | None]) -> None:
-    cpu_state, cuda_state = state
+def restore_rng(state) -> None:
+    # Accept legacy two-item snapshots so existing saved probe code remains usable.
+    cpu_state, cuda_state = state[:2]
     torch.random.set_rng_state(cpu_state)
     if cuda_state is not None:
         torch.cuda.set_rng_state_all(cuda_state)
+    if len(state) >= 3:
+        random.setstate(state[2])
+    if len(state) >= 4:
+        np.random.set_state(state[3])
 
 
 def populate_online_cache(

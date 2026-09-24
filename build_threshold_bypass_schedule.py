@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a strict score-threshold bypass schedule matched to a B8 target."""
+"""Build a strict score-threshold bypass schedule matched to a compute target."""
 
 from __future__ import annotations
 
@@ -169,10 +169,15 @@ def main() -> None:
         raise SystemExit("--thresholds must be non-negative")
 
     all_rows = read_csv(args.importance_csv)
-    required = {"train_step", "noise_ratio", "block", "block_index", args.score_key}
+    required = {"noise_ratio", "block", "block_index", args.score_key}
     missing = required - set(all_rows[0])
     if missing:
         raise SystemExit("Importance CSV is missing columns: " + ", ".join(sorted(missing)))
+    # Standalone model-onboarding probes represent a single calibration point and
+    # may omit train_step. Treat that snapshot as step zero.
+    if "train_step" not in all_rows[0]:
+        for row in all_rows:
+            row["train_step"] = "0"
     rows = [row for row in all_rows if int(row["train_step"]) == args.importance_step]
     if not rows:
         raise SystemExit(f"No importance rows at train_step={args.importance_step}")
@@ -241,6 +246,8 @@ def main() -> None:
             "max_bypass_budget": max(schedule.values()),
             "is_constant_schedule": is_constant,
             "estimated_saved_gflops_per_step": mean_saved,
+            "difference_vs_fixed_budget_pct": difference,
+            # Retained for compatibility with existing DiT4SR result readers.
             "difference_vs_fixed_b8_pct": difference,
             "schedule": schedule_text(schedule),
         })
@@ -268,6 +275,10 @@ def main() -> None:
         "target_budget": args.target_budget,
         "target_saved_gflops_per_step": target_saved,
         "threshold_saved_gflops_per_step": chosen_scan["estimated_saved_gflops_per_step"],
+        "difference_vs_fixed_budget_pct": chosen_scan[
+            "difference_vs_fixed_budget_pct"
+        ],
+        # Retained for compatibility with existing DiT4SR result readers.
         "difference_vs_fixed_b8_pct": chosen_scan["difference_vs_fixed_b8_pct"],
         "threshold_schedule": chosen_scan["schedule"],
         "protected_blocks": sorted(protected),
