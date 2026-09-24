@@ -1,0 +1,660 @@
+import os
+import sys
+import gc
+import types
+import glob
+import argparse
+import json
+import math
+import time
+from contextlib import nullcontext
+import torch
+import torch.nn.functional as F
+import numpy as np
+from PIL import Image
+from torchvision import transforms
+from torchvision.transforms import Normalize
+from safetensors.torch import load_file
+from tqdm import tqdm
+
+torch.hub.set_dir('preset/ckpts/torch_cache')
+sys.path.append(os.getcwd())
+# Make the VOSR/ dir (where tiled_vae.py lives) importable from any run cwd.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from models.lightningdit import LightningDiT
+from models.light_decoder import LightDecoder
+from vosr import VOSR
+from vosr_lora_adapter import (
+    inject_vosr_lora,
+    load_vosr_lora_adapter,
+    validate_lora_model,
+)
+from tiled_vae import (
+    encode_dispatch, decode_dispatch,
+    _gaussian_weights, _make_tile_grid,
+)
+
+IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
+
+SD2_LWDECODER_PATH = 'preset/ckpts/sd21_lwdecoder.pth'
+SD2_AE_PATH = 'preset/ckpts/stable-diffusion-2-1-base'
+QWEN_AE_PATH = 'preset/ckpts/Qwen-Image-vae-2d'
+
+
+IMG_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp'}
+
+def list_lq_images(input_path):
+    p = os.path.normpath(input_path)
+    if os.path.isfile(p):
+        return [p]
+    if os.path.isdir(p):
+        imgs = [
+            os.path.join(p, f) for f in sorted(os.listdir(p))
+            if os.path.splitext(f)[1].lower() in IMG_EXTENSIONS
+        ]
+        return imgs
+    return []
+
+
+def all_expected_outputs_exist(image_paths, out_dirs):
+    if not image_paths:
+        return False
+    for img_path in image_paths:
+        name = os.path.basename(img_path)
+        for d in out_dirs:
+            if not os.path.isfile(os.path.join(d, os.path.splitext(name)[0] + '.png')):
+                return False
+    return True
+
+
+def load_lora_config(adapter_argument):
+    adapter_path = os.path.abspath(adapter_argument)
+    if os.path.isdir(adapter_path):
+        adapter_dir = adapter_path
+        adapter_path = os.path.join(
+            adapter_dir, "adapter_model.safetensors"
+        )
+    else:
+        adapter_dir = os.path.dirname(adapter_path)
+
+    config_path = os.path.join(adapter_dir, "adapter_config.json")
+    if not os.path.isfile(adapter_path):
+        raise FileNotFoundError(
+            f"LoRA adapter not found: {adapter_path}"
+        )
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(
+            f"LoRA adapter config not found: {config_path}"
+        )
+
+    with open(config_path, "r", encoding="utf-8") as handle:
+        config = json.load(handle)
+
+    if config.get("format") != "vosr_native_lora_v1":
+        raise RuntimeError(
+            f"Unsupported LoRA format: {config.get('format')!r}"
+        )
+
+    selected_blocks = []
+    for value in config.get("selected_blocks", []):
+        if isinstance(value, str) and value.startswith("blocks."):
+            value = value.split(".", 1)[1]
+        selected_blocks.append(int(value))
+    if not selected_blocks:
+        raise RuntimeError("Adapter config has no selected blocks")
+
+    return {
+        "adapter_path": adapter_path,
+        "config_path": config_path,
+        "selected_blocks": selected_blocks,
+        "rank": int(config["rank"]),
+        "alpha": float(config["alpha"]),
+    }
+
+
+def adain_color_fix(target, source):
+    from torchvision.transforms.functional import to_tensor, to_pil_image
+    target_tensor = to_tensor(target).unsqueeze(0)
+    source_tensor = to_tensor(source).unsqueeze(0)
+    eps = 1e-5
+    target_mean = torch.mean(target_tensor, dim=[2, 3], keepdim=True)
+    target_std = torch.std(target_tensor, dim=[2, 3], keepdim=True) + eps
+    source_mean = torch.mean(source_tensor, dim=[2, 3], keepdim=True)
+    source_std = torch.std(source_tensor, dim=[2, 3], keepdim=True) + eps
+    target_tensor = (target_tensor - target_mean) / target_std * source_std + source_mean
+    return to_pil_image(torch.clamp(target_tensor[0], 0, 1))
+
+
+def wavelet_color_fix(target, source):
+    import cv2
+    target_np = np.array(target).astype(np.float32) / 255.0
+    source_np = np.array(source.resize(target.size, Image.LANCZOS)).astype(np.float32) / 255.0
+    sigma = 5
+    source_low = cv2.GaussianBlur(source_np, (0, 0), sigma)
+    target_low = cv2.GaussianBlur(target_np, (0, 0), sigma)
+    target_high = target_np - target_low
+    result = np.clip(source_low + target_high, 0, 1) * 255.0
+    return Image.fromarray(result.astype(np.uint8))
+
+
+def load_config_with_cli(ckpt_path, parser):
+    cur = os.path.abspath(ckpt_path)
+    json_path = None
+    for _ in range(5):
+        candidate = os.path.join(cur, "args.json")
+        if os.path.isfile(candidate):
+            json_path = candidate
+            break
+        cur = os.path.dirname(cur)
+    if json_path is None:
+        print(f"Warning: args.json not found near {ckpt_path}, using default CLI args only.")
+        return parser.parse_args()
+    with open(json_path, 'r') as f:
+        json_args = json.load(f)
+    cli_args = parser.parse_args()
+    combined_args = argparse.Namespace()
+    for k, v in json_args.items():
+        setattr(combined_args, k, v)
+    for k, v in vars(cli_args).items():
+        if v is not None:
+            setattr(combined_args, k, v)
+        elif not hasattr(combined_args, k):
+            setattr(combined_args, k, v)
+    return combined_args
+
+
+def _clear_stale_distributed_env():
+    for k in (
+        'WORLD_SIZE', 'RANK', 'LOCAL_RANK', 'LOCAL_WORLD_SIZE',
+        'GROUP_RANK', 'ROLE_RANK', 'MASTER_ADDR', 'MASTER_PORT',
+        'TORCHELASTIC_RUN_ID', 'TORCHELASTIC_MAX_RESTARTS',
+    ):
+        os.environ.pop(k, None)
+
+
+def _inference_accelerator_stub():
+    _clear_stale_distributed_env()
+    dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    return types.SimpleNamespace(device=dev)
+
+
+def preprocess_raw_image(x, args):
+    x = x / 255.
+    x = F.interpolate(x, args.dinov2_size, mode='bicubic').clip(0., 1.)
+    x = Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD)(x)
+    return x
+
+
+def load_dinov2(args, device):
+    if args.enc_type == 'dinov2b':
+        encoder = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
+    elif args.enc_type == 'dinov2l':
+        encoder = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
+    elif args.enc_type == 'dinov2g':
+        encoder = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitg14')
+    del encoder.head
+    encoder.head = torch.nn.Identity()
+
+    def forward_with_features(self, x, masks=None):
+        features = {}
+        layer_indices = list(range(len(self.blocks)))
+        if isinstance(x, list):
+            return self.forward_features_list(x, masks)
+        x = self.prepare_tokens_with_masks(x, masks)
+        for i, blk in enumerate(self.blocks):
+            x = blk(x)
+            if i in layer_indices:
+                features[f'layer_{i}'] = x[:, 1:]
+        x_norm = self.norm(x)
+        return features, x_norm[:, 1:]
+
+    encoder.forward_with_features = types.MethodType(forward_with_features, encoder)
+    encoder = encoder.to(device).eval()
+    for p in encoder.parameters():
+        p.requires_grad_(False)
+    return encoder
+
+
+def get_venc_features(venc, lq_tensor, args):
+    with torch.no_grad():
+        raw_image = (0.5 * lq_tensor + 0.5) * 255
+        raw_image_ = preprocess_raw_image(raw_image, args)
+        features, x_norm = venc.forward_with_features(raw_image_)
+        z = [v for k, v in features.items() if k.startswith('layer_')]
+        z[-1] = x_norm
+        z = [z[i] for i in args.layer_dinov2b_list]
+    return z
+
+
+def tiled_latent_inference(
+    model, vosr_model, vae, venc, lq_tensor, args,
+    device='cuda', light_decoder=None,
+):
+    """
+    Latent-space tiled inference for VOSR DiT (multi-step FM with CFG).
+
+    1. VAE-encode the full image once.
+    2. For each tile, crop the corresponding LQ pixel region, resize to
+       dinov2_size, and extract DINOv2 features independently — keeps exact
+       spatial correspondence and constant feature shape across tiles.
+    3. Generate noise z for the full latent (consistent across overlapping tiles).
+    4. For each flow step, tile only the DiT forward pass in latent space
+       (with CFG: cond + weak batched together), blend velocity predictions
+       with Gaussian weights, then update z globally.
+    5. VAE-decode the full result latent once.
+    """
+    AE_FACTOR = 8
+    b = lq_tensor.shape[0]
+    patch_size = getattr(args, 'patch_size', 2)
+
+    # --- Full-image encode (done once) ---
+    with torch.no_grad():
+        lq_latent, latents_mean, latents_std = encode_dispatch(vae, lq_tensor, args, device)
+
+    _, lc, lh, lw = lq_latent.shape
+
+    # --- Pixel tile params -> latent tile params (aligned to patch_size) ---
+    lt_size = max((args.tile_size // AE_FACTOR // patch_size) * patch_size, patch_size)
+    lt_overlap = max(args.tile_overlap // AE_FACTOR, lt_size // 8)
+    lt_size = min(lt_size, min(lh, lw))
+    lt_overlap = min(lt_overlap, lt_size - 1)
+
+    # --- Fast path: no tiling needed ---
+    if lh <= lt_size and lw <= lt_size:
+        print(f"[Tiled Latent]: latent {lh}x{lw} fits in tile {lt_size}, no tiling needed.")
+        with torch.no_grad():
+            z_fea = get_venc_features(venc, lq_tensor, args) if venc is not None else None
+            sr_latent = vosr_model.sample_multistep_fm(
+                model, lq_latent, n_steps=args.infer_steps, venc_fea=z_fea
+            )
+            return decode_dispatch(vae, sr_latent, args, latents_mean, latents_std, light_decoder)
+
+    # --- Build tile grid & Gaussian weights ---
+    h_pos = _make_tile_grid(lh, lt_size, lt_overlap)
+    w_pos = _make_tile_grid(lw, lt_size, lt_overlap)
+    g_weight = _gaussian_weights(lt_size, lt_size, lc, device)
+    print(f"[Tiled Latent]: latent {lh}x{lw}, tile={lt_size}, overlap={lt_overlap}, "
+          f"grid={len(h_pos)}x{len(w_pos)}")
+
+    # --- Per-tile DINOv2 features (pre-computed once) ---
+    tile_venc = {}
+    if venc is not None:
+        with torch.no_grad():
+            for hi in h_pos:
+                for wi in w_pos:
+                    ph_s, pw_s = hi * AE_FACTOR, wi * AE_FACTOR
+                    ph_e = min((hi + lt_size) * AE_FACTOR, lq_tensor.shape[2])
+                    pw_e = min((wi + lt_size) * AE_FACTOR, lq_tensor.shape[3])
+                    lq_crop = lq_tensor[:, :, ph_s:ph_e, pw_s:pw_e]
+                    tile_venc[(hi, wi)] = get_venc_features(venc, lq_crop, args)
+
+    # --- CFG preparation on the full latent (done once) ---
+    weak_str = (args.weak_cond_strength_aelq_list[0] + args.weak_cond_strength_aelq_list[1]) / 2.
+    lq_weak_full = vosr_model.interpolate(
+        lq_latent, torch.zeros_like(lq_latent), weak_str, vosr_model.interp_type
+    )
+
+    # --- Full-latent noise (shared across tiles for consistency) ---
+    z = torch.randn_like(lq_latent)
+
+    # --- Flow matching loop with tiled DiT + CFG ---
+    n_steps = args.infer_steps
+    t_seq = torch.linspace(1., 0., n_steps + 1, device=device)
+    cfg_scale = vosr_model.cfg_scale
+    t_start, t_end = vosr_model.t_start, vosr_model.t_end
+
+    with torch.no_grad():
+        for step_i in range(n_steps):
+            t_cur, t_nxt = t_seq[step_i], t_seq[step_i + 1]
+            dt = t_cur - t_nxt
+            use_cfg = (t_cur >= t_start and t_cur <= t_end)
+
+            u_acc = torch.zeros_like(lq_latent)
+            w_acc = torch.zeros_like(lq_latent)
+
+            for hi in h_pos:
+                for wi in w_pos:
+                    he, we = hi + lt_size, wi + lt_size
+
+                    lq_tile = lq_latent[:, :, hi:he, wi:we]
+                    z_tile = z[:, :, hi:he, wi:we]
+                    z_fea_tile = tile_venc.get((hi, wi))
+
+                    inp_cond = torch.cat([lq_tile, z_tile], dim=1)
+
+                    if use_cfg:
+                        lq_weak_tile = lq_weak_full[:, :, hi:he, wi:we]
+                        inp_weak = torch.cat([lq_weak_tile, z_tile], dim=1)
+                        model_inp = torch.cat([inp_cond, inp_weak], dim=0)
+                        model_t = t_cur.expand(b).repeat(2)
+
+                        if z_fea_tile is not None:
+                            model_z = [torch.cat([v, torch.zeros_like(v)], dim=0)
+                                       for v in z_fea_tile]
+                        else:
+                            model_z = None
+
+                        d_out = model(model_inp, model_t, z=model_z)
+                        d_cond, d_weak = d_out.chunk(2)
+                        u_tile = d_weak + cfg_scale * (d_cond - d_weak)
+                    else:
+                        u_tile = model(inp_cond, t_cur.expand(b), z=z_fea_tile)
+
+                    u_acc[:, :, hi:he, wi:we] += u_tile * g_weight
+                    w_acc[:, :, hi:he, wi:we] += g_weight
+
+            z = z - dt * (u_acc / w_acc)
+
+    # --- Full-latent decode (done once) ---
+    with torch.no_grad():
+        return decode_dispatch(vae, z, args, latents_mean, latents_std, light_decoder)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--checkpoint', '-c', type=str, required=True)
+    parser.add_argument('--input_image', '-i', type=str, required=True)
+    parser.add_argument('--output_dir', '-o', type=str, required=True)
+    parser.add_argument("--upscale", '-u', type=int, default=4)
+    parser.add_argument("--process_size", type=int, default=512)
+    parser.add_argument("--align_method", type=str, choices=['wavelet', 'adain', 'nofix'], default='wavelet')
+    parser.add_argument("--tile_size", type=int, default=0, help='Tile size for diffusion inference (0 to disable)')
+    parser.add_argument("--tile_overlap", type=int, default=4)
+    parser.add_argument('--vae_tile_size', type=int, default=None,
+                        help='VAE tile size in pixels for tiled encode/decode (default 0 = full-image VAE; '
+                             'the 4D-attention fix makes full VAE fit up to ~8K, so tiling is only for '
+                             'extreme sizes).')
+    parser.add_argument('--vae_tile_overlap', type=int, default=None,
+                        help='VAE tile overlap in pixels (default: follow --tile_overlap).')
+    parser.add_argument('--posterior_mode', action=argparse.BooleanOptionalAction, default=True,
+                        help='Deterministic VAE latent (latent_dist.mode()) instead of .sample() '
+                             '(needed for seam-free tiled encode).')
+    parser.add_argument('--infer_steps', type=int, default=25)
+    parser.add_argument('--cfg_scale', type=float, default=2.0)
+    parser.add_argument('--weak_cond_strength_aelq', type=float, default=0.10)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--force_rerun', action='store_true')
+    parser.add_argument('--config', type=str, default='')
+    parser.add_argument(
+        '--precision',
+        choices=('fp32', 'bf16'),
+        default=None,
+        help='Inference autocast precision (default: fp32).',
+    )
+    parser.add_argument(
+        '--method_name',
+        type=str,
+        default=None,
+        help='Method label stored in inference_summary.json.',
+    )
+    parser.add_argument(
+        '--lora_adapter',
+        type=str,
+        default=None,
+        help=(
+            'VOSR native LoRA directory or adapter_model.safetensors. '
+            'Omit this option for the unmodified Base-VOSR model.'
+        ),
+    )
+
+    temp_args, _ = parser.parse_known_args()
+    args = load_config_with_cli(temp_args.checkpoint, parser)
+
+    if args.infer_steps is None:
+        args.infer_steps = 25
+    if not getattr(args, 'precision', None):
+        args.precision = 'fp32'
+    # vae_tile_size stays None (-> full-image VAE) by default; only explicit
+    # --vae_tile_size N enables tiled VAE for extreme (>~8K) inputs.
+
+    image_paths = list_lq_images(args.input_image)
+    if not image_paths:
+        print("No LQ images found. Exit.")
+        return
+
+    # Output goes directly into the user-specified -o folder (no tag sub-dir).
+    out_dir = args.output_dir
+
+    if (
+        not getattr(args, 'force_rerun', False)
+        and not os.environ.get('INFER_NO_SKIP', '').lower() in ('1', 'true', 'yes')
+        and all_expected_outputs_exist(image_paths, [out_dir])
+    ):
+        print(f"Skip: all {len(image_paths)} outputs already exist. Use --force_rerun to override.")
+        return
+
+    seed = args.seed
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    accelerator = _inference_accelerator_stub()
+    print(f"Loading model from {args.checkpoint}...")
+
+    # 1. Load VAE
+    ae_path = getattr(args, 'ae_path', QWEN_AE_PATH if args.ae_type == 'qwen' else SD2_AE_PATH)
+    if args.ae_type == "qwen":
+        from models.qwenimage_vae2d import AutoencoderKLQwenImage2D
+        vae = AutoencoderKLQwenImage2D.from_pretrained(ae_path)
+    elif args.ae_type == "sd2":
+        from diffusers import AutoencoderKL
+        vae = AutoencoderKL.from_pretrained(ae_path, subfolder="vae")
+    vae.to(device).eval()
+
+    # 2. Load LightDecoder (sd2 only)
+    light_decoder = None
+    if args.ae_type == 'sd2':
+        print(f"Loading LightDecoder from {SD2_LWDECODER_PATH}...")
+        ckpt = torch.load(SD2_LWDECODER_PATH, map_location="cpu")
+        dec_config = ckpt["config"]
+        light_decoder = LightDecoder(
+            in_channels=dec_config["in_channels"],
+            out_channels=dec_config["out_channels"],
+            block_out_channels=tuple(dec_config["block_out_channels"]),
+            layers_per_block=dec_config["layers_per_block"],
+        )
+        light_decoder.load_state_dict(ckpt["model_state_dict"])
+        light_decoder.to(device).eval()
+
+    # 3. Load Vision Encoder (dinov2)
+    venc = load_dinov2(args, device)
+
+    # 4. Load DiT Model
+    base_channel = 4 if args.ae_type == 'sd2' else 16
+    model = LightningDiT(
+        input_size=args.resolution // 8,
+        patch_size=args.patch_size,
+        in_channels=2 * base_channel,
+        out_channels=base_channel,
+        hidden_size=args.dim,
+        depth=args.depth,
+        num_heads=args.num_heads,
+        mlp_ratio=args.mlp_ratio,
+        z_dims=args.enc_dim,
+        encdim_ratio=args.encdim_ratio,
+        auxiliary_time_cond=False,
+        use_qknorm=args.use_qknorm,
+        use_swiglu=args.use_swiglu,
+        use_rope=args.use_rope,
+        use_rmsnorm=args.use_rmsnorm,
+        wo_shift=args.wo_shift,
+        num_fused_layers=len(args.layer_dinov2b_list),
+    )
+
+    search_dirs = [
+        os.path.join(args.checkpoint, "clean_weights"),
+        os.path.join(args.checkpoint, "checkpoints"),
+        args.checkpoint,
+    ]
+    weight_path = None
+    for d in search_dirs:
+        for name in ("ema_model.safetensors", "model.safetensors"):
+            candidate = os.path.join(d, name)
+            if os.path.isfile(candidate):
+                weight_path = candidate
+                break
+        if weight_path:
+            break
+    if weight_path is None:
+        hits = glob.glob(os.path.join(args.checkpoint, "**/*.safetensors"), recursive=True)
+        if not hits:
+            raise FileNotFoundError(f"No .safetensors found under {args.checkpoint}")
+        weight_path = hits[0]
+
+    print(f"Loading weights from {weight_path}")
+    state_dict = load_file(weight_path) if weight_path.endswith(".safetensors") else torch.load(weight_path, map_location="cpu")
+    model.load_state_dict(state_dict, strict=False)
+
+    if args.lora_adapter:
+        lora = load_lora_config(args.lora_adapter)
+        injected = inject_vosr_lora(
+            model,
+            selected_blocks=lora["selected_blocks"],
+            rank=lora["rank"],
+            alpha=lora["alpha"],
+        )
+        report = validate_lora_model(
+            model,
+            expected_blocks=len(lora["selected_blocks"]),
+            rank=lora["rank"],
+        )
+        loaded_tensors = load_vosr_lora_adapter(
+            model, lora["adapter_path"]
+        )
+        print(
+            "Loaded VOSR LoRA adapter: "
+            f"blocks={len(lora['selected_blocks'])} "
+            f"modules={len(injected)} "
+            f"tensors={loaded_tensors} "
+            f"params={report['trainable_lora_params']} "
+            f"rank={lora['rank']} alpha={lora['alpha']}"
+        )
+
+    model.to(device).eval()
+    model.forward = model.forward_flexible
+
+    # 5. Initialize VOSR
+    vosr_model = VOSR(
+        time_dist=args.time_dist,
+        cfg_ratio=args.cfg_ratio,
+        cfg_scale=args.cfg_scale,
+        interp_type=args.interp_type,
+        accelerator=accelerator,
+        t_start=getattr(args, 't_start', 0.0),
+        t_end=getattr(args, 't_end', 1.0),
+        args=args,
+    )
+
+    # Model construction and LoRA injection consume random numbers. Reset here
+    # so Base and adapter runs with the same seed use identical sampling noise.
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
+    if args.precision == 'bf16' and device == 'cuda':
+        def precision_context():
+            return torch.autocast(
+                device_type='cuda', dtype=torch.bfloat16
+            )
+    else:
+        precision_context = nullcontext
+    print(f"Inference precision: {args.precision}")
+
+    # 6. Inference Loop
+    os.makedirs(out_dir, exist_ok=True)
+    args.output_dir = out_dir
+    to_tensor = transforms.ToTensor()
+    print(f"Processing {len(image_paths)} images...")
+    image_times = []
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    for idx, img_path in enumerate(tqdm(image_paths, file=sys.stderr)):
+        img_name = os.path.basename(img_path)
+        raw_img = Image.open(img_path).convert("RGB")
+        w, h = raw_img.size
+        target_w, target_h = w * args.upscale, h * args.upscale
+        if idx == 0:
+            print(f"Output size: {target_w}x{target_h}, input size: {w}x{h}")
+
+        input_img = raw_img.resize((target_w, target_h), Image.BICUBIC)
+        lq = to_tensor(input_img).unsqueeze(0).to(device) * 2.0 - 1.0
+
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            image_started = time.perf_counter()
+            with precision_context():
+                if args.tile_size > 0:
+                    sr_tensor = tiled_latent_inference(
+                        model, vosr_model, vae, venc, lq, args,
+                        device=device, light_decoder=light_decoder,
+                    )
+                else:
+                    with torch.no_grad():
+                        lq_latent, latents_mean, latents_std = encode_dispatch(vae, lq, args, device)
+                        z_fea = get_venc_features(venc, lq, args)
+                        sr_latent = vosr_model.sample_multistep_fm(
+                            model, lq_latent, n_steps=args.infer_steps, venc_fea=z_fea
+                        )
+                        sr_tensor = decode_dispatch(vae, sr_latent, args, latents_mean, latents_std, light_decoder)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            image_times.append(time.perf_counter() - image_started)
+
+            sr_img = transforms.ToPILImage()(sr_tensor[0].cpu() * 0.5 + 0.5)
+            if args.align_method == 'adain':
+                sr_img = adain_color_fix(sr_img, input_img)
+            elif args.align_method == 'wavelet':
+                sr_img = wavelet_color_fix(sr_img, input_img)
+            sr_img.save(os.path.join(out_dir, os.path.splitext(img_name)[0] + '.png'))
+
+        except Exception as e:
+            print(f"Error processing {img_name}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    method_name = args.method_name or (
+        'All-LoRA' if args.lora_adapter else 'Base-VOSR'
+    )
+    summary = {
+        'method': method_name,
+        'num_input_images': len(image_paths),
+        'num_completed_images': len(image_times),
+        'precision': args.precision,
+        'seed': int(seed),
+        'infer_steps': int(args.infer_steps),
+        'cfg_scale': float(args.cfg_scale),
+        'align_method': args.align_method,
+        'lora_adapter': (
+            os.path.abspath(args.lora_adapter)
+            if args.lora_adapter else None
+        ),
+        'mean_inference_time_s': (
+            sum(image_times) / len(image_times)
+            if image_times else None
+        ),
+        'peak_cuda_mem_mb': (
+            torch.cuda.max_memory_allocated() / 2**20
+            if torch.cuda.is_available() else 0.0
+        ),
+    }
+    with open(
+        os.path.join(out_dir, 'inference_summary.json'),
+        'w', encoding='utf-8',
+    ) as handle:
+        json.dump(summary, handle, indent=2)
+    print(json.dumps(summary, indent=2))
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    print("Done!")
+
+
+if __name__ == "__main__":
+    main()

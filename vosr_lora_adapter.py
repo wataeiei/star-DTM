@@ -249,7 +249,41 @@ def save_vosr_lora_adapter(
 
 
 def load_vosr_lora_adapter(model, adapter_path):
-    state = load_file(str(adapter_path))
+    adapter_path = Path(adapter_path)
+    if adapter_path.is_dir():
+        adapter_path = adapter_path / "adapter_model.safetensors"
+    if not adapter_path.is_file():
+        raise FileNotFoundError(f"LoRA adapter not found: {adapter_path}")
+
+    state = load_file(str(adapter_path), device="cpu")
+    expected = get_lora_state_dict(model)
+    missing = sorted(set(expected) - set(state))
+    unexpected = sorted(set(state) - set(expected))
+    if missing or unexpected:
+        raise RuntimeError(
+            "Adapter keys do not match the injected LoRA structure: "
+            f"missing={missing[:10]} unexpected={unexpected[:10]}"
+        )
+
+    shape_mismatches = [
+        (name, tuple(state[name].shape), tuple(expected[name].shape))
+        for name in state
+        if state[name].shape != expected[name].shape
+    ]
+    if shape_mismatches:
+        raise RuntimeError(
+            f"Adapter shape mismatches: {shape_mismatches[:10]}"
+        )
+
+    nonfinite = sum(
+        int((~torch.isfinite(tensor)).sum().item())
+        for tensor in state.values()
+    )
+    if nonfinite:
+        raise RuntimeError(
+            f"Adapter contains {nonfinite} non-finite values"
+        )
+
     result = model.load_state_dict(state, strict=False)
     if result.unexpected_keys:
         raise RuntimeError(
