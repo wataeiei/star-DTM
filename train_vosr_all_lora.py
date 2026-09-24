@@ -377,6 +377,28 @@ def main(
     if force_threshold_bypass_training:
         config["threshold_bypass_training"] = True
     args = Namespace(**config)
+    for field in (
+        "learning_rate",
+        "adam_beta1",
+        "adam_beta2",
+        "adam_weight_decay",
+        "adam_epsilon",
+        "max_grad_norm",
+        "ema_decay",
+    ):
+        if hasattr(args, field):
+            setattr(args, field, float(getattr(args, field)))
+    for field in (
+        "train_batch_size",
+        "gradient_accumulation_steps",
+        "max_train_steps",
+        "checkpointing_steps",
+        "lr_warmup_steps",
+        "lr_num_cycles",
+        "dataloader_num_workers",
+    ):
+        if hasattr(args, field):
+            setattr(args, field, int(getattr(args, field)))
     args.report_to = normalize_report_to(getattr(args, "report_to", None))
     probe_config = configure_importance_probe(args)
     importance_probe_only = probe_config is not None
