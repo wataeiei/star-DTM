@@ -329,7 +329,15 @@ def profile_loss(
         + args.latent_mse_weight * latent_mse
         + args.lpips_weight * lpips_loss.float()
     )
-    return total, tsd_loss, latent_mse, lpips_loss, teacher_index, float(teacher_timestep[0].item())
+    return (
+        total,
+        tsd_loss,
+        latent_mse,
+        lpips_loss,
+        teacher_index,
+        float(teacher_timestep[0].item()),
+        float(scheduler.sigmas[teacher_index].item()),
+    )
 
 
 def collect_block_scores(student) -> list[dict]:
@@ -417,6 +425,7 @@ def main() -> None:
         sums = {"loss": 0.0, "tsd": 0.0, "mse": 0.0, "lpips": 0.0}
         teacher_index = None
         timestep = None
+        teacher_sigma = None
         valid = 0
         for batch_index, batch in enumerate(batches):
             set_seed(args.seed + batch_index)
@@ -425,7 +434,7 @@ def main() -> None:
                     student, teacher, vae, lpips, scheduler, batch, ratio, args,
                     device, dtype, default_prompt, default_pooled, null_prompt, null_pooled,
                 )
-            loss, tsd, mse, perceptual, teacher_index, timestep = values
+            loss, tsd, mse, perceptual, teacher_index, timestep, teacher_sigma = values
             if not torch.isfinite(loss):
                 raise SystemExit(f"Non-finite probe loss at noise ratio {ratio}")
             loss.backward()
@@ -448,6 +457,7 @@ def main() -> None:
                 "noise_ratio": ratio,
                 "teacher_schedule_index": teacher_index,
                 "timestep": timestep,
+                "teacher_sigma": teacher_sigma,
                 "importance_rank": rank_by_block[row["block"]],
                 "score_share": row["normalized_grad_score"] / max(total_score, 1e-30),
                 "probe_batches": valid,
@@ -499,6 +509,10 @@ def main() -> None:
         "boundary_lora_module_count": boundary_modules,
         "boundary_lora_param_count": boundary_params,
         "noise_anchors": args.noise_ratios,
+        "noise_condition_definition": (
+            "Normalized teacher scheduler position: 0.05 is early/high-noise and "
+            "0.95 is late/low-noise. teacher_sigma records the actual noise scale."
+        ),
         "probe_batches_per_anchor": len(batches),
         "seed": args.seed,
     }
