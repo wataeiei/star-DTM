@@ -442,6 +442,16 @@ def _decode_residual(encoded: Any, refs: list[torch.Tensor]) -> Any:
     raise RuntimeError(f"Unknown residual encoding: {kind}")
 
 
+class _IdentityGradientReconnect(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, output: torch.Tensor, reference: torch.Tensor):
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return None, grad_output
+
+
 def _reconnect_residual(
     output: Any,
     refs: list[torch.Tensor],
@@ -461,9 +471,10 @@ def _reconnect_residual(
         index = matches[0]
         used_refs.add(index)
         ref = refs[index]
-        # ref - ref.detach() is exactly zero in the forward pass but contributes
-        # an identity derivative. This avoids quantizing and storing a residual.
-        rebuilt = output.detach() + (ref - ref.detach())
+        # Preserve the exact block output while routing its incoming gradient
+        # directly to the residual input. The custom autograd edge avoids the
+        # large elementwise add/subtract kernels used by the algebraic form.
+        rebuilt = _IdentityGradientReconnect.apply(output.detach(), ref)
         max_abs_diff = 0.0
         if verify_forward_equivalence:
             max_abs_diff = float(
