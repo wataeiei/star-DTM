@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import random
 import re
 import time
@@ -19,6 +20,7 @@ from peft.utils import get_peft_model_state_dict
 from torch.utils.data import DataLoader
 
 import profile_tsdsr_grad as core
+import adaptive_grad_blockskip as adaptive
 
 
 BLOCK_PATTERN = re.compile(r"transformer_blocks\.\d+")
@@ -36,6 +38,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--method", default="TSD-SR-All-LoRA-AID-1000")
     parser.add_argument("--selection", choices=["all", "metadata"], default="all")
     parser.add_argument("--selection_file", default="")
+    parser.add_argument(
+        "--bypass_policy_csv",
+        default="",
+        help=(
+            "Noise-conditioned Threshold bypass policy. Requires metadata "
+            "LoRA selection and uses exact-forward single-pass backward bypass."
+        ),
+    )
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--sr_scale", type=int, default=4)
     parser.add_argument("--rank", type=int, default=8)
@@ -82,6 +92,53 @@ def read_selected_blocks(path: str) -> set[str]:
     if not isinstance(blocks, list) or not blocks:
         raise SystemExit("Selection metadata contains no selected LoRA blocks")
     return {str(block) for block in blocks}
+
+
+def read_bypass_policy(path: str) -> dict[float, list[str]]:
+    with Path(path).open(newline="", encoding="utf-8-sig") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows:
+        raise SystemExit(f"Bypass policy is empty: {path}")
+    required = {"noise_ratio", "skip_blocks"}
+    missing = required - set(rows[0])
+    if missing:
+        raise SystemExit(
+            "Bypass policy is missing columns: " + ", ".join(sorted(missing))
+        )
+    policy = {}
+    for row in rows:
+        ratio = float(row["noise_ratio"])
+        blocks = [
+            block.strip()
+            for block in str(row["skip_blocks"]).split(";")
+            if block.strip()
+        ]
+        if ratio in policy:
+            raise SystemExit(f"Duplicate bypass policy noise ratio: {ratio:g}")
+        expected = row.get("bypass_budget", "")
+        if expected != "" and int(float(expected)) != len(blocks):
+            raise SystemExit(
+                f"Policy count mismatch at noise={ratio:g}: "
+                f"budget={expected}, blocks={len(blocks)}"
+            )
+        policy[ratio] = blocks
+    return policy
+
+
+def policy_blocks_for_ratio(
+    policy: dict[float, list[str]], ratio: float
+) -> list[str]:
+    matches = [
+        blocks
+        for anchor, blocks in policy.items()
+        if math.isclose(anchor, ratio, abs_tol=1e-8)
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Expected one Threshold bypass policy at noise={ratio:g}, "
+            f"found {len(matches)}"
+        )
+    return list(matches[0])
 
 
 def module_has_adapter(module: torch.nn.Module, adapter_name: str) -> bool:
@@ -300,9 +357,36 @@ def regularizer_loss(teacher, scheduler, context, device) -> torch.Tensor:
     ).mean()
 
 
-def save_adapter(student, directory: Path) -> tuple[str, float]:
+def save_adapter(
+    student,
+    directory: Path,
+    controller: adaptive.ResidualBlockController | None = None,
+    selected_blocks: set[str] | None = None,
+) -> tuple[str, float]:
     directory.mkdir(parents=True, exist_ok=True)
-    state = get_peft_model_state_dict(student, adapter_name="aid")
+    if controller is None:
+        state = get_peft_model_state_dict(student, adapter_name="aid")
+    else:
+        # Wrappers add a synthetic `.block` segment to parameter names. Restore
+        # the original module tree while exporting a standard PEFT checkpoint.
+        for name, wrapper in controller.wrappers.items():
+            adaptive.set_module(student, name, wrapper.block)
+        try:
+            state = get_peft_model_state_dict(student, adapter_name="aid")
+        finally:
+            for name, wrapper in controller.wrappers.items():
+                adaptive.set_module(student, name, wrapper)
+    if selected_blocks is not None:
+        state = {
+            key: value
+            for key, value in state.items()
+            if (
+                (match := BLOCK_PATTERN.search(key)) is None
+                or match.group(0) in selected_blocks
+            )
+        }
+        if not state:
+            raise RuntimeError("Sparse Adapter export produced an empty state dict")
     StableDiffusion3Pipeline.save_lora_weights(
         str(directory),
         transformer_lora_layers=state,
@@ -318,6 +402,11 @@ def main() -> None:
         raise SystemExit("--train_steps and --batch_size must be positive")
     if args.selection == "metadata" and not args.selection_file:
         raise SystemExit("--selection metadata requires --selection_file")
+    if args.bypass_policy_csv and args.selection != "metadata":
+        raise SystemExit(
+            "Threshold bypass requires --selection metadata and a fixed sparse "
+            "LoRA placement"
+        )
     output_dir = Path(args.output_dir)
     if output_dir.exists() and any(output_dir.iterdir()):
         raise SystemExit(f"Output directory is not empty: {output_dir}")
@@ -344,6 +433,43 @@ def main() -> None:
     trainable_params, active_modules, boundary_modules, active_blocks = (
         configure_domain_adapter(student, args.selection, selected_blocks)
     )
+    bypass_policy = (
+        read_bypass_policy(args.bypass_policy_csv)
+        if args.bypass_policy_csv else {}
+    )
+    all_blocks = [f"transformer_blocks.{index}" for index in range(24)]
+    controller = None
+    if bypass_policy:
+        policy_anchors = set(bypass_policy)
+        missing_anchors = [
+            ratio for ratio in args.train_noise_ratios
+            if not any(
+                math.isclose(ratio, anchor, abs_tol=1e-8)
+                for anchor in policy_anchors
+            )
+        ]
+        if missing_anchors:
+            raise SystemExit(
+                "Bypass policy is missing training noise anchors: "
+                + ", ".join(f"{ratio:g}" for ratio in missing_anchors)
+            )
+        policy_union = {
+            block for blocks in bypass_policy.values() for block in blocks
+        }
+        unknown = sorted(policy_union - set(all_blocks))
+        overlap = sorted(policy_union & selected_blocks)
+        if unknown:
+            raise SystemExit("Unknown bypass blocks: " + ", ".join(unknown))
+        if overlap:
+            raise SystemExit(
+                "LoRA-selected blocks cannot be bypassed: " + ", ".join(overlap)
+            )
+        controller = adaptive.ResidualBlockController(
+            student,
+            {block: block for block in all_blocks},
+            cache_device="cpu",
+            cache_dtype=torch.float16,
+        )
     reg_parameters = set_reg_trainable(teacher)
     student_parameters = [
         parameter for parameter in student.parameters() if parameter.requires_grad
@@ -393,6 +519,7 @@ def main() -> None:
 
     rows = []
     train_elapsed = 0.0
+    max_train_peak_mb = 0.0
     experiment_started = time.perf_counter()
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -404,8 +531,20 @@ def main() -> None:
             iterator = iter(loader)
             batch = next(iterator)
         ratio = random.choice(args.train_noise_ratios)
+        skip_blocks = []
+        cache_stats = adaptive.CacheStats(0.0, 0.0, 0, 0)
+        policy_error = ""
+        if controller is not None:
+            try:
+                skip_blocks = policy_blocks_for_ratio(bypass_policy, ratio)
+                controller.configure(skip_blocks)
+                controller.set_mode("single_skip")
+            except Exception as error:
+                policy_error = str(error)
+                raise
         if device.type == "cuda":
             torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
         started = time.perf_counter()
 
         optimizer.zero_grad(set_to_none=True)
@@ -438,6 +577,9 @@ def main() -> None:
             student_parameters, args.grad_clip
         )
         optimizer.step()
+        if controller is not None:
+            cache_stats = controller.stats(0.0)
+            controller.set_mode("full")
 
         set_reg_trainable(teacher)
         with torch.autocast(
@@ -458,6 +600,11 @@ def main() -> None:
             torch.cuda.synchronize(device)
         elapsed = time.perf_counter() - started
         train_elapsed += elapsed
+        train_peak_mb = (
+            torch.cuda.max_memory_allocated(device) / (1024.0**2)
+            if device.type == "cuda" else 0.0
+        )
+        max_train_peak_mb = max(max_train_peak_mb, train_peak_mb)
         row = {
             "step": step,
             "noise_ratio": ratio,
@@ -469,7 +616,18 @@ def main() -> None:
             "regularizer_loss": float(reg_loss.detach().cpu()),
             "student_grad_norm": float(student_grad_norm.detach().cpu()),
             "regularizer_grad_norm": float(reg_grad_norm.detach().cpu()),
+            "requested_skip_count": len(skip_blocks),
+            "skipped_blocks": ";".join(skip_blocks),
+            "skipped_block_count": len(skip_blocks),
+            "replayable_blocks": cache_stats.replayable_blocks,
+            "fallback_blocks": cache_stats.fallback_blocks,
+            "fallback_block_names": cache_stats.fallback_names,
+            "residual_forward_max_abs_diff": cache_stats.max_reconstruction_abs_diff,
+            "bypass_run_count": cache_stats.bypass_run_count,
+            "bypass_run_blocks": cache_stats.bypass_run_blocks,
+            "policy_error": policy_error,
             "train_step_time_s": elapsed,
+            "train_peak_cuda_mem_mb": train_peak_mb,
         }
         rows.append(row)
         if step == 1 or step % args.log_every == 0:
@@ -479,15 +637,21 @@ def main() -> None:
                 f"time={elapsed:.3f}s"
             )
         if args.checkpoint_every > 0 and step % args.checkpoint_every == 0:
-            save_adapter(student, output_dir / f"checkpoint-{step:05d}")
+            save_adapter(
+                student,
+                output_dir / f"checkpoint-{step:05d}",
+                controller,
+                selected_blocks if args.selection == "metadata" else None,
+            )
 
-    adapter_path, adapter_size_mb = save_adapter(student, output_dir)
-    experiment_elapsed = time.perf_counter() - experiment_started
-    peak_mb = (
-        torch.cuda.max_memory_allocated(device) / (1024.0**2)
-        if device.type == "cuda"
-        else 0.0
+    adapter_path, adapter_size_mb = save_adapter(
+        student,
+        output_dir,
+        controller,
+        selected_blocks if args.selection == "metadata" else None,
     )
+    experiment_elapsed = time.perf_counter() - experiment_started
+    peak_mb = max_train_peak_mb
     write_csv(output_dir / "train_log.csv", rows)
     summary = [{
         "method": args.method,
@@ -504,6 +668,11 @@ def main() -> None:
         "peak_cuda_mem_mb": peak_mb,
         "final_loss": rows[-1]["loss"],
         "mean_last100_loss": sum(row["loss"] for row in rows[-100:]) / min(100, len(rows)),
+        "mean_skipped_blocks": sum(row["skipped_block_count"] for row in rows) / len(rows),
+        "fallback_block_events": sum(row["fallback_blocks"] for row in rows),
+        "max_residual_forward_abs_diff": max(
+            row["residual_forward_max_abs_diff"] for row in rows
+        ),
         "adapter_size_mb": adapter_size_mb,
         "adapter_path": adapter_path,
     }]
@@ -518,6 +687,15 @@ def main() -> None:
         "boundary_lora_modules": boundary_modules,
         "trainable_domain_lora_params": trainable_params,
         "regularizer_trainable_params": sum(parameter.numel() for parameter in reg_parameters),
+        "algorithm": "Threshold bypass" if controller is not None else "All-LoRA",
+        "bypass_policy_csv": args.bypass_policy_csv,
+        "bypass_policy": {
+            f"{ratio:g}": blocks for ratio, blocks in sorted(bypass_policy.items())
+        },
+        "bypass_policy_union": sorted(
+            {block for blocks in bypass_policy.values() for block in blocks}
+        ),
+        "bypass_execution": "single_pass_backward_only" if controller is not None else "none",
         "adapter_path": adapter_path,
     }
     (output_dir / "metadata.json").write_text(

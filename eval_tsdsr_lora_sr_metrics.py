@@ -247,13 +247,40 @@ def add_adapter(model, name: str, rank: int, alpha: float, targets: list[str], i
     )
 
 
-def load_adapter(model, path: Path, filename: str, adapter_name: str) -> None:
+def load_adapter(
+    model,
+    path: Path,
+    filename: str,
+    adapter_name: str,
+    allow_sparse: bool = False,
+) -> None:
     directory = path if path.is_dir() else path.parent
     weight_name = filename if path.is_dir() else path.name
     state = StableDiffusion3Pipeline.lora_state_dict(
         str(directory), weight_name=weight_name
     )
-    load_lora_state_dict(state, model, adapter_name=adapter_name)
+    if not allow_sparse:
+        load_lora_state_dict(state, model, adapter_name=adapter_name)
+        return
+
+    loaded = 0
+    for name, parameter in model.named_parameters():
+        if adapter_name not in name:
+            continue
+        key = "transformer." + name.replace(f".{adapter_name}", "")
+        value = state.pop(key, None)
+        if value is None:
+            continue
+        parameter.data.copy_(value)
+        loaded += 1
+    if not loaded:
+        raise RuntimeError(f"Sparse adapter {path} did not match any model parameters")
+    if state:
+        raise RuntimeError(
+            f"Sparse adapter {path} contains {len(state)} unknown keys; "
+            f"examples: {list(state)[:5]}"
+        )
+    print(f"Loaded sparse domain adapter tensors: {loaded}")
 
 
 def load_models(args, adapters: list[tuple[str, Path]], dtype, device):
@@ -281,7 +308,13 @@ def load_models(args, adapters: list[tuple[str, Path]], dtype, device):
             TRANSFORMER_TARGETS,
             True,
         )
-        load_adapter(transformer, checkpoint, checkpoint.name, internal_name)
+        load_adapter(
+            transformer,
+            checkpoint,
+            checkpoint.name,
+            internal_name,
+            allow_sparse=True,
+        )
         internal_names[label] = internal_name
 
     vae = AutoencoderKL.from_pretrained(
