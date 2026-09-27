@@ -195,6 +195,7 @@ def load_importance(
 def load_costs(
     path: Path,
     blocks: list[str],
+    required_blocks: set[str],
     explicit_unsafe: set[str],
     tolerance: float,
 ) -> tuple[dict[str, float], set[str], list[dict]]:
@@ -202,11 +203,12 @@ def load_costs(
     if not rows:
         raise SystemExit(f"Cost CSV is empty: {path}")
     by_block = {str(row["block"]): row for row in rows}
-    missing = sorted(set(blocks) - set(by_block), key=block_index)
+    missing = sorted(required_blocks - set(by_block), key=block_index)
     if missing:
         raise SystemExit(
-            "Cost profile does not cover every candidate block. Re-run "
-            "profile_tsdsr_bypass_costs.py with --selected_k 0. Missing: "
+            "Cost profile does not cover every block that can be bypassed by "
+            "the requested K candidates. Profile the frozen complement of the "
+            "smallest K. Missing: "
             + ", ".join(missing)
         )
     unknown_unsafe = sorted(explicit_unsafe - set(blocks))
@@ -217,6 +219,19 @@ def load_costs(
     unsafe = set(explicit_unsafe)
     audit = []
     for block in blocks:
+        if block not in by_block:
+            audit.append({
+                "block": block,
+                "block_index": block_index(block),
+                "cost_profile_required": False,
+                "safe_for_bypass": False,
+                "unsafe_reasons": "selected_for_all_requested_k",
+                "reported_gflops_saved": "",
+                "max_loss_abs_diff": "",
+                "max_forward_abs_diff": "",
+                "fallback_events": "",
+            })
+            continue
         row = by_block[block]
         fallback = int(float(row.get("fallback_events", 0) or 0))
         loss_diff = float(row.get("max_loss_abs_diff", 0) or 0)
@@ -239,6 +254,7 @@ def load_costs(
         audit.append({
             "block": block,
             "block_index": block_index(block),
+            "cost_profile_required": block in required_blocks,
             "safe_for_bypass": not reasons,
             "unsafe_reasons": ";".join(reasons),
             "reported_gflops_saved": saved,
@@ -301,14 +317,16 @@ def main() -> None:
         for block in blocks
     }
     ranked = sorted(blocks, key=lambda block: (-aggregate[block], block_index(block)))
+    k_values = derive_k_values(args, len(blocks))
+    required_cost_blocks = set(ranked[min(k_values):])
     costs, unsafe, safety_audit = load_costs(
         Path(args.cost_csv),
         blocks,
+        required_cost_blocks,
         set(args.unsafe_block),
         args.correctness_tolerance,
     )
     write_csv(output_dir / "block_safety_audit.csv", safety_audit)
-    k_values = derive_k_values(args, len(blocks))
 
     ranking_rows = []
     cumulative = 0.0
@@ -320,8 +338,8 @@ def main() -> None:
             "block_index": block_index(block),
             "aggregate_utility": aggregate[block],
             "cumulative_utility": cumulative,
-            "reported_gflops_saved": costs[block],
-            "safe_for_bypass": block not in unsafe,
+            "reported_gflops_saved": costs.get(block, ""),
+            "safe_for_bypass": block in required_cost_blocks and block not in unsafe,
         })
     write_csv(output_dir / "lora_importance_ranking.csv", ranking_rows)
 
@@ -483,7 +501,8 @@ def main() -> None:
         "k_candidates": k_values,
         "threshold_metric": args.threshold_metric,
         "noise_weights": {f"{ratio:g}": weights[ratio] for ratio in anchors},
-        "safe_bypass_blocks": sorted(set(blocks) - unsafe, key=block_index),
+        "cost_profile_required_blocks": sorted(required_cost_blocks, key=block_index),
+        "safe_bypass_blocks": sorted(required_cost_blocks - unsafe, key=block_index),
         "unsafe_bypass_blocks": sorted(unsafe, key=block_index),
         "policy_rule": "independent safe frozen blocks with metric <= one global tau",
         "constraints_removed": [
