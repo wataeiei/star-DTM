@@ -447,6 +447,7 @@ def _reconnect_residual(
     refs: list[torch.Tensor],
     used_refs: set[int],
     residual_dtype: torch.dtype,
+    verify_forward_equivalence: bool = True,
 ) -> tuple[Any, int, float]:
     """Return the exact no-grad value with an identity straight-through Jacobian."""
     if torch.is_tensor(output):
@@ -463,13 +464,24 @@ def _reconnect_residual(
         # ref - ref.detach() is exactly zero in the forward pass but contributes
         # an identity derivative. This avoids quantizing and storing a residual.
         rebuilt = output.detach() + (ref - ref.detach())
-        max_abs_diff = float(
-            (rebuilt.detach().float() - output.detach().float()).abs().max().cpu()
-        )
+        max_abs_diff = 0.0
+        if verify_forward_equivalence:
+            max_abs_diff = float(
+                (rebuilt.detach().float() - output.detach().float())
+                .abs()
+                .max()
+                .cpu()
+            )
         return rebuilt, 0, max_abs_diff
     if isinstance(output, tuple):
         values = [
-            _reconnect_residual(item, refs, used_refs, residual_dtype)
+            _reconnect_residual(
+                item,
+                refs,
+                used_refs,
+                residual_dtype,
+                verify_forward_equivalence,
+            )
             for item in output
         ]
         return (
@@ -479,7 +491,13 @@ def _reconnect_residual(
         )
     if isinstance(output, list):
         values = [
-            _reconnect_residual(item, refs, used_refs, residual_dtype)
+            _reconnect_residual(
+                item,
+                refs,
+                used_refs,
+                residual_dtype,
+                verify_forward_equivalence,
+            )
             for item in output
         ]
         return (
@@ -520,6 +538,7 @@ class ResidualBlockWrapper(nn.Module):
                     refs,
                     set(),
                     self.controller.cache_dtype,
+                    self.controller.verify_forward_equivalence,
                 )
                 self.cached_bytes = residual_bytes
                 self.replayable = True
@@ -590,11 +609,13 @@ class ResidualBlockController:
         block_paths: dict[str, str],
         cache_device: str = "cpu",
         cache_dtype: torch.dtype = torch.float16,
+        verify_forward_equivalence: bool = True,
     ) -> None:
         self.mode = "full"
         self.skip_blocks: set[str] = set()
         self.cache_device = cache_device
         self.cache_dtype = cache_dtype
+        self.verify_forward_equivalence = verify_forward_equivalence
         self.fallbacks: dict[str, str] = {}
         self.wrappers: dict[str, ResidualBlockWrapper] = {}
         self.block_order = list(block_paths)
@@ -700,6 +721,7 @@ class ResidualBlockController:
                 refs,
                 set(),
                 self.cache_dtype,
+                self.verify_forward_equivalence,
             )
         except ValueError as exc:
             blocks = ", ".join(self.run_blocks[run_index])

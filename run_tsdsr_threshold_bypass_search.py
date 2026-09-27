@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import random
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -23,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--null_embedding_dir", required=True)
     parser.add_argument("--data_dir", required=True)
     parser.add_argument("--train_steps", type=int, default=20)
+    parser.add_argument("--timing_warmup_steps", type=int, default=0)
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--sr_scale", type=int, default=4)
     parser.add_argument("--rank", type=int, default=8)
@@ -44,6 +47,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include_zero_bypass", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
+    parser.add_argument("--shuffle_run_order", action="store_true")
+    parser.add_argument("--run_order_seed", type=int, default=0)
+    parser.add_argument("--cooldown_seconds", type=float, default=0.0)
     return parser.parse_args()
 
 
@@ -80,6 +86,7 @@ def common_command(args: argparse.Namespace, run_dir: Path, method: str) -> list
         "--alpha", str(args.alpha),
         "--reg_rank", str(args.reg_rank),
         "--train_steps", str(args.train_steps),
+        "--timing_warmup_steps", str(args.timing_warmup_steps),
         "--batch_size", str(args.batch_size),
         "--num_workers", str(args.num_workers),
         "--lr", str(args.lr),
@@ -106,6 +113,13 @@ def main() -> None:
     args = parse_args()
     if args.train_steps <= 0:
         raise SystemExit("--train_steps must be positive")
+    if not 0 <= args.timing_warmup_steps < args.train_steps:
+        raise SystemExit(
+            "--timing_warmup_steps must be non-negative and smaller than "
+            "--train_steps"
+        )
+    if args.cooldown_seconds < 0:
+        raise SystemExit("--cooldown_seconds must be non-negative")
     manifest_path = Path(args.candidate_manifest)
     candidates = read_csv(manifest_path)
     if not candidates:
@@ -173,6 +187,9 @@ def main() -> None:
                 ],
             })
 
+    if args.shuffle_run_order:
+        random.Random(args.run_order_seed).shuffle(plan)
+
     plan_rows = [
         {**{key: value for key, value in item.items() if key != "command"},
          "command": json.dumps(item["command"])}
@@ -185,6 +202,9 @@ def main() -> None:
 
     results = []
     for index, item in enumerate(plan, 1):
+        if index > 1 and args.cooldown_seconds > 0:
+            print(f"Cooling down for {args.cooldown_seconds:g} seconds")
+            time.sleep(args.cooldown_seconds)
         run_dir = Path(item["run_dir"])
         summary_path = run_dir / "summary.csv"
         if args.resume and summary_path.exists():

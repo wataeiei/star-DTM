@@ -45,6 +45,13 @@ def value(row: dict[str, str], key: str) -> float:
     return result
 
 
+def timing_value(row: dict[str, str]) -> tuple[float, str]:
+    key = "steady_train_step_time_s"
+    if row.get(key, "") == "":
+        key = "mean_train_step_time_s"
+    return value(row, key), key
+
+
 def main() -> None:
     args = parse_args()
     if args.top_per_k <= 0:
@@ -65,9 +72,16 @@ def main() -> None:
         k = int(row["selected_k"])
         if k not in controls or set(controls[k]) != {"native", "controller_b0"}:
             raise SystemExit(f"Missing Native-K or Controller-B0 control for K={k}")
-        candidate_time = value(row, "mean_train_step_time_s")
-        native_time = value(controls[k]["native"], "mean_train_step_time_s")
-        controller_time = value(controls[k]["controller_b0"], "mean_train_step_time_s")
+        candidate_time, candidate_time_key = timing_value(row)
+        native_time, native_time_key = timing_value(controls[k]["native"])
+        controller_time, controller_time_key = timing_value(
+            controls[k]["controller_b0"]
+        )
+        if len({candidate_time_key, native_time_key, controller_time_key}) != 1:
+            raise SystemExit(
+                f"Mixed timing protocols for K={k}: "
+                f"{candidate_time_key}, {native_time_key}, {controller_time_key}"
+            )
         speed_native = (native_time - candidate_time) / native_time * 100.0
         speed_controller = (controller_time - candidate_time) / controller_time * 100.0
         fallback = value(row, "fallback_block_events")
@@ -83,6 +97,7 @@ def main() -> None:
             "candidate_id": row["candidate_id"],
             "selected_k": k,
             "global_threshold": row["global_threshold"],
+            "timing_metric": candidate_time_key,
             "mean_skipped_blocks": row["mean_skipped_blocks"],
             "candidate_step_time_s": candidate_time,
             "native_step_time_s": native_time,

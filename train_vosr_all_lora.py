@@ -620,6 +620,7 @@ def main(
             block_paths,
             cache_device="cpu",
             cache_dtype=torch.float16,
+            verify_forward_equivalence=not threshold_bypass_training,
         )
 
     def unwrap_model(model):
@@ -1560,6 +1561,11 @@ def main(
                     "adapter_size_mb": metadata["adapter_size_mb"],
                     "peak_cuda_mem_mb": metadata["peak_cuda_mem_mb"],
                     "adapter_path": metadata["adapter_path"],
+                    "forward_equivalence_runtime_audit": False,
+                    "forward_equivalence_basis": (
+                        "Exact straight-through reconstruction audited during "
+                        "the update-free bypass cost and fidelity probes"
+                    ),
                 },
             )
             logger.info(

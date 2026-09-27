@@ -9,6 +9,7 @@ import json
 import math
 import random
 import re
+import statistics
 import time
 from pathlib import Path
 
@@ -72,6 +73,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alpha", type=float, default=16.0)
     parser.add_argument("--reg_rank", type=int, default=16)
     parser.add_argument("--train_steps", type=int, default=1000)
+    parser.add_argument(
+        "--timing_warmup_steps",
+        type=int,
+        default=0,
+        help="Exclude this many initial steps from steady-state timing summaries.",
+    )
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-5)
@@ -420,6 +427,11 @@ def main() -> None:
     args = parse_args()
     if args.train_steps <= 0 or args.batch_size <= 0:
         raise SystemExit("--train_steps and --batch_size must be positive")
+    if not 0 <= args.timing_warmup_steps < args.train_steps:
+        raise SystemExit(
+            "--timing_warmup_steps must be non-negative and smaller than "
+            "--train_steps"
+        )
     if args.selection == "metadata" and not args.selection_file:
         raise SystemExit("--selection metadata requires --selection_file")
     if args.bypass_policy_csv and args.selection != "metadata":
@@ -719,6 +731,8 @@ def main() -> None:
     experiment_elapsed = time.perf_counter() - experiment_started
     peak_mb = max_train_peak_mb
     write_csv(output_dir / "train_log.csv", rows)
+    steady_rows = rows[args.timing_warmup_steps:]
+    steady_times = [row["train_step_time_s"] for row in steady_rows]
     summary = [{
         "method": args.method,
         "train_steps": args.train_steps,
@@ -729,6 +743,12 @@ def main() -> None:
         "trainable_domain_lora_params": trainable_params,
         "train_step_time_s": train_elapsed,
         "mean_train_step_time_s": train_elapsed / args.train_steps,
+        "timing_warmup_steps": args.timing_warmup_steps,
+        "steady_timed_steps": len(steady_times),
+        "steady_train_step_time_s": statistics.mean(steady_times),
+        "steady_train_step_std_s": (
+            statistics.stdev(steady_times) if len(steady_times) > 1 else 0.0
+        ),
         "experiment_time_s": experiment_elapsed,
         "non_train_overhead_s": experiment_elapsed - train_elapsed,
         "peak_cuda_mem_mb": peak_mb,
