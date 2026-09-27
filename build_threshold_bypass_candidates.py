@@ -329,6 +329,8 @@ def main() -> None:
     manifest = []
     for k in k_values:
         selected = set(ranked[:k])
+        selected_ordered = sorted(selected, key=block_index)
+        frozen_ordered = sorted(set(blocks) - selected, key=block_index)
         eligible = [
             block for block in blocks if block not in selected and block not in unsafe
         ]
@@ -340,10 +342,14 @@ def main() -> None:
             "algorithm": "Threshold bypass",
             "selection_rule": "target-domain weighted gradient importance Top-K",
             "selected_k": k,
+            "selected_block_count": k,
             "candidate_block_count": len(blocks),
             "selected_utility": selected_utility,
-            "selected_lora_blocks": sorted(selected, key=block_index),
-            "selected_blocks": sorted(selected, key=block_index),
+            "selected_lora_blocks": selected_ordered,
+            "selected_blocks": selected_ordered,
+            "selected_block_indices": [block_index(block) for block in selected_ordered],
+            "frozen_blocks": frozen_ordered,
+            "frozen_block_indices": [block_index(block) for block in frozen_ordered],
             "noise_weights": {f"{ratio:g}": weights[ratio] for ratio in anchors},
             "importance_csv": str(Path(args.importance_csv)),
             "cost_csv": str(Path(args.cost_csv)),
