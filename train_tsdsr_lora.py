@@ -46,6 +46,26 @@ def parse_args() -> argparse.Namespace:
             "LoRA selection and uses exact-forward single-pass backward bypass."
         ),
     )
+    parser.add_argument(
+        "--controller_b0",
+        action="store_true",
+        help=(
+            "Enable the identical residual-bypass controller with an empty "
+            "policy. Use this control to measure controller overhead for a "
+            "fixed sparse LoRA placement."
+        ),
+    )
+    parser.add_argument(
+        "--forward_diff_tolerance",
+        type=float,
+        default=0.0,
+        help="Maximum accepted exact-forward reconstruction difference.",
+    )
+    parser.add_argument(
+        "--allow_fallback",
+        action="store_true",
+        help="Continue after a bypass fallback. Disabled by default.",
+    )
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--sr_scale", type=int, default=4)
     parser.add_argument("--rank", type=int, default=8)
@@ -407,6 +427,14 @@ def main() -> None:
             "Threshold bypass requires --selection metadata and a fixed sparse "
             "LoRA placement"
         )
+    if args.controller_b0 and args.bypass_policy_csv:
+        raise SystemExit(
+            "--controller_b0 and --bypass_policy_csv are mutually exclusive"
+        )
+    if args.controller_b0 and args.selection != "metadata":
+        raise SystemExit("--controller_b0 requires --selection metadata")
+    if args.forward_diff_tolerance < 0:
+        raise SystemExit("--forward_diff_tolerance must be non-negative")
     output_dir = Path(args.output_dir)
     if output_dir.exists() and any(output_dir.iterdir()):
         raise SystemExit(f"Output directory is not empty: {output_dir}")
@@ -438,32 +466,44 @@ def main() -> None:
         if args.bypass_policy_csv else {}
     )
     all_blocks = [f"transformer_blocks.{index}" for index in range(24)]
+    unknown_selected = sorted(selected_blocks - set(all_blocks))
+    if unknown_selected:
+        raise SystemExit(
+            "Unknown selected LoRA blocks: " + ", ".join(unknown_selected)
+        )
+    if args.selection == "metadata" and set(active_blocks) != selected_blocks:
+        missing_active = sorted(selected_blocks - set(active_blocks))
+        raise SystemExit(
+            "Selected blocks contain no active domain LoRA modules: "
+            + ", ".join(missing_active)
+        )
     controller = None
-    if bypass_policy:
-        policy_anchors = set(bypass_policy)
-        missing_anchors = [
-            ratio for ratio in args.train_noise_ratios
-            if not any(
-                math.isclose(ratio, anchor, abs_tol=1e-8)
-                for anchor in policy_anchors
-            )
-        ]
-        if missing_anchors:
-            raise SystemExit(
-                "Bypass policy is missing training noise anchors: "
-                + ", ".join(f"{ratio:g}" for ratio in missing_anchors)
-            )
-        policy_union = {
-            block for blocks in bypass_policy.values() for block in blocks
-        }
-        unknown = sorted(policy_union - set(all_blocks))
-        overlap = sorted(policy_union & selected_blocks)
-        if unknown:
-            raise SystemExit("Unknown bypass blocks: " + ", ".join(unknown))
-        if overlap:
-            raise SystemExit(
-                "LoRA-selected blocks cannot be bypassed: " + ", ".join(overlap)
-            )
+    if bypass_policy or args.controller_b0:
+        if bypass_policy:
+            policy_anchors = set(bypass_policy)
+            missing_anchors = [
+                ratio for ratio in args.train_noise_ratios
+                if not any(
+                    math.isclose(ratio, anchor, abs_tol=1e-8)
+                    for anchor in policy_anchors
+                )
+            ]
+            if missing_anchors:
+                raise SystemExit(
+                    "Bypass policy is missing training noise anchors: "
+                    + ", ".join(f"{ratio:g}" for ratio in missing_anchors)
+                )
+            policy_union = {
+                block for blocks in bypass_policy.values() for block in blocks
+            }
+            unknown = sorted(policy_union - set(all_blocks))
+            overlap = sorted(policy_union & selected_blocks)
+            if unknown:
+                raise SystemExit("Unknown bypass blocks: " + ", ".join(unknown))
+            if overlap:
+                raise SystemExit(
+                    "LoRA-selected blocks cannot be bypassed: " + ", ".join(overlap)
+                )
         controller = adaptive.ResidualBlockController(
             student,
             {block: block for block in all_blocks},
@@ -534,18 +574,25 @@ def main() -> None:
         skip_blocks = []
         cache_stats = adaptive.CacheStats(0.0, 0.0, 0, 0)
         policy_error = ""
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
+        started = time.perf_counter()
+
+        # Controller lookup and configuration are intentionally inside the
+        # measured interval. This makes Native-K, Controller-B0, and Threshold
+        # bypass wall times directly comparable.
         if controller is not None:
             try:
-                skip_blocks = policy_blocks_for_ratio(bypass_policy, ratio)
+                skip_blocks = (
+                    policy_blocks_for_ratio(bypass_policy, ratio)
+                    if bypass_policy else []
+                )
                 controller.configure(skip_blocks)
                 controller.set_mode("single_skip")
             except Exception as error:
                 policy_error = str(error)
                 raise
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-            torch.cuda.reset_peak_memory_stats(device)
-        started = time.perf_counter()
 
         optimizer.zero_grad(set_to_none=True)
         reg_optimizer.zero_grad(set_to_none=True)
@@ -579,6 +626,25 @@ def main() -> None:
         optimizer.step()
         if controller is not None:
             cache_stats = controller.stats(0.0)
+            if cache_stats.replayable_blocks != len(skip_blocks):
+                raise RuntimeError(
+                    f"Requested {len(skip_blocks)} bypass blocks but only "
+                    f"{cache_stats.replayable_blocks} were replayable"
+                )
+            if cache_stats.fallback_blocks and not args.allow_fallback:
+                raise RuntimeError(
+                    "Threshold bypass fallback is forbidden: "
+                    + cache_stats.fallback_names
+                )
+            if (
+                cache_stats.max_reconstruction_abs_diff
+                > args.forward_diff_tolerance
+            ):
+                raise RuntimeError(
+                    "Threshold bypass changed the forward result: "
+                    f"{cache_stats.max_reconstruction_abs_diff:.9g} > "
+                    f"{args.forward_diff_tolerance:.9g}"
+                )
             controller.set_mode("full")
 
         set_reg_trainable(teacher)
@@ -669,6 +735,11 @@ def main() -> None:
         "final_loss": rows[-1]["loss"],
         "mean_last100_loss": sum(row["loss"] for row in rows[-100:]) / min(100, len(rows)),
         "mean_skipped_blocks": sum(row["skipped_block_count"] for row in rows) / len(rows),
+        "controller_mode": (
+            "threshold_policy" if bypass_policy
+            else "b0" if controller is not None
+            else "none"
+        ),
         "fallback_block_events": sum(row["fallback_blocks"] for row in rows),
         "max_residual_forward_abs_diff": max(
             row["residual_forward_max_abs_diff"] for row in rows
@@ -687,7 +758,12 @@ def main() -> None:
         "boundary_lora_modules": boundary_modules,
         "trainable_domain_lora_params": trainable_params,
         "regularizer_trainable_params": sum(parameter.numel() for parameter in reg_parameters),
-        "algorithm": "Threshold bypass" if controller is not None else "All-LoRA",
+        "algorithm": (
+            "Threshold bypass" if bypass_policy
+            else "Controller-B0" if controller is not None
+            else "Native-K" if args.selection == "metadata"
+            else "All-LoRA"
+        ),
         "bypass_policy_csv": args.bypass_policy_csv,
         "bypass_policy": {
             f"{ratio:g}": blocks for ratio, blocks in sorted(bypass_policy.items())
@@ -695,7 +771,11 @@ def main() -> None:
         "bypass_policy_union": sorted(
             {block for blocks in bypass_policy.values() for block in blocks}
         ),
-        "bypass_execution": "single_pass_backward_only" if controller is not None else "none",
+        "bypass_execution": (
+            "single_pass_backward_only" if bypass_policy else "none"
+        ),
+        "controller_enabled": controller is not None,
+        "controller_overhead_in_step_time": True,
         "adapter_path": adapter_path,
     }
     (output_dir / "metadata.json").write_text(

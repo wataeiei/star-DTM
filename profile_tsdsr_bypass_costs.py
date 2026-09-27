@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Profile frozen-block backward-bypass costs for a sparse TSD-SR LoRA policy."""
+"""Profile TSD-SR backward-bypass cost and correctness for every candidate block."""
 
 from __future__ import annotations
 
@@ -35,7 +35,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_dir", required=True)
     parser.add_argument("--importance_csv", required=True)
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--selected_k", type=int, required=True)
+    parser.add_argument(
+        "--selected_k",
+        type=int,
+        default=0,
+        help=(
+            "Number of top-importance LoRA blocks to protect during profiling. "
+            "Use 0 (recommended) to profile all blocks once for later K searches."
+        ),
+    )
     parser.add_argument("--profile_noise_ratio", type=float, default=0.4)
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--sr_scale", type=int, default=4)
@@ -317,8 +325,8 @@ def stdev(values: list[float]) -> float:
 
 def main() -> None:
     args = parse_args()
-    if args.selected_k <= 0 or args.warmup < 0 or args.repeats <= 0:
-        raise SystemExit("Require selected_k > 0, warmup >= 0, and repeats > 0")
+    if args.selected_k < 0 or args.warmup < 0 or args.repeats <= 0:
+        raise SystemExit("Require selected_k >= 0, warmup >= 0, and repeats > 0")
     if not 0.0 <= args.profile_noise_ratio <= 1.0:
         raise SystemExit("--profile_noise_ratio must be in [0, 1]")
 
@@ -337,7 +345,10 @@ def main() -> None:
             f"among {len(aggregate)} blocks"
         )
     selected = {row["block"] for row in aggregate[: args.selected_k]}
-    selected_utility = aggregate[args.selected_k - 1]["cumulative_utility"]
+    selected_utility = (
+        aggregate[args.selected_k - 1]["cumulative_utility"]
+        if args.selected_k else 0.0
+    )
     all_blocks = sorted((row["block"] for row in aggregate), key=block_index)
     frozen = [block for block in all_blocks if block not in selected]
 
@@ -534,7 +545,9 @@ def main() -> None:
             "The official TSD-SR and VAE adapters remain frozen. The fresh domain "
             "adapter is active only in the selected K blocks and shared boundary "
             "modules. Single-pass bypass executes the exact forward under no_grad "
-            "and removes only the selected frozen block's backward graph."
+            "and removes only the selected frozen block's backward graph. Use "
+            "selected_k=0 to obtain model-wide costs that can be reused for every "
+            "K candidate at the same image size and batch size."
         ),
     }
     (output_dir / "block_backward_costs_summary.json").write_text(

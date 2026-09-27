@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Build a strict score-threshold bypass schedule matched to a compute target."""
+"""LEGACY: build a constrained, compute-matched bypass schedule.
+
+This script reproduces earlier fixed-budget/run-constrained experiments. It is
+not the final Threshold bypass algorithm. New experiments must use
+build_threshold_bypass_candidates.py.
+"""
 
 from __future__ import annotations
 
