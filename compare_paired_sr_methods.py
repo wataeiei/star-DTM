@@ -120,7 +120,18 @@ def main() -> None:
 
     sr = read_many(args.sr_csv)
     if not sr.empty:
-        sr["filename"] = sr["image"].map(lambda value: Path(str(value)).name)
+        if "filename" in sr.columns:
+            sr["filename"] = sr["filename"].map(
+                lambda value: Path(str(value)).name
+            )
+        elif "image" in sr.columns:
+            sr["filename"] = sr["image"].map(
+                lambda value: Path(str(value)).name
+            )
+        else:
+            raise SystemExit(
+                "SR CSV must contain either a filename or image column"
+            )
         for metric in ("psnr", "ssim"):
             tests.append(
                 paired_metric(
