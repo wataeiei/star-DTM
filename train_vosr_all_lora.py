@@ -1165,6 +1165,7 @@ def main(
             if threshold_bypass_training:
                 threshold_step_policy = None
                 threshold_step_sampled_t = None
+                threshold_step_stats = None
             hq = batch["hq"].to(accelerator.device, non_blocking=True)
             with torch.no_grad():
                 _, lq = degradation.degrade_process(hq, resize_bak=True)
@@ -1220,6 +1221,40 @@ def main(
                             if threshold_bypass_training else None
                         ),
                     )
+
+                if not bool(torch.isfinite(loss.detach()).all()):
+                    raise RuntimeError(
+                        f"Non-finite reported loss at step {global_step + 1}"
+                    )
+                if not bool(torch.isfinite(loss_backward.detach()).all()):
+                    raise RuntimeError(
+                        f"Non-finite backward loss at step {global_step + 1}"
+                    )
+
+                if threshold_bypass_training:
+                    if threshold_step_policy is None:
+                        raise RuntimeError(
+                            "Threshold bypass policy was not configured"
+                        )
+                    threshold_step_stats = bypass_controller.stats(0.0)
+                    expected_bypass = threshold_step_policy["bypass_budget"]
+                    actual_bypass = threshold_step_stats.replayable_blocks
+                    if threshold_step_stats.fallback_blocks:
+                        raise RuntimeError(
+                            "Threshold bypass fallback is forbidden: "
+                            f"{threshold_step_stats.fallback_names}"
+                        )
+                    if threshold_step_stats.max_reconstruction_abs_diff != 0:
+                        raise RuntimeError(
+                            "Threshold bypass changed the forward pass: "
+                            f"max_abs_diff="
+                            f"{threshold_step_stats.max_reconstruction_abs_diff}"
+                        )
+                    if actual_bypass != expected_bypass:
+                        raise RuntimeError(
+                            "Threshold bypass execution count mismatch: "
+                            f"requested={expected_bypass}, actual={actual_bypass}"
+                        )
                 
                 # Backward and optimize
                 accelerator.backward(loss_backward)
@@ -1260,9 +1295,12 @@ def main(
                         raise RuntimeError(
                             "Threshold bypass policy was not configured"
                         )
+                    if threshold_step_stats is None:
+                        raise RuntimeError(
+                            "Threshold bypass statistics were not recorded"
+                        )
                     if accelerator.device.type == "cuda":
                         torch.cuda.synchronize(accelerator.device)
-                    threshold_stats = bypass_controller.stats(0.0)
                     threshold_bypass_rows.append(
                         {
                             "step": global_step,
@@ -1273,7 +1311,9 @@ def main(
                             "requested_skip_count": threshold_step_policy[
                                 "bypass_budget"
                             ],
-                            "skipped_block_count": threshold_stats.skipped_blocks,
+                            "skipped_block_count": (
+                                threshold_step_stats.replayable_blocks
+                            ),
                             "skipped_blocks": ";".join(
                                 threshold_step_policy["skip_blocks"]
                             ),
@@ -1284,9 +1324,14 @@ def main(
                             "train_step_time_s": (
                                 time.perf_counter() - training_step_started
                             ),
-                            "fallback_blocks": threshold_stats.fallback_blocks,
+                            "fallback_blocks": (
+                                threshold_step_stats.fallback_blocks
+                            ),
+                            "fallback_block_names": (
+                                threshold_step_stats.fallback_names
+                            ),
                             "max_forward_abs_diff": (
-                                threshold_stats.max_reconstruction_abs_diff
+                                threshold_step_stats.max_reconstruction_abs_diff
                             ),
                         }
                     )

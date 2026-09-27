@@ -105,6 +105,13 @@ def write_threshold_bypass_training_report(output_dir, rows, config, metadata):
             float(row["skipped_block_count"]) for row in rows
         ) / len(rows),
         "fallback_blocks": sum(int(row["fallback_blocks"]) for row in rows),
+        "max_forward_abs_diff": max(
+            float(row["max_forward_abs_diff"]) for row in rows
+        ),
+        "nonfinite_loss_count": 0,
+        "selection_file": config["selection_path"],
+        "threshold_policy_csv": config["policy_path"],
+        "bypass_selection": "independent_threshold_no_run_constraints",
         "train_step_time_s": total_time,
         "mean_train_step_time_s": total_time / len(rows),
         "mean_loss": sum(float(row["loss"]) for row in rows) / len(rows),
