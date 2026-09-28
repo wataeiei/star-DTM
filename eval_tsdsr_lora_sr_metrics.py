@@ -449,9 +449,10 @@ def main() -> None:
             with Image.open(lq_index[hr_path.stem]) as source:
                 lr_pil = source.convert("RGB")
             lr = image_to_tensor(lr_pil)
-        lr_upscaled_pil = lr_pil.resize(
-            (args.image_size, args.image_size), Image.Resampling.BICUBIC
-        )
+        # Match the reference TSD-SR evaluation protocol exactly. PIL's default
+        # resize filter is intentional for the wavelet color reference, while
+        # AdaIN receives the original low-resolution image.
+        lr_wavelet_reference = lr_pil.resize((args.image_size, args.image_size))
 
         for label, internal_name, _ in methods:
             transformer.set_adapter(
@@ -479,9 +480,11 @@ def main() -> None:
 
             prediction_pil = tensor_to_pil(prediction)
             if args.color_fix == "wavelet":
-                prediction_pil = wavelet_color_fix(prediction_pil, lr_upscaled_pil)
+                prediction_pil = wavelet_color_fix(
+                    prediction_pil, lr_wavelet_reference
+                )
             elif args.color_fix == "adain":
-                prediction_pil = adain_color_fix(prediction_pil, lr_upscaled_pil)
+                prediction_pil = adain_color_fix(prediction_pil, lr_pil)
             prediction_array = np.asarray(prediction_pil.convert("RGB"), dtype=np.uint8)
             target_array = np.asarray(hr_pil, dtype=np.uint8)
             psnr, ssim = calculate_metrics(
@@ -537,6 +540,12 @@ def main() -> None:
         "num_eval_images": len(eval_paths),
         "paired_vae_sampling": True,
         "lq_source": str(Path(args.lq_dir).resolve()) if args.lq_dir else "generated_in_memory",
+        "color_alignment_protocol": "official-tsdsr-test-script",
+        "color_alignment_source": (
+            "original-lr" if args.color_fix == "adain" else
+            "pil-default-resized-lr" if args.color_fix == "wavelet" else
+            "none"
+        ),
         "official_transformer_and_vae_adapters_loaded": True,
     }
     (output_dir / "metadata.json").write_text(
